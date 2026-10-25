@@ -114,7 +114,7 @@ pub fn export_list(data: &[u8]) -> Result<Vec<(String, u64)>, ElfError> {
         )?;
         let strtab = slice(data, u64_at(strsh, 24)?, u64_at(strsh, 32)?)?;
         let syms = slice(data, off, size)?;
-        for s in syms.chunks_exact(SYMSIZE) {
+        for s in syms.as_chunks::<SYMSIZE>().0 {
             let name = u32_at(s, 0)? as usize;
             let info = s[4];
             let shndx = u16_at(s, 6)?;

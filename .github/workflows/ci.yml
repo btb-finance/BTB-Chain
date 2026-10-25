@@ -17,10 +17,10 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal \
+          rustup toolchain install 1.97.0 --profile minimal \
             --component rustfmt --component clippy --component rust-src \
             --target riscv64imac-unknown-none-elf
-          rustup default stable
+          rustup default 1.97.0
 
       - name: Install clang and lld
         run: |
