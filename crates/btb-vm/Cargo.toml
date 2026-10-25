@@ -1,0 +1,8 @@
+[package]
+name = "btb-vm"
+description = "Deterministic, gas-metered RISC-V RV64IM interpreter for BTB Chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
