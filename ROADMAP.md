@@ -69,6 +69,8 @@ Consensus and networking across independent validators.
 **Deliverables**
 
 - [ ] Proof-of-stake BFT consensus (HotStuff family or DAG), ~1 s finality
+  - consensus core done (simulated): `crates/btb-consensus`, Jolteon-style 2-chain with timeout certificates, stake-weighted quorums and equivocation evidence, see [docs/CONSENSUS.md](docs/CONSENSUS.md); still needs real networking and a ~1 s finality measurement
+  - the execution layer it will drive (transactions, genesis, block execution, fees, crons, mempool) is `crates/btb-chain`, see [docs/CHAIN.md](docs/CHAIN.md); not a tick, consensus itself is not done
 - [ ] libp2p networking over QUIC
 - [ ] Fast path for transactions touching only one owner's data
 - [ ] Parallel execution (Block-STM style)

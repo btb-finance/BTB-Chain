@@ -1,0 +1,367 @@
+//! Transactions: format, signing, verification and the contract manifest.
+//!
+//! Wire format (all integers little-endian, via `btb-codec`):
+//!
+//! ```text
+//! tx      = body || public_key[32] || signature[64]
+//! body    = chain_id:u64 || nonce:u64 || tag:u8 || fields
+//! Deploy   (tag 0): code:bytes || manifest
+//! Call     (tag 1): contract[32] || kind:u8 || function:string || args:bytes
+//!                   || gas_limit:u64 || max_fee:u64
+//! Transfer (tag 2): to[32] || amount:u64
+//! manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes:[string]
+//! ```
+//!
+//! `kind` is the entry-point kind (0 query, 1 mutation, 2 cron, 3 action). All four decode so
+//! the error is a clear "kind not allowed", but only mutation is valid in a
+//! transaction: queries never go through consensus and actions are not transactions.
+//!
+//! The signature is Ed25519 over `SHA256("btb.tx.sig.v1" || body)`. The body contains the
+//! chain id, so a signature made for one chain is useless on another. The sender is
+//! `SHA256("btb.account.v1" || public_key)`.
+
+use btb_codec::{Decode, DecodeError, Encode, Reader};
+use btb_vm::FunctionKind;
+pub use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
+
+use crate::sha256;
+
+pub type Address = [u8; 32];
+pub type Hash = [u8; 32];
+
+pub const MAX_CODE_BYTES: usize = 1 << 20;
+pub const MAX_NAME_BYTES: usize = 64;
+pub const MAX_CRONS: usize = 16;
+pub const MAX_INDEX_SPECS: usize = 64;
+pub const MAX_CRON_EVERY: u64 = 1 << 32;
+pub const MAX_ARG_BYTES: usize = 1 << 20;
+
+const SIG_DOMAIN: &[u8] = b"btb.tx.sig.v1";
+const ID_DOMAIN: &[u8] = b"btb.tx.id.v1";
+const ACCOUNT_DOMAIN: &[u8] = b"btb.account.v1";
+const CONTRACT_DOMAIN: &[u8] = b"btb.contract.v1";
+
+/// Why bytes are not a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxError {
+    Decode(DecodeError),
+    BadTag(u8),
+    BadKind(u8),
+}
+
+impl From<DecodeError> for TxError {
+    fn from(e: DecodeError) -> Self {
+        TxError::Decode(e)
+    }
+}
+
+/// What a deploy declares about the contract: its name, cron schedules and table indexes.
+///
+/// `crons` lists `(function, every_blocks)`: the `cron` entry point `function` runs every
+/// `every_blocks` blocks (`every = "N blocks"`). `indexes` use the `btb dev` spec
+/// `Table:index:addr@offset` or `Table:index:u64@offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Manifest {
+    pub name: String,
+    pub crons: Vec<(String, u64)>,
+    pub indexes: Vec<String>,
+}
+
+impl Encode for Manifest {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.name.encode_to(out);
+        self.crons.encode_to(out);
+        self.indexes.encode_to(out);
+    }
+}
+
+impl Decode for Manifest {
+    fn decode_from(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Manifest {
+            name: String::decode_from(r)?,
+            crons: Vec::decode_from(r)?,
+            indexes: Vec::decode_from(r)?,
+        })
+    }
+}
+
+/// A parsed index declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSpec {
+    pub table: String,
+    pub index: String,
+    pub addr: bool,
+    pub offset: usize,
+}
+
+impl IndexSpec {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad =
+            || format!("bad index spec {s:?}, expected Table:index:addr@offset or :u64@offset");
+        let mut p = s.split(':');
+        let (Some(table), Some(index), Some(rest), None) = (p.next(), p.next(), p.next(), p.next())
+        else {
+            return Err(bad());
+        };
+        let (kind, off) = rest.split_once('@').ok_or_else(bad)?;
+        let addr = match kind {
+            "addr" => true,
+            "u64" => false,
+            _ => return Err(bad()),
+        };
+        if table.is_empty() || index.is_empty() {
+            return Err(bad());
+        }
+        Ok(Self {
+            table: table.into(),
+            index: index.into(),
+            addr,
+            offset: off.parse().map_err(|_| bad())?,
+        })
+    }
+}
+
+impl Manifest {
+    /// Check the manifest against itself (limits, schedules, index specs).
+    pub fn validate(&self) -> Result<Vec<IndexSpec>, String> {
+        if self.name.len() > MAX_NAME_BYTES {
+            return Err("name too long".into());
+        }
+        if self.crons.len() > MAX_CRONS {
+            return Err("too many crons".into());
+        }
+        for (i, (f, every)) in self.crons.iter().enumerate() {
+            if !(1..=MAX_CRON_EVERY).contains(every) {
+                return Err(format!(
+                    "cron {f:?}: every must be 1..={MAX_CRON_EVERY} blocks"
+                ));
+            }
+            if self.crons[..i].iter().any(|(g, _)| g == f) {
+                return Err(format!("cron {f:?} listed twice"));
+            }
+        }
+        if self.indexes.len() > MAX_INDEX_SPECS {
+            return Err("too many indexes".into());
+        }
+        self.indexes.iter().map(|s| IndexSpec::parse(s)).collect()
+    }
+}
+
+/// What a transaction does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxKind {
+    Deploy {
+        code: Vec<u8>,
+        manifest: Manifest,
+    },
+    Call {
+        contract: Address,
+        kind: FunctionKind,
+        function: String,
+        args: Vec<u8>,
+        gas_limit: u64,
+        max_fee: u64,
+    },
+    Transfer {
+        to: Address,
+        amount: u64,
+    },
+}
+
+fn kind_byte(k: FunctionKind) -> u8 {
+    match k {
+        FunctionKind::Query => 0,
+        FunctionKind::Mutation => 1,
+        FunctionKind::Cron => 2,
+        FunctionKind::Action => 3,
+    }
+}
+
+fn byte_kind(b: u8) -> Result<FunctionKind, TxError> {
+    Ok(match b {
+        0 => FunctionKind::Query,
+        1 => FunctionKind::Mutation,
+        2 => FunctionKind::Cron,
+        3 => FunctionKind::Action,
+        _ => return Err(TxError::BadKind(b)),
+    })
+}
+
+/// The signed part of a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxBody {
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub kind: TxKind,
+}
+
+impl Encode for TxBody {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.chain_id.encode_to(out);
+        self.nonce.encode_to(out);
+        match &self.kind {
+            TxKind::Deploy { code, manifest } => {
+                0u8.encode_to(out);
+                code.encode_to(out);
+                manifest.encode_to(out);
+            }
+            TxKind::Call {
+                contract,
+                kind,
+                function,
+                args,
+                gas_limit,
+                max_fee,
+            } => {
+                1u8.encode_to(out);
+                contract.encode_to(out);
+                kind_byte(*kind).encode_to(out);
+                function.encode_to(out);
+                args.encode_to(out);
+                gas_limit.encode_to(out);
+                max_fee.encode_to(out);
+            }
+            TxKind::Transfer { to, amount } => {
+                2u8.encode_to(out);
+                to.encode_to(out);
+                amount.encode_to(out);
+            }
+        }
+    }
+}
+
+impl TxBody {
+    fn decode_body(r: &mut Reader<'_>) -> Result<Self, TxError> {
+        let chain_id = u64::decode_from(r)?;
+        let nonce = u64::decode_from(r)?;
+        let kind = match u8::decode_from(r)? {
+            0 => TxKind::Deploy {
+                code: Vec::decode_from(r)?,
+                manifest: Manifest::decode_from(r)?,
+            },
+            1 => TxKind::Call {
+                contract: <[u8; 32]>::decode_from(r)?,
+                kind: byte_kind(u8::decode_from(r)?)?,
+                function: String::decode_from(r)?,
+                args: Vec::decode_from(r)?,
+                gas_limit: u64::decode_from(r)?,
+                max_fee: u64::decode_from(r)?,
+            },
+            2 => TxKind::Transfer {
+                to: <[u8; 32]>::decode_from(r)?,
+                amount: u64::decode_from(r)?,
+            },
+            t => return Err(TxError::BadTag(t)),
+        };
+        Ok(TxBody {
+            chain_id,
+            nonce,
+            kind,
+        })
+    }
+
+    /// The hash that is signed.
+    pub fn signing_hash(&self) -> Hash {
+        sha256(&[SIG_DOMAIN, &self.encode()])
+    }
+}
+
+/// A signed transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transaction {
+    pub body: TxBody,
+    pub public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+/// Account address of a public key.
+pub fn account_address(public_key: &[u8; 32]) -> Address {
+    sha256(&[ACCOUNT_DOMAIN, public_key])
+}
+
+/// Address of the contract deployed by `deployer` with transaction nonce `nonce`.
+pub fn contract_address(deployer: &Address, nonce: u64) -> Address {
+    sha256(&[CONTRACT_DOMAIN, deployer, &nonce.to_be_bytes()])
+}
+
+impl Transaction {
+    pub fn sign(body: TxBody, key: &SigningKey) -> Self {
+        let sig = key.sign(&body.signing_hash());
+        Transaction {
+            public_key: key.verifying_key().to_bytes(),
+            signature: sig.to_bytes(),
+            body,
+        }
+    }
+
+    pub fn sender(&self) -> Address {
+        account_address(&self.public_key)
+    }
+
+    /// Whether the signature is a valid (strict) Ed25519 signature of the body by `public_key`.
+    pub fn verify_signature(&self) -> bool {
+        let Ok(vk) = VerifyingKey::from_bytes(&self.public_key) else {
+            return false;
+        };
+        let sig = Signature::from_bytes(&self.signature);
+        vk.verify_strict(&self.body.signing_hash(), &sig).is_ok()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.body.encode();
+        out.extend_from_slice(&self.public_key);
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn encode_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.encode());
+    }
+
+    pub fn decode_from(r: &mut Reader<'_>) -> Result<Self, TxError> {
+        let body = TxBody::decode_body(r)?;
+        Ok(Transaction {
+            body,
+            public_key: <[u8; 32]>::decode_from(r)?,
+            signature: <[u8; 64]>::decode_from(r)?,
+        })
+    }
+
+    /// Decode exactly one transaction (trailing bytes are an error).
+    pub fn decode(bytes: &[u8]) -> Result<Self, TxError> {
+        let mut r = Reader::new(bytes, MAX_CODE_BYTES);
+        let tx = Self::decode_from(&mut r)?;
+        if r.remaining() != 0 {
+            return Err(DecodeError::TrailingBytes.into());
+        }
+        Ok(tx)
+    }
+
+    /// Transaction id: `SHA256("btb.tx.id.v1" || wire bytes)`.
+    pub fn id(&self) -> Hash {
+        sha256(&[ID_DOMAIN, &self.encode()])
+    }
+
+    /// Gas charged before the VM runs. For a deploy or transfer this is the whole gas, and it
+    /// is charged in full.
+    pub fn intrinsic_gas(&self) -> u64 {
+        use crate::*;
+        match &self.body.kind {
+            TxKind::Transfer { .. } => TRANSFER_GAS,
+            TxKind::Deploy { code, .. } => {
+                DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
+            }
+            TxKind::Call { function, args, .. } => CALL_BASE_GAS
+                .saturating_add(CALL_BYTE_GAS.saturating_mul((function.len() + args.len()) as u64)),
+        }
+    }
+
+    /// The most gas the transaction can use.
+    pub fn gas_limit(&self) -> u64 {
+        match &self.body.kind {
+            TxKind::Call { gas_limit, .. } => *gas_limit,
+            _ => self.intrinsic_gas(),
+        }
+    }
+}

@@ -18,8 +18,10 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/ARCHITECTURE.md` | Network, consensus, state model, tech stack |
 | `docs/DEV_SERVER.md` | `btb-dev`: single-node dev server (HTTP, live queries over SSE), the Phase 2 gate demo |
 | `docs/CLI.md` | The `btb` command: `init`, `build`, `dev` (hot reload), `deploy` |
+| `docs/CONSENSUS.md` | `btb-consensus`: Jolteon-style 2-chain BFT, safety rules (voting, locking, commit), leader schedule, equivocation evidence, simulator |
 | `docs/STATE.md` | Key layout, index encodings, table writes and queries in `btb-runtime` |
 | `docs/LSP.md` | rust-analyzer setup and `btb-lsp` (BTB-specific diagnostics, hover, completion) |
+| `docs/CHAIN.md` | Transactions, signing, fees, genesis, blocks, crons and the mempool in `btb-chain` |
 | `docs/LANGUAGE.md` | Contract languages, Rust SDK, project layout |
 | `docs/ENCODING.md` | Canonical binary encoding of arguments and results (all languages) |
 | `docs/TS_SDK.md` | TypeScript client (`sdk-ts/`, `@btb/client`): codec, client, React hooks |
@@ -40,6 +42,8 @@ crates/
 ├── btb-codec/     # canonical argument/result encoding (no_std)
 ├── btb-sdk/       # Rust contract SDK (no_std) and macros
 ├── btb-runtime/   # kv store, tables, indexes, queries, subscriptions, scheduler
+├── btb-consensus/ # deterministic, I/O-free BFT state machine (HotStuff family) + simulator
+├── btb-chain/     # transactions, genesis, block execution, fees, crons, mempool
 ├── btb-dev/       # single-node dev server (HTTP + SSE), Phase 2 demo
 ├── btb-node/      # consensus, networking, hosting gateway
 ├── btb-cli/       # `btb init`, `btb dev`, `btb deploy`

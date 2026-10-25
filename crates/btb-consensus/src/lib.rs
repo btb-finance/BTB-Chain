@@ -1,0 +1,17 @@
+//! Deterministic, I/O-free BFT consensus for BTB Chain: a Jolteon-style (2-chain, pipelined
+//! HotStuff-2 family) state machine with timeout certificates, stake-weighted quorums,
+//! equivocation evidence and crash-safe persistence hooks. See `docs/CONSENSUS.md`.
+
+mod codec;
+mod replica;
+mod storage;
+mod types;
+
+#[cfg(test)]
+mod sim;
+#[cfg(test)]
+mod tests;
+
+pub use replica::{Config, LeaderPolicy, Replica, Stats};
+pub use storage::{MemoryStorage, SafetyState, SafetyStorage};
+pub use types::*;

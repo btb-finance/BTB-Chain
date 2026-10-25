@@ -58,9 +58,13 @@ See [SCALING.md](SCALING.md) for how every layer scales and how each role earns.
 Validators are run by parties who don't trust each other, so they must agree on one order of transactions to prevent double spends. Batching that agreement into blocks makes it cheap. Users and developers never see blocks:
 
 - **Fast path.** Transactions touching only one user's own data (sending your own tokens) need validator signatures but no global ordering, confirming in about half a second.
-- **Streaming consensus.** A pipelined BFT or DAG protocol proposes batches continuously; shared objects like DEX pools confirm in under a second.
+- **Streaming consensus.** A pipelined BFT or DAG protocol proposes batches continuously; shared objects like DEX pools confirm in under a second. The consensus core is a Jolteon-style 2-chain HotStuff state machine in `crates/btb-consensus`; its safety rules, leader schedule and evidence records are in [CONSENSUS.md](CONSENSUS.md).
 - **Parallel execution.** Transactions that touch different data run at the same time (Block-STM style). Table declarations tell the scheduler what each transaction touches.
 - **Request/response SDK.** `await dex.swap(...)` returns the result; batching, confirmation and retries are hidden.
+
+## Execution layer
+
+The deterministic part a consensus engine drives is `crates/btb-chain`: signed transactions (Deploy, Call to a mutation or cron, Transfer), a genesis that allocates the fixed supply, blocks executed in order with per-transaction gas, fees accounted into a validator pool (80%) and a relay pool (20%), cron jobs run by block height, and a Merkle state root after every block. Queries never enter it. See [CHAIN.md](CHAIN.md).
 
 ## State model
 
@@ -73,7 +77,7 @@ BTB state is a database, not a raw key-value store. Tables, indexes and everythi
 | Queries | Read-only, answered by any hosting node without consensus. Optional Merkle proof against the latest block; apps choose fast or verified. |
 | Subscriptions | An app subscribes to a query; the node pushes new results whenever a block changes the data it read. |
 | Mutations | Change state, go through consensus, pay gas. Optimistic execution with retry on conflict. |
-| Cron / scheduled functions | Scheduled by block height or block timestamp, never a local clock. Paid from the contract's prepaid balance; jobs pause when it is empty. A per-block scheduled-gas cap prevents pile-ups. |
+| Cron / scheduled functions | Scheduled by block height (`btb-chain`: every N blocks) or block timestamp, never a local clock. Paid from the contract's prepaid balance; jobs pause when it is empty. A per-block scheduled-gas cap prevents pile-ups. |
 | Hosting | Frontend files stored by contracts, served over HTTP by hosting nodes. |
 | Blob storage | Large files split across many nodes with erasure coding; only the hash is on-chain. |
 | Storage deposits | BTB locked per byte stored, refunded on delete. Prevents state bloat. |

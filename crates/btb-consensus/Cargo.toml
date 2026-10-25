@@ -1,0 +1,12 @@
+[package]
+name = "btb-consensus"
+description = "Deterministic, I/O-free HotStuff-family (Jolteon-style 2-chain) BFT consensus state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+sha2 = "0.10"
+
+[dev-dependencies]

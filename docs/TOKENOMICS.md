@@ -1,6 +1,6 @@
 # BTB Tokenomics
 
-BTB has a **fixed supply of 1,000,000,000 tokens** created at genesis. Nothing is ever minted after that. Tokens circulate from apps to the nodes that host and execute them.
+BTB has a **fixed supply of 1,000,000,000 tokens** created at genesis. Nothing is ever minted after that. Native amounts are `u64` base units with 9 decimals (1 BTB = 10^9 units, the whole supply 10^18 units); see [CHAIN.md](CHAIN.md#units). Tokens circulate from apps to the nodes that host and execute them.
 
 ## Principle: whoever does the work gets paid
 
