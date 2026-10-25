@@ -1,12 +1,20 @@
 //! RV64IM instruction decoder.
 
 /// Reasons execution stops abnormally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trap {
     IllegalInstruction,
     MisalignedFetch,
-    MemoryOutOfBounds { addr: u64 },
+    MemoryOutOfBounds {
+        addr: u64,
+    },
     OutOfGas,
+    /// ECALL with a call number that is not in `host::abi`.
+    UnknownHostCall(u64),
+    /// A state-changing host call was made in read-only (query) mode.
+    WriteInQuery,
+    /// The guest called `abort`; carries the (lossily UTF-8 decoded) message.
+    Abort(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
