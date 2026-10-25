@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail (instead of silently skipping) the C contract test if clang/ld.lld are missing.
+  BTB_REQUIRE_C: "1"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy --component rust-src \
+            --target riscv64imac-unknown-none-elf
+          rustup default stable
+
+      - name: Install clang and lld
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          workspaces: |
+            .
+            examples/counter
+            examples/token
+            examples/dex
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The examples are standalone workspaces that build only for riscv64imac-unknown-none-elf
+      # (target, flags and build-std come from each .cargo/config.toml; build-std needs
+      # RUSTC_BOOTSTRAP=1). Clippy works there.
+      - name: Examples fmt and clippy
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          for d in examples/*/; do
+            if [ -f "$d/Cargo.toml" ]; then
+              echo "::group::$d"
+              (cd "$d" && cargo fmt --check && cargo clippy --release -- -D warnings)
+              echo "::endgroup::"
+            fi
+          done

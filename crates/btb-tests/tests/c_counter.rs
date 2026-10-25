@@ -1,5 +1,6 @@
 //! End to end: build `examples/c-counter` with clang (proving the host-call ABI works from C),
-//! then run it in `btb-vm`. Skips with a message if clang or ld.lld is missing.
+//! then run it in `btb-vm`. Skips with a message if clang or ld.lld is missing, unless
+//! `BTB_REQUIRE_C=1` is set (as in CI), in which case a missing toolchain fails the tests.
 
 use btb_vm::decode::decode;
 use btb_vm::host::abi;
@@ -30,6 +31,9 @@ fn elf() -> Option<&'static [u8]> {
     ELF.get_or_init(|| {
         let clang = std::env::var("CLANG").unwrap_or_else(|_| "/usr/bin/clang".into());
         if !have(&clang) || !have("ld.lld") {
+            if std::env::var("BTB_REQUIRE_C").is_ok_and(|v| !v.is_empty() && v != "0") {
+                panic!("BTB_REQUIRE_C is set but clang ({clang}) and/or ld.lld not found");
+            }
             eprintln!("SKIPPED c_counter: clang ({clang}) and/or ld.lld not found");
             return None;
         }

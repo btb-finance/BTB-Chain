@@ -60,6 +60,10 @@ AI tools are welcome collaborators here. Use them however helps you, with three 
 - Determinism first: no floats, system time or randomness in anything that affects consensus
 - Docs updated in the same PR when behavior or interfaces change
 
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`, plus fmt and clippy inside each `examples/*` contract. CI sets `BTB_REQUIRE_C=1`, so the C contract test fails instead of skipping when clang or `ld.lld` is missing. Run the same commands locally before opening a PR.
+
 ## Getting recognized
 
 Every merged contribution counts, whether it's code, docs, research or design. Contributors are listed on the repository's contributors page, and significant contributions are credited in the [CHANGELOG](CHANGELOG.md).
