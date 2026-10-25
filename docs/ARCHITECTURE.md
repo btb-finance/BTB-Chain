@@ -89,7 +89,7 @@ Block producers choose transaction order and earn fees, so they could front-run 
 | --- | --- | --- |
 | Contract languages | Rust first (SDK with attribute macros); any language that compiles to RISC-V | Familiar tools, like NEAR and ICP |
 | Compile target | RISC-V, 64-bit integer-only | Simple, near-native, ZK-friendly, deterministic |
-| VM | RISC-V recompiler with gas metering (reference interpreter: `crates/btb-vm`) | Near-native speed with exact metering |
+| VM | RISC-V recompiler with gas metering (reference interpreter: `crates/btb-vm`) | Near-native speed with exact metering (see [VM_DECISION.md](VM_DECISION.md)) |
 | Node software | Rust | Safe, fast, strongest blockchain ecosystem |
 | Consensus | Proof-of-stake BFT (HotStuff family or DAG) | ~1 s finality, no forks |
 | Execution | Parallel, Block-STM style | Non-conflicting transactions run at once |

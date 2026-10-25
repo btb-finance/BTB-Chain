@@ -19,7 +19,7 @@ A RISC-V VM that runs Rust contracts locally, with gas metering. No blockchain y
 - [x] Argument and result encoding shared by all languages
 - [x] Example Rust contracts: counter, token, simple DEX
 - [x] C header for the host-call ABI, proving "any language"
-- [ ] Decide: build on an existing RISC-V VM (PolkaVM, CKB-VM) or write our own
+- [x] Decide: build on an existing RISC-V VM (PolkaVM, CKB-VM) or write our own: keep our own interpreter for now, see [docs/VM_DECISION.md](docs/VM_DECISION.md)
 
 **Gate:** sample Rust contracts compile and run with exact, repeatable gas on every machine.
 
