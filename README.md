@@ -5,7 +5,9 @@
 [![Website](https://img.shields.io/badge/Website-btb.finance-blue)](https://www.btb.finance)
 [![Twitter Follow](https://img.shields.io/twitter/follow/btb_finance?style=social)](https://twitter.com/btb_finance)
 
-> **Status: design phase.** This repository holds the BTB Chain specification and roadmap. Phase 1 (language + VM) is the next milestone. The earlier Arbitrum Orbit L3 design has been retired; it remains available on the `orbit-legacy` branch.
+**New here? Start with [IDEA.md](IDEA.md): why BTB Chain exists, in five minutes.**
+
+> **Status: design phase.** This repository holds the BTB Chain specification and roadmap. Phase 1 (RISC-V VM + Rust SDK) is the next milestone. The earlier Arbitrum Orbit L3 design has been retired; it remains available on the `orbit-legacy` branch.
 
 ## Why BTB Chain
 
