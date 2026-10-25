@@ -12,7 +12,7 @@
 <!-- Tests you ran, or for docs: proofread, links checked. -->
 
 ## AI assistance
-- [ ] This PR was written partly or fully with AI tools (Claude, Copilot, etc.), and I have reviewed and understood every change
+- [ ] This PR was written partly or fully with AI tools, and I have reviewed and understood every change
 
 ## Checklist
 - [ ] I've kept this PR focused on one change

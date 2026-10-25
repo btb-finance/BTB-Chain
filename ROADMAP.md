@@ -6,21 +6,22 @@ Each phase ends with a **gate**: a concrete test that must pass before the next 
 
 ---
 
-## Phase 1 — Language and VM
+## Phase 1 — RISC-V VM and Rust SDK
 
-A compiler and RISC-V VM that run BTB contracts locally, with gas metering. No blockchain yet.
+A RISC-V VM that runs Rust contracts locally, with gas metering. No blockchain yet. Rust compiles to RISC-V with the standard compiler, so no custom language compiler is needed to start.
 
 **Deliverables**
 
-- [ ] Language grammar and lexer/parser
-- [ ] Type checker: structs, enums, `Result`/`Option`, generics, integer-only math
-- [ ] BTB-specific rules: `contract`, `table`, `query fn`, `mutation fn`, `@cron`
-- [ ] Lowering to LLVM or Cranelift IR, emitting RISC-V (rv64im, no floats)
-- [ ] RISC-V VM (interpreter first, recompiler later) with per-instruction gas metering
-- [ ] Host-call interface for storage, tokens and context (`caller()`, block height)
+- [ ] RISC-V rv64im interpreter (recompiler later) with per-instruction gas metering
+- [ ] ELF loader and contract entry-point convention (one export per query / mutation / cron)
+- [ ] Host-call ABI for storage, tables, tokens and context (`caller()`, block height), with a gas cost per call
+- [ ] `btb-sdk` Rust crate (no_std) with `#[btb::table]`, `#[query]`, `#[mutation]`, `#[cron]` macros
+- [ ] Argument and result encoding shared by all languages
+- [ ] Example Rust contracts: counter, token, simple DEX
+- [ ] C header for the host-call ABI, proving "any language"
 - [ ] Decide: build on an existing RISC-V VM (PolkaVM, CKB-VM) or write our own
 
-**Gate:** sample contracts compile and run with exact, repeatable gas on every machine.
+**Gate:** sample Rust contracts compile and run with exact, repeatable gas on every machine.
 
 ## Phase 2 — State database
 
@@ -98,7 +99,8 @@ Everything that makes BTB a decentralized cloud.
 
 ## Open questions
 
-- [ ] Name for the contract language
+- [ ] Whether to build an optional BTB DSL later, and its name
+- [ ] TypeScript support: compile to RISC-V or run an interpreter inside the VM
 - [ ] Fast-path design: owned objects (Sui-style) or a simpler rule
 - [ ] Mutation fee split between executor and relay host (80/20 proposed)
 - [ ] Genesis reserve for early validator rewards (10–20% proposed) and the rest of the allocation

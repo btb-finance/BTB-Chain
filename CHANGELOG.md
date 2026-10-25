@@ -13,11 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - BTB Chain is now an independent Layer 1: "the Convex of blockchain", a decentralized cloud with database-native state, queries and live subscriptions, cron jobs, on-chain hosting and native tokens
-- New roadmap (ROADMAP.md): six phases from language + VM through mainnet
+- New roadmap (ROADMAP.md): six phases from RISC-V VM + Rust SDK through mainnet
 - Native token BTB with a fixed supply of 1,000,000,000 and no minting
+- Contracts are Rust first, and any language that compiles to RISC-V is supported (like NEAR and ICP); a custom DSL is now optional and later
 
 ### Added
-- Design docs: architecture, contract language (Rust-like, compiled to RISC-V), tokenomics, cross-chain
+- Design docs: architecture, languages (Rust SDK, Convex-style project layout), tokenomics, cross-chain
+- docs/PRIOR_ART.md: detailed comparison with Convex, ICP, NEAR, Sui/Aptos, Nervos CKB/PolkaVM and THORChain
+- AGENTS.md: project conventions for AI agents and new contributors
 
 ### Removed
 - Arbitrum Orbit / AnyTrust L3 system: chain and node configs, Orbit SDK deployment scripts, Hardhat ERC-20 contract, Next.js token UI and Orbit CI workflows (preserved on the `orbit-legacy` branch)

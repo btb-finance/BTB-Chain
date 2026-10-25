@@ -80,7 +80,7 @@ Block producers choose transaction order and earn fees, so they could front-run 
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| Contract language | Own Rust-like language | Tables, queries, mutations, cron and tokens as syntax |
+| Contract languages | Rust first (SDK with attribute macros); any language that compiles to RISC-V | Familiar tools, like NEAR and ICP |
 | Compile target | RISC-V, 64-bit integer-only | Simple, near-native, ZK-friendly, deterministic |
 | VM | RISC-V recompiler with gas metering | Near-native speed with exact metering |
 | Node software | Rust | Safe, fast, strongest blockchain ecosystem |
@@ -93,9 +93,13 @@ Block producers choose transaction order and earn fees, so they could front-run 
 
 ## Prior art
 
-- **Convex** (convex.dev) — reactive queries, transactions and developer experience. Its backend is source-available under FSL-1.1-Apache-2.0; each release converts to Apache 2.0 two years after publication. Any code reuse requires a license review.
-- **Internet Computer** — on-chain hosting, query calls, timers, threshold signatures.
-- **Sui / Aptos** — owned-object fast path, Block-STM parallel execution, Move's money-safety ideas.
-- **NEAR** — sharding, storage staking, chain signatures.
-- **Nervos CKB / PolkaVM** — RISC-V VMs in production.
-- **THORChain** — native cross-chain swaps via vaults.
+BTB combines ideas that have each been proven separately. [PRIOR_ART.md](PRIOR_ART.md) explains each project in detail: how it works, what BTB takes from it, and what BTB does differently.
+
+| Project | What BTB takes |
+| --- | --- |
+| Convex | Developer experience, reactive queries, query/mutation split, crons |
+| Internet Computer | On-chain hosting, free queries, app-pays fees, timers, threshold signatures, many languages on one VM |
+| NEAR | Rust-first SDK with attribute macros, storage staking, chain signatures |
+| Sui / Aptos | Owned-object fast path, Block-STM parallel execution, money-safe types |
+| Nervos CKB / PolkaVM | RISC-V as the contract target, recompilation to native code |
+| THORChain | Validator-controlled vaults for native cross-chain assets |

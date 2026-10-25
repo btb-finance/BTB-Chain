@@ -24,7 +24,7 @@ On most chains, the chain cannot answer basic questions like "who holds this NFT
 | --- | --- |
 | Native token | **BTB**, fixed supply of **1,000,000,000**, no minting after genesis |
 | Fees | Every request pays the node that does the work (hosting node or block executor) |
-| Contract language | BTB's own Rust-like language, compiled to RISC-V |
+| Contract languages | **Rust first**, plus any language that compiles to RISC-V (C, C++, Zig, …), like NEAR and ICP |
 | VM | RISC-V recompiler with deterministic gas metering |
 | Node software | Rust |
 | Consensus | Proof-of-stake BFT, ~1 s finality, fast path for owned data |
@@ -40,44 +40,52 @@ btb deploy     # contracts + frontend go live
 # → https://my-dex.btb.app
 ```
 
+A BTB app is laid out like a Convex app: backend functions in `btb/`, frontend in `web/`. Contracts are plain Rust with attribute macros, in the style of NEAR's SDK:
+
 ```rust
-contract Dex {
-    table Pool {
-        id: u64 @primary,
-        token_a: TokenId @index,
-        token_b: TokenId @index,
-        reserve_a: u128,
-        reserve_b: u128,
-        creator: Address @index,
-    }
+use btb_sdk::prelude::*;
 
-    query fn price(pool: u64) -> Decimal {
-        let p = Pool.get(pool)?;
-        p.reserve_b / p.reserve_a
-    }
-
-    mutation fn swap(pool: u64, amount_in: u128, min_out: u128) {
-        let p = Pool.get(pool)?;
-        let out = amm_out(amount_in, p.reserve_a, p.reserve_b);
-        require(out >= min_out, "slippage too high")?;
-        // move tokens, update reserves
-    }
-
-    @cron(every = 1 hour)
-    mutation fn record_price_history() { /* for charts */ }
+#[btb::table]
+pub struct Pool {
+    #[primary] pub id: u64,
+    #[index]   pub token_a: TokenId,
+    #[index]   pub token_b: TokenId,
+    pub reserve_a: u128,
+    pub reserve_b: u128,
+    #[index]   pub creator: Address,
 }
+
+#[btb::query]
+pub fn price(pool: u64) -> Result<Ratio> {
+    let p = Pool::get(pool)?;
+    Ok(Ratio::new(p.reserve_b, p.reserve_a))
+}
+
+#[btb::mutation]
+pub fn swap(pool: u64, amount_in: u128, min_out: u128) -> Result<u128> {
+    let mut p = Pool::get(pool)?;
+    let out = amm_out(amount_in, p.reserve_a, p.reserve_b);
+    ensure!(out >= min_out, "slippage too high");
+    // move tokens, update reserves, save
+    Ok(out)
+}
+
+#[btb::cron(every = "1h")]
+pub fn record_price_history() -> Result<()> { Ok(()) }
 ```
 
-```js
-const price = useQuery(dex.price, { pool: 7 }); // live, no polling
-const swap  = useMutation(dex.swap);
+```tsx
+const price = useQuery(api.pools.price, { pool: 7 }); // live, no polling
+const swap  = useMutation(api.pools.swap);
 ```
+
+The same three function kinds (query, mutation, cron) in every app make BTB projects easy for both humans and AI agents to understand. See [AGENTS.md](AGENTS.md).
 
 ## Roadmap
 
 | Phase | Focus | Gate to move on |
 | --- | --- | --- |
-| 1 | Language + RISC-V VM (local, no chain) | Sample contracts compile and run with exact, repeatable gas |
+| 1 | RISC-V VM + Rust SDK (local, no chain) | Sample Rust contracts compile and run with exact, repeatable gas |
 | 2 | State database: tables, indexes, queries, subscriptions | Query by index and watch a UI update live |
 | 3 | Single-node devnet: `btb` CLI, TypeScript SDK, dashboard | An outside developer ships a working app and it feels like Convex |
 | 4 | Multi-validator testnet: consensus, networking, parallel execution | Testnet keeps finalizing when validators fail |
@@ -89,9 +97,11 @@ Full details: [ROADMAP.md](ROADMAP.md).
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — state model, network, consensus, hosting
-- [Language](docs/LANGUAGE.md) — the BTB contract language and RISC-V target
+- [Languages](docs/LANGUAGE.md) — Rust SDK, any language via RISC-V, Convex-style project layout
 - [Tokenomics](docs/TOKENOMICS.md) — fixed supply, fees, payment channels
 - [Cross-chain](docs/CROSS_CHAIN.md) — chain signatures and native-asset vaults
+- [Prior art](docs/PRIOR_ART.md) — what BTB learns from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM and THORChain, in detail
+- [AGENTS.md](AGENTS.md) — conventions for AI agents and new contributors
 - [Roadmap](ROADMAP.md)
 
 ## Build with us

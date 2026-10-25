@@ -48,7 +48,7 @@ Decisions are made by discussion and consensus in public. When consensus can't b
 
 ## Building with AI
 
-AI tools (Claude, Copilot and others) are welcome collaborators here; parts of this repository were written with Claude. Use them however helps you, with three rules:
+AI tools are welcome collaborators here. Use them however helps you, with three rules (and see [AGENTS.md](AGENTS.md) for the conventions agents should follow):
 
 1. **You own what you submit.** Read, understand and test everything before opening a PR, whether you or an AI wrote it.
 2. **Say so in your PR.** Tick the AI-assistance box in the PR template. It's not a penalty; it helps reviewers know where to look carefully.
