@@ -4,6 +4,7 @@ Deterministic, gas-metered RISC-V **RV64IM** interpreter for BTB Chain. No depen
 
 - `decode`: `decode(u32) -> Result<Instr, Trap>`
 - `vm`: `Vm::new(mem_size, gas_limit)`, `step()`, `run() -> Result<Exit, Trap>`
+- `elf`: `elf::load(&mut vm, bytes)` loads an ELF64 RISC-V ET_EXEC (PT_LOAD segments, zero-filled bss, pc = entry, sp = top of memory & !15) and returns exported global `STT_FUNC` symbols (name -> address) as entry points; typed `ElfError`, no panics, VM untouched on error
 - `gas`: per-instruction cost table, charged before execution
 
 `Exit::Ecall` returns control to the host (call number in a7); call `run()` again to resume. `EBREAK` returns `Exit::Halt`. Traps: `IllegalInstruction`, `MisalignedFetch`, `MemoryOutOfBounds { addr }`, `OutOfGas`.
