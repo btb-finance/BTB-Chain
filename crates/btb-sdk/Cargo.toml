@@ -1,0 +1,15 @@
+[package]
+name = "btb-sdk"
+description = "Rust contract SDK for BTB Chain (no_std)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Panic handler (calls `abort`), bump allocator and mem* routines for contracts built for the
+# bare-metal RISC-V target. Only active when `target_os = "none"`.
+runtime = []
+
+[dependencies]
+btb-codec = { path = "../btb-codec" }
+btb-sdk-macros = { path = "../btb-sdk-macros" }

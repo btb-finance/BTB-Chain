@@ -1,0 +1,12 @@
+[package]
+name = "btb-tests"
+description = "End-to-end tests: example contracts compiled to RISC-V and run in btb-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+btb-vm = { path = "../btb-vm" }
+btb-codec = { path = "../btb-codec" }
+btb-sdk = { path = "../btb-sdk" }

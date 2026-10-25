@@ -224,6 +224,16 @@ impl<T: Decode, const N: usize> Decode for [T; N] {
     }
 }
 
+/// The empty tuple encodes as zero bytes (no arguments, no result).
+impl Encode for () {
+    fn encode_to(&self, _out: &mut Vec<u8>) {}
+}
+impl Decode for () {
+    fn decode_from(_r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(())
+    }
+}
+
 macro_rules! tuple_impl {
     ($(($($n:ident),+))*) => {$(
         impl<$($n: Encode),+> Encode for ($($n,)+) {

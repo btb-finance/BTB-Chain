@@ -124,3 +124,14 @@ fn fuzz_never_panics() {
         }
     }
 }
+
+#[test]
+fn unit_is_zero_bytes() {
+    use btb_codec::{Decode, Encode};
+    assert!(().encode().is_empty());
+    assert_eq!(<()>::decode(&[]), Ok(()));
+    assert_eq!(
+        <()>::decode(&[0]),
+        Err(btb_codec::DecodeError::TrailingBytes)
+    );
+}

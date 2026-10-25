@@ -18,7 +18,7 @@ All integers are **little-endian**, fixed width, two's complement for signed typ
 | `Option<T>` | `00` for none; `01` followed by the encoding of `T` for some. Other tags invalid. |
 | `Vec<T>` | `u32` LE element count N, then N encodings of `T` |
 | `[T; N]` | N encodings of `T`, no length prefix (N is part of the type) |
-| tuple `(A, B, ...)` | encodings of each field in order, no prefix |
+| tuple `(A, B, ...)` | encodings of each field in order, no prefix; `()` is zero bytes |
 | `Address` | 32 raw bytes |
 
 Structs are encoded as the tuple of their fields in declaration order. Enums are not yet specified.
