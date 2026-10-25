@@ -66,6 +66,12 @@ btb deploy
 
 Write contracts in **Rust**, or any language that compiles to RISC-V. Apps follow a Convex-style layout that developers and AI agents can understand instantly. ([Languages](docs/LANGUAGE.md))
 
+### Anyone can host, anyone can earn
+
+Every action on BTB costs a tiny amount of BTB that goes to whoever did the work: a bot reading a price pays the validators that reported it, a page view pays the node that served it, a stored file pays the nodes holding it.
+
+Big files are never copied to every machine. A 100 GB NFT artwork is split into 100 small pieces stored on 100 different nodes, and any 34 pieces can rebuild it. So **anyone can host a small part of the network, even from a phone, and earn from it**. ([Scaling and earning](docs/SCALING.md))
+
 ### Fair, simple token
 
 **BTB has a fixed supply of 1,000,000,000.** No minting, ever. Every request pays the node that does the work. ([Tokenomics](docs/TOKENOMICS.md))

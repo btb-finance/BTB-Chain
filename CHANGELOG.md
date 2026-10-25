@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - docs/PRIOR_ART.md: detailed comparison with Convex, ICP, NEAR, Sui/Aptos, Nervos CKB/PolkaVM and THORChain
 - AGENTS.md: project conventions for AI agents and new contributors
 - docs/ORACLES.md: native oracles (threshold-BLS randomness, price feeds as tables, HTTPS actions, signed reports for other chains); `action` added as a fourth function kind
+- docs/SCALING.md: how each layer scales, five node roles and how each earns, erasure-coded storage with challenges, edge nodes on phones
 
 ### Removed
 - Arbitrum Orbit / AnyTrust L3 system: chain and node configs, Orbit SDK deployment scripts, Hardhat ERC-20 contract, Next.js token UI and Orbit CI workflows (preserved on the `orbit-legacy` branch)

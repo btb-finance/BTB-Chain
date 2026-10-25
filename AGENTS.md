@@ -20,6 +20,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/TOKENOMICS.md` | Fixed 1B BTB supply, fees, payment channels |
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
 | `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |
+| `docs/SCALING.md` | How each layer scales; node roles and how each earns; storage proofs |
 | `docs/PRIOR_ART.md` | What BTB takes from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain, Chainlink |
 | `CONTRIBUTING.md` | How to contribute, including AI-assisted work |
 
@@ -41,7 +42,8 @@ crates/
 - **Determinism:** nothing that affects consensus may use floats, system time, thread scheduling or unseeded randomness. The VM implements only integer RISC-V (rv64im).
 - **Gas:** every instruction and every host call costs gas. New host calls must define their gas cost.
 - **Fixed supply:** 1,000,000,000 BTB, never minted after genesis. No design may introduce inflation.
-- **Fees go to whoever does the work:** hosting nodes for queries and serving, executors for mutations and crons.
+- **Fees go to whoever does the work:** hosting and edge nodes for queries and serving, storage nodes for proven storage, validators for mutations, crons, oracles and signing.
+- **Large files never go on every validator:** they are erasure-coded into pieces on storage nodes; only hashes and assignments are on-chain.
 - **Blocks inside, requests outside:** developers and users see request/response APIs; consensus details stay internal.
 
 ## Working rules

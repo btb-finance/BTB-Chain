@@ -19,9 +19,9 @@ BTB Chain is a decentralized cloud: core validators keep the chain in agreement,
                   │  requests + signed vouchers
                   ▼
   ┌───────────────────────────────────┐      ┌──────────────────┐
-  │  Hosting nodes  (thousands)       │◄────►│  Blob storage    │
-  │  queries, subscriptions,          │      │  erasure-coded   │
-  │  websites, files, proofs          │      │  large files     │
+  │  Hosting + edge nodes (thousands, │◄────►│  Storage nodes   │
+  │  incl. phones): queries, subs,    │      │  erasure-coded   │
+  │  websites, cached files, proofs   │      │  file pieces     │
   └───────────────────────────────────┘      └──────────────────┘
         │ relay mutations      ▲ state sync + proofs
         ▼                      │
@@ -45,6 +45,13 @@ BTB Chain is a decentralized cloud: core validators keep the chain in agreement,
 - Sync state from validators and attach Merkle proofs so answers can be verified.
 - Relay mutations to validators and earn a share of their gas.
 - Anyone can run one; BTB scales traffic by adding hosting nodes without slowing consensus.
+
+### Storage nodes and edge nodes
+
+- **Storage nodes** hold erasure-coded pieces of large files (a 100 GB file becomes 100 pieces of ~3 GB, any 34 rebuild it), prove they still hold them through random challenges, and earn per period.
+- **Edge nodes**, including laptops and phones, cache popular content near users, relay requests and hold small pieces, earning per request.
+
+See [SCALING.md](SCALING.md) for how every layer scales and how each role earns.
 
 ## Consensus: blocks inside, requests outside
 

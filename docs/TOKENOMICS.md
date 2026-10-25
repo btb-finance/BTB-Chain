@@ -12,7 +12,14 @@ Every request pays the node that served or executed it:
 | Website / file serving | App via voucher | Hosting node | Batched on-chain |
 | Mutation | Sender (or app-sponsored) | Block executor 80%, relay host 20% (proposed) | In the block |
 | Cron job | Contract's prepaid balance | Block executor | In the block |
-| Storage | Contract locks a deposit | Refunded on delete | On-chain |
+| Oracle price read (in a mutation) | The user or bot reading it | Validators that reported the price | In the block |
+| Randomness | Mutation's gas | Validators | In the block |
+| Large-file storage (blob layer) | Uploader prepays per GB per period | Storage nodes that pass storage challenges | Per period |
+| File retrieval | App or user via voucher | Storage and edge nodes that served the bytes | Batched on-chain |
+| Cross-chain signing and relaying | The requesting app | Validators (signing), relayers (delivery) | In the block |
+| State storage | Contract locks a deposit | Refunded on delete | On-chain |
+
+See [Scaling and earning](SCALING.md) for how these micro-payments let anyone, down to a phone, earn by doing a small part of the work.
 
 ## Payment channels for per-request fees
 

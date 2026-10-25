@@ -78,7 +78,8 @@ Everything that makes BTB a decentralized cloud.
 - [ ] Hosting nodes: queries, subscriptions, websites, Merkle proofs on answers
 - [ ] Payment channels and signed vouchers for per-request fees
 - [ ] Fee split for mutations (executor / relay host)
-- [ ] Erasure-coded blob storage for large files
+- [ ] Storage nodes ([design](docs/SCALING.md)): erasure-coded file pieces, random piece assignment, storage challenges, automatic repair
+- [ ] Edge caching for popular content
 - [ ] Native DEX module with batch auctions (front-running protection)
 - [ ] Oracles ([design](docs/ORACLES.md)): threshold-BLS randomness beacon, built-in price feeds, HTTPS actions with transforms, signed reports for other chains
 - [ ] Cross-chain: threshold signatures and native-asset vaults (Ethereum, Bitcoin, Solana)
@@ -94,6 +95,8 @@ Everything that makes BTB a decentralized cloud.
 - [ ] Final genesis allocation of the fixed 1,000,000,000 BTB supply
 - [ ] Validator and hosting-node operator onboarding (region and provider diversity)
 - [ ] Mainnet launch
+
+**After mainnet:** lightweight node app for phones and home devices; state sharding when demand requires it.
 
 ---
 

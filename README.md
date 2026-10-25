@@ -20,19 +20,20 @@ On most chains, the chain cannot answer basic questions like "who holds this NFT
 - **Native tokens** — creating a token is one built-in call; every wallet, explorer and DEX sees it automatically.
 - **Cross-chain by signature** — BTB contracts can read and write Ethereum, Bitcoin, Solana and more without deploying contracts there.
 - **Oracles built in** — verifiable randomness, live price feeds and web data come from the validators themselves; no separate oracle network needed.
+- **Anyone can earn** — every action pays a tiny BTB fee to whoever did the work; big files are split across many nodes, so anyone can host a small part, even from a phone.
 
 ## At a glance
 
 | | |
 | --- | --- |
 | Native token | **BTB**, fixed supply of **1,000,000,000**, no minting after genesis |
-| Fees | Every request pays the node that does the work (hosting node or block executor) |
+| Fees | Every request pays the node that does the work: validators, hosting, storage or edge nodes |
 | Contract languages | **Rust first**, plus any language that compiles to RISC-V (C, C++, Zig, …), like NEAR and ICP |
 | VM | RISC-V recompiler with deterministic gas metering |
 | Node software | Rust |
 | Consensus | Proof-of-stake BFT, ~1 s finality, fast path for owned data |
 | Execution | Parallel (Block-STM style) |
-| Network | Core validators (consensus) + hosting nodes (queries, subscriptions, websites) |
+| Network | Core validators (consensus) + hosting, storage and edge nodes that anyone can run |
 
 ## Developer experience (target)
 
@@ -104,6 +105,7 @@ Full details: [ROADMAP.md](ROADMAP.md).
 - [Tokenomics](docs/TOKENOMICS.md) — fixed supply, fees, payment channels
 - [Cross-chain](docs/CROSS_CHAIN.md) — chain signatures and native-asset vaults
 - [Oracles](docs/ORACLES.md) — randomness, price feeds and web data built into the validator set
+- [Scaling and earning](docs/SCALING.md) — how BTB scales and how anyone, even on a phone, earns by hosting a small part
 - [Prior art](docs/PRIOR_ART.md) — what BTB learns from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain and Chainlink, in detail
 - [AGENTS.md](AGENTS.md) — conventions for AI agents and new contributors
 - [Roadmap](ROADMAP.md)
