@@ -17,8 +17,8 @@ A RISC-V VM that runs Rust contracts locally, with gas metering. No blockchain y
 - [x] Host-call ABI for storage, tables, tokens and context (`caller()`, block height), with a gas cost per call
 - [x] `btb-sdk` Rust crate (no_std) with `#[btb::table]`, `#[query]`, `#[mutation]`, `#[cron]` macros
 - [x] Argument and result encoding shared by all languages
-- [ ] Example Rust contracts: counter, token, simple DEX
-- [ ] C header for the host-call ABI, proving "any language"
+- [x] Example Rust contracts: counter, token, simple DEX
+- [x] C header for the host-call ABI, proving "any language"
 - [ ] Decide: build on an existing RISC-V VM (PolkaVM, CKB-VM) or write our own
 
 **Gate:** sample Rust contracts compile and run with exact, repeatable gas on every machine.

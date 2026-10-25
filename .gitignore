@@ -36,3 +36,7 @@ yarn-error.log*
 *.swo
 .DS_Store
 examples/counter/counter.elf
+examples/c-counter/counter.elf
+examples/c-counter/build/
+examples/token/token.elf
+examples/dex/dex.elf

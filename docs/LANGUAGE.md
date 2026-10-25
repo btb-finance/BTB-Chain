@@ -54,7 +54,7 @@ Running `btb dev` compiles the `btb/` folder, starts a local chain, hot-reloads 
 
 ## What works today (Phase 1)
 
-The SDK is the `btb-sdk` crate (`no_std`, plus `alloc`). The working example is `examples/counter`, built for `riscv64imac-unknown-none-elf` and run in `btb-vm` by `crates/btb-tests`.
+The SDK is the `btb-sdk` crate (`no_std`, plus `alloc`). The working examples are `examples/counter`, `examples/token` (fungible token in contract storage) and `examples/dex` (constant-product AMM, 0.3% fee), built for `riscv64imac-unknown-none-elf` and run in `btb-vm` by `crates/btb-tests`.
 
 ```rust
 use btb_sdk::btb;
@@ -190,3 +190,7 @@ Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a
 Queries run in read-only mode: calls 2, 3, 7, 10, 12 and 13 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Indexes, randomness, cross-chain and action calls are added later with their own numbers and gas costs.
 
 Argument and result bytes use the canonical encoding specified in [ENCODING.md](ENCODING.md).
+
+### C
+
+`include/btb.h` is a freestanding C header (only `<stdint.h>`) with the call numbers above, a `static inline` `ecall` wrapper per host call (`btb_storage_read`, `btb_return_data`, ...) and entry-point macros: `BTB_QUERY(name)`, `BTB_MUTATION(name)`, `BTB_CRON(name)`, `BTB_ACTION(name)` define `btb_<kind>_<name>(const uint8_t *ptr, uint64_t len)`. Compile with `clang --target=riscv64-unknown-elf -march=rv64im -mabi=lp64 -nostdlib -ffreestanding -O2 -mno-relax` and link with `ld.lld` and a linker script like `examples/c-counter/link.ld`. See `examples/c-counter/` for a working counter; a test checks the header's call numbers against `btb_vm::host::abi`.
