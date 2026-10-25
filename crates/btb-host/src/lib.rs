@@ -16,9 +16,11 @@
 mod build;
 mod http;
 pub mod proof;
+pub mod relay;
 mod site;
 mod state;
 
+pub use relay::RelayConfig;
 pub use state::{HostState, Recording};
 
 use btb_chain::Address;
@@ -54,6 +56,8 @@ pub struct HostConfig {
     pub serve_followers: Option<FollowerPolicy>,
     /// Concurrent HTTP connections; more get a 503.
     pub max_connections: usize,
+    /// Relay client-signed transactions to validators and earn the relay share of their fees.
+    pub relay: Option<RelayConfig>,
 }
 
 impl HostConfig {
@@ -68,6 +72,7 @@ impl HostConfig {
             poll_ms: 100,
             serve_followers: None,
             max_connections: 256,
+            relay: None,
         }
     }
 }
@@ -113,6 +118,8 @@ impl Host {
         let ctx = Arc::new(http::Ctx {
             node: node.clone(),
             shared: shared.clone(),
+            relay: cfg.relay.clone(),
+            chain_id: cfg.genesis.chain_id,
         });
         let sh = shared.clone();
         let thread = std::thread::Builder::new()

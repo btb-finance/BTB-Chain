@@ -65,7 +65,7 @@ Validators are run by parties who don't trust each other, so they must agree on 
 
 ## Execution layer
 
-The deterministic part a consensus engine drives is `crates/btb-chain`: signed transactions (Deploy, Call to a mutation or cron, Transfer), a genesis that allocates the fixed supply, blocks executed in order with per-transaction gas, fees accounted into a validator pool (80%) and a relay pool (20%), cron jobs run by block height, and a Merkle state root after every block. Queries never enter it. See [CHAIN.md](CHAIN.md).
+The deterministic part a consensus engine drives is `crates/btb-chain`: signed transactions (Deploy, Call to a mutation or cron, Transfer), a genesis that allocates the fixed supply, blocks executed in order with per-transaction gas, fees paid into a validator pool (80%, or 100% without a relayer) and to the relay host the sender signed into the transaction (20%), cron jobs run by block height, and a Merkle state root after every block. Queries never enter it. See [CHAIN.md](CHAIN.md).
 
 ## State model
 

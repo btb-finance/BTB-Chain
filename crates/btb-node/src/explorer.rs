@@ -31,6 +31,8 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Storage(_) => "storage",
         TxKind::Action(_) => "action",
         TxKind::Dkg(_) => "dkg",
+        TxKind::Cross(_) => "cross",
+        TxKind::Host(_) => "host",
     }
 }
 
@@ -46,6 +48,9 @@ pub fn tx_json(tx: &Transaction) -> Value {
         "gas_limit": tx.gas_limit(),
     });
     let o = v.as_object_mut().expect("object");
+    if let Some(r) = &tx.body.relayer {
+        o.insert("relayer".into(), json!(hex::encode(r)));
+    }
     match &tx.body.kind {
         TxKind::Transfer { to, amount } => {
             o.insert("to".into(), json!(hex::encode(to)));
@@ -115,6 +120,18 @@ pub fn tx_json(tx: &Transaction) -> Value {
                 json!(format!("{op:?}").split([' ', '(', '{']).next()),
             );
         }
+        TxKind::Host(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
+        TxKind::Cross(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
         TxKind::Action(op) => match op {
             btb_chain::ActionOp::Request {
                 contract,
@@ -162,6 +179,7 @@ mod tests {
         let k = SigningKey::from_bytes(&[3; 32]);
         let tx = Transaction::sign(
             TxBody {
+                relayer: None,
                 chain_id: 7,
                 nonce: 2,
                 kind: TxKind::Transfer {

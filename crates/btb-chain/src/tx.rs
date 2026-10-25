@@ -14,6 +14,8 @@
 //! RegisterValidator (tag 5): consensus_key[32] || network_addr:bytes
 //! SubmitEvidence    (tag 6): epoch:u64 || evidence
 //! Dkg               (tag 14): sub:u8 || fields (`dkg.rs`: 0 deal, 1 complain), sent by a consensus key
+//! Cross             (tag 21): sub:u8 || fields (`cross.rs`: 0 deal, 1 complain, 2 signature, 3 evidence, 4 attest, 5 prepare, 6 withdraw)
+//! Host              (tag 20): sub:u8 || fields (`host.rs`: 0 register url:bytes, 1 unregister)
 //! Action            (tag 13): sub:u8 || fields (`actions.rs`: 0 request an HTTPS action, 1 set the contract's hosts)
 //! Storage           (tag 12): sub:u8 || fields (`storage.rs`: 0 register, 1 add deposit, 2 withdraw, 3 store, 4 prove)
 //! Dex               (tag 10): sub:u8 || fields (`dex.rs`: 0 place, 1 cancel)
@@ -23,6 +25,12 @@
 //! Channel  (tag 8): sub:u8 || fields   (see `channel.rs`: open 0, top-up 1, close 2, start-close 3, finalize 4)
 //! manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes:[string]
 //! ```
+//!
+//! **Versions.** A body may name the hosting node that relayed it. If so, the tag byte has its
+//! high bit set (`tag | 0x80`) and the 32-byte relayer address follows it, before the fields.
+//! A body without a relayer is byte-for-byte the original encoding, so old transactions still
+//! decode, keep their signatures and ids, and execute (the fee then goes wholly to the
+//! validator pool). The relayer is inside the signed body: changing it breaks the signature.
 //!
 //! `kind` is the entry-point kind (0 query, 1 mutation, 2 cron, 3 action). All four decode so
 //! the error is a clear "kind not allowed", but only mutation is valid in a `Call`: queries never
@@ -49,6 +57,9 @@ pub const MAX_CRONS: usize = 16;
 pub const MAX_INDEX_SPECS: usize = 64;
 pub const MAX_CRON_EVERY: u64 = 1 << 32;
 pub const MAX_ARG_BYTES: usize = 1 << 20;
+
+/// High bit of the tag byte: a 32-byte relayer address follows the tag (tx encoding v2).
+const RELAYER_FLAG: u8 = 0x80;
 
 const SIG_DOMAIN: &[u8] = b"btb.tx.sig.v1";
 const ID_DOMAIN: &[u8] = b"btb.tx.id.v1";
@@ -210,8 +221,12 @@ pub enum TxKind {
     Storage(crate::storage::StorageOp),
     /// A beacon key-generation message (`crate::dkg`), signed by a validator's consensus key.
     Dkg(crate::dkg::DkgOp),
+    /// A cross-chain key, signature or vault operation (`crate::cross`).
+    Cross(crate::cross::CrossOp),
     /// An HTTPS action request, or the contract's host allowlist (`crate::actions`).
     Action(crate::actions::ActionOp),
+    /// Register or remove the sender as a hosting node that may be paid as relayer (`crate::host`).
+    Host(crate::host::HostOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -285,6 +300,10 @@ fn byte_kind(b: u8) -> Result<FunctionKind, TxError> {
 pub struct TxBody {
     pub chain_id: u64,
     pub nonce: u64,
+    /// The hosting node that relayed the transaction and earns `RELAY_SHARE_BPS` of its fee
+    /// (see `host.rs`). Chosen by the sender and covered by the signature, so no relay or
+    /// proposer can change it. `None` encodes exactly as before this field existed.
+    pub relayer: Option<Address>,
     pub kind: TxKind,
 }
 
@@ -292,6 +311,7 @@ impl Encode for TxBody {
     fn encode_to(&self, out: &mut Vec<u8>) {
         self.chain_id.encode_to(out);
         self.nonce.encode_to(out);
+        let tag_pos = out.len();
         match &self.kind {
             TxKind::Deploy { code, manifest } => {
                 0u8.encode_to(out);
@@ -361,10 +381,23 @@ impl Encode for TxBody {
                 14u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Cross(op) => {
+                21u8.encode_to(out);
+                op.encode_to(out);
+            }
             TxKind::Action(op) => {
                 13u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Host(op) => {
+                20u8.encode_to(out);
+                op.encode_to(out);
+            }
+        }
+        // v2: a relayer sets the tag's high bit and follows it as 32 bytes.
+        if let Some(relayer) = &self.relayer {
+            out[tag_pos] |= RELAYER_FLAG;
+            out.splice(tag_pos + 1..tag_pos + 1, relayer.iter().copied());
         }
     }
 }
@@ -373,7 +406,13 @@ impl TxBody {
     fn decode_body(r: &mut Reader<'_>) -> Result<Self, TxError> {
         let chain_id = u64::decode_from(r)?;
         let nonce = u64::decode_from(r)?;
-        let kind = match u8::decode_from(r)? {
+        let tag = u8::decode_from(r)?;
+        let relayer = if tag & RELAYER_FLAG != 0 {
+            Some(<[u8; 32]>::decode_from(r)?)
+        } else {
+            None
+        };
+        let kind = match tag & !RELAYER_FLAG {
             0 => TxKind::Deploy {
                 code: Vec::decode_from(r)?,
                 manifest: Manifest::decode_from(r)?,
@@ -425,8 +464,16 @@ impl TxBody {
                 Ok(op) => TxKind::Dkg(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
+            21 => match crate::cross::CrossOp::decode_from(r)? {
+                Ok(op) => TxKind::Cross(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
             13 => match crate::actions::ActionOp::decode_from(r)? {
                 Ok(op) => TxKind::Action(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            20 => match crate::host::HostOp::decode_from(r)? {
+                Ok(op) => TxKind::Host(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
             t => return Err(TxError::BadTag(t)),
@@ -434,6 +481,7 @@ impl TxBody {
         Ok(TxBody {
             chain_id,
             nonce,
+            relayer,
             kind,
         })
     }
@@ -535,7 +583,9 @@ impl Transaction {
             TxKind::Dex(op) => op.gas(),
             TxKind::Storage(op) => op.gas(),
             TxKind::Dkg(op) => op.gas(),
+            TxKind::Cross(op) => op.gas(),
             TxKind::Action(op) => op.gas(),
+            TxKind::Host(op) => op.gas(),
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }

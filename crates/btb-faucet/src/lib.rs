@@ -402,6 +402,7 @@ impl Faucet {
             let nonce = st.next;
             let tx = Transaction::sign(
                 TxBody {
+                    relayer: None,
                     chain_id,
                     nonce,
                     kind: TxKind::Transfer { to, amount },

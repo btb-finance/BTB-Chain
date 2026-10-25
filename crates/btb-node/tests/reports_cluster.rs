@@ -42,6 +42,7 @@ impl Wallet {
     fn sign(&mut self, kind: TxKind) -> Transaction {
         let tx = Transaction::sign(
             TxBody {
+                relayer: None,
                 chain_id: CHAIN_ID,
                 nonce: self.nonce,
                 kind,

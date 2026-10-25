@@ -106,13 +106,23 @@ impl Reply {
 }
 
 fn http(addr: SocketAddr, method: &str, path: &str, headers: &[(&str, &str)]) -> Reply {
+    http_body(addr, method, path, headers, "")
+}
+
+fn http_body(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Reply {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n");
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
-    req.push_str("\r\n");
+    req.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
     s.write_all(req.as_bytes()).unwrap();
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).unwrap();
@@ -1000,4 +1010,109 @@ fn sdk_ts_client_works_against_the_host() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A hosting node that relays: the client signs the host's relayer address into the
+/// transaction, the host forwards it to a validator, and the executor pays the host 20% of the
+/// fee. The host cannot change the relayer, and refuses transactions that name someone else.
+#[test]
+fn relay_endpoint_forwards_client_signed_tx_and_pays_the_host() {
+    use btb_chain::{HostOp, TxKind};
+    use btb_host::RelayConfig;
+    let mut c = Lite::new(4, 600, Some(FollowerPolicy::default()));
+    let mut hostw = Wallet::new(50);
+    let mut user = Wallet::new(51);
+    let other = Wallet::new(52).addr();
+    let fund_host = c.faucet.transfer(hostw.addr(), 1_000_000);
+    c.run(&fund_host);
+    let fund_user = c.faucet.transfer(user.addr(), 1_000_000);
+    c.run(&fund_user);
+    // The host registers its account as a hosting node.
+    c.run(&hostw.sign(TxKind::Host(HostOp::Register {
+        url: b"http://host".to_vec(),
+    })));
+
+    let mut cfg = HostConfig::new(
+        c.genesis.clone(),
+        c.validator_addrs(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    cfg.relay = Some(RelayConfig {
+        relayer: hostw.addr(),
+        rpc: (0..4)
+            .map(|i| c.node(i).rpc_addr().unwrap().to_string())
+            .collect(),
+    });
+    let host = Host::start(cfg).unwrap();
+    let addr = host.http_addr();
+    let info = http(addr, "GET", "/relay", &[]).json();
+    assert_eq!(info["relayer"], hex::encode(&hostw.addr()));
+    assert_eq!(info["chain_id"], CHAIN_ID);
+
+    let balance = |a: &Address| {
+        let v = c
+            .node(0)
+            .call("btb_getBalance", json!([hex::encode(a)]))
+            .unwrap();
+        v["balance"]
+            .as_str()
+            .map_or_else(|| v["balance"].as_u64().unwrap(), |s| s.parse().unwrap())
+    };
+    let transfer = TxKind::Transfer {
+        to: other,
+        amount: 10,
+    };
+
+    // Refused before reaching a validator: no relayer, someone else's, forged, garbage.
+    let nonce0 = user.nonce;
+    let plain = user.sign_relayed(transfer.clone(), None);
+    user.nonce = nonce0;
+    let wrong = user.sign_relayed(transfer.clone(), Some([0x77; 32]));
+    user.nonce = nonce0;
+    let mut forged = user.sign_relayed(transfer.clone(), Some(hostw.addr()));
+    forged.body.relayer = Some([0x78; 32]); // swapped after signing
+    user.nonce = nonce0;
+    for (what, body) in [
+        ("no relayer", hex::encode(&plain.encode())),
+        ("another relayer", hex::encode(&wrong.encode())),
+        ("changed relayer", hex::encode(&forged.encode())),
+        ("garbage", "zz".to_string()),
+        ("not a tx", "00ff".to_string()),
+    ] {
+        let r = http_body(addr, "POST", "/tx", &[], &body);
+        assert_eq!(r.status, 400, "{what}: {}", r.text());
+    }
+    assert_eq!(balance(&other), 0);
+
+    // The real one.
+    let (host_before, user_before) = (balance(&hostw.addr()), balance(&user.addr()));
+    let tx = user.sign_relayed(transfer, Some(hostw.addr()));
+    let r = http_body(addr, "POST", "/tx", &[], &hex::encode(&tx.encode()));
+    assert_eq!(r.status, 200, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(id, hex::encode(&tx.id()));
+    // The host executes the block itself, so the receipt is served by the host.
+    let mut receipt = Value::Null;
+    c.wait_until("the host to execute the transaction", 30, || {
+        receipt = http(addr, "GET", &format!("/tx/{id}"), &[]).json();
+        !receipt.is_null()
+    });
+    assert_eq!(receipt["status"], "success", "{receipt}");
+    let fee: u64 = receipt["fee"].as_str().unwrap().parse().unwrap();
+    assert!(fee > 0);
+    assert_eq!(balance(&other), 10);
+    assert_eq!(balance(&user.addr()), user_before - 10 - fee);
+    assert_eq!(
+        balance(&hostw.addr()),
+        host_before + fee / 5,
+        "the relayer gets exactly 20% of the fee"
+    );
+    host.shutdown();
+}
+
+#[test]
+fn host_without_relay_config_refuses_tx() {
+    let e = setup();
+    assert_eq!(http(e.addr(), "GET", "/relay", &[]).status, 404);
+    assert_eq!(http_body(e.addr(), "POST", "/tx", &[], "00").status, 501);
 }

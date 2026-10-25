@@ -343,6 +343,7 @@ pub(crate) fn begin_block(
         return Err("block carries oracle input but the chain has no oracle config".into());
     };
     dkg::begin_block(kv, cfg, og.dkg_window, height).map_err(|e| e.0)?;
+    crate::cross::begin_block(kv, height).map_err(|e| e.0)?;
     let epoch = cfg.epoch_of_block(height);
     let key = dkg::epoch_key(&*kv, epoch).map_err(|e| e.0)?;
     let Some(key) = key else {
@@ -386,6 +387,7 @@ pub(crate) fn end_block(
     };
     let og = &og;
     dkg::end_block(kv, epoch_len, height)?;
+    crate::cross::end_block(kv, height)?;
     let epoch = height.saturating_sub(1) / epoch_len;
     let Some(rec) = staking::epoch_record(&*kv, epoch)? else {
         return Ok(());

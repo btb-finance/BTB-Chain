@@ -377,6 +377,12 @@ pub struct NodeParams {
     /// (`crate::actions`). The default is strict (https only, public addresses only); tests use
     /// `FetchPolicy::test_mode()`.
     pub fetch_policy: crate::actions::FetchPolicy,
+    /// What this validator sees of Bitcoin and Solana (deposits, withdrawal transactions) for
+    /// the vault duties (`btb_chain::vault::Observer`). `None`: it votes for nothing. The real
+    /// chain watchers are future work; tests use `vault::MockObserver`.
+    pub observer: Option<std::sync::Arc<dyn btb_chain::vault::Observer>>,
+    /// Cross-chain signing knobs (`crate::cross`).
+    pub cross: crate::cross::CrossParams,
 }
 
 impl NodeParams {
@@ -402,6 +408,8 @@ impl NodeParams {
             dkg_dir: None,
             key_passphrase: None,
             fetch_policy: crate::actions::FetchPolicy::default(),
+            observer: None,
+            cross: crate::cross::CrossParams::default(),
         }
     }
 

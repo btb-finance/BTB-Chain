@@ -120,6 +120,7 @@ impl Submitter for RpcSubmitter {
             .ok_or("balance has no nonce")?;
         let tx = Transaction::sign(
             TxBody {
+                relayer: None,
                 chain_id,
                 nonce,
                 kind: TxKind::Channel(ChannelOp::Close { voucher: *voucher }),

@@ -17,7 +17,8 @@ btb-edge --upstream host1:8788,host2:8788 --rpc http://node:8545 \
          [--listen 127.0.0.1:8090] [--mem-mb 256] [--disk-dir DIR --disk-mb 4096] \
          [--site-ttl-secs 5] [--max-object-mb 1024] [--max-subscriptions 1024] \
          [--key edge-key.json --price 10 --free-requests 100 --free-window-secs 3600 \
-          --redeem-min 1000 --redeem-every-secs 3600]
+          --redeem-min 1000 --redeem-every-secs 3600] \
+         [--relayer <64 hex>]
 ```
 
 Library: `Edge::start(EdgeConfig, Services)`; `Services` takes the upstream (`Upstream` trait, `HttpUpstream` for real hosts), a `StorageSource`, node `Rpc` and a `Submitter`, so everything is testable with fakes.
@@ -62,9 +63,13 @@ Optional (`EdgeConfig::pay`, or `--key` with `--price`). Each client address get
 - The edge keeps only the best voucher per channel. `Edge::redeem()` (and a background task every `redeem_every`) sends `ChannelOp::Close` with it, signed with the edge's key, for channels that earned at least `redeem_min`. The channel is then gone; further vouchers for it are refused. A payer that disappears can still be settled any time before its timeout close finishes ([CHAIN.md](CHAIN.md#payment-channels)).
 - `/health` and `/metrics` are free.
 
+## Transaction relay
+
+With `--relayer <address>` (and `--rpc`), or `EdgeConfig::relay`, the edge forwards client-signed transactions: `GET /relay` returns `{relayer, chain_id}`, `POST /tx` (hex body or `{"tx": hex}`) checks the signature, the chain id and that the transaction names this relayer, then sends it through node RPC (`btb_sendTransaction`) and answers `{id, relayer}`; `GET /tx/<id>` returns the receipt from the node. Same rules as a hosting node ([HOSTING.md](HOSTING.md#relaying-transactions)): the client signs the relayer, the edge cannot change it, the account must be registered on chain (`Host::Register`) to be paid, and the executor then pays it 20% of the fee ([CHAIN.md](CHAIN.md#fees)). These routes are free (not behind the voucher quota); the `relayed` counter is in `/metrics`. Point `--rpc` at validators or RPC nodes that accept transactions.
+
 ## Metrics
 
-`GET /metrics` (Prometheus text): `requests`, `hits`, `misses` (a revalidated file is a hit; a request that waited on another's fetch is a miss and also `coalesced`), per kind `site_*`, `file_*`, `query_*`, `bytes_out`, `upstream_requests`, `upstream_bytes`, `storage_fetches`, `storage_bytes`, `storage_failures`, `tampered_rejected`, `invalidations`, `subscriptions_opened`, `passthrough`, `free_served`, `paid_served`, `payment_required`, `vouchers_accepted`, `vouchers_rejected`, `redeem_txs`, `redeem_failures`, `redeemed_units`, and gauges `cache_memory_bytes`, `cache_memory_entries`, `cache_disk_bytes`, `subscriptions`, `unsettled_units`. `GET /status` has a short JSON summary.
+`GET /metrics` (Prometheus text): `requests`, `hits`, `misses` (a revalidated file is a hit; a request that waited on another's fetch is a miss and also `coalesced`), per kind `site_*`, `file_*`, `query_*`, `bytes_out`, `upstream_requests`, `upstream_bytes`, `storage_fetches`, `storage_bytes`, `storage_failures`, `tampered_rejected`, `invalidations`, `subscriptions_opened`, `passthrough`, `free_served`, `paid_served`, `payment_required`, `vouchers_accepted`, `vouchers_rejected`, `relayed`, `redeem_txs`, `redeem_failures`, `redeemed_units`, and gauges `cache_memory_bytes`, `cache_memory_entries`, `cache_disk_bytes`, `subscriptions`, `unsettled_units`. `GET /status` has a short JSON summary.
 
 ## Security notes
 

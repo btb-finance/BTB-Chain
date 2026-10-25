@@ -9,7 +9,7 @@ const USAGE: &str = "usage: btb <command>\n\
   btb build                                          build target/btb/<name>.elf and list entry points\n\
   btb dev [--port N] [--data DIR]                    build, serve and hot reload (default port 8787)\n\
   btb deploy [--rpc URL --key FILE [--gas-limit N]]  write a deploy bundle; with --rpc deploy it to a node\n\
-  btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]   send a mutation\n\
+  btb call --rpc URL --key FILE [--gas-limit N] [--relayer HOST_URL] <contract> <fn> [args]   send a mutation (--relayer: submit via a hosting node, which earns 20% of the fee)\n\
   btb query --rpc URL <contract> <fn> [args]         run a read-only query\n\
   btb keygen <FILE>                                  write a new account key file\n\
   btb store <file> --rpc URL --key FILE [--k N --m N --periods N]   erasure-code a file onto storage nodes\n\
@@ -185,6 +185,8 @@ fn no_args(rest: &[String]) -> Result<(), String> {
 struct Flags {
     rpc: Option<String>,
     key: Option<String>,
+    /// A hosting or edge node to submit through (it earns the relay share of the fee).
+    relayer: Option<String>,
     gas_limit: Option<u64>,
     positional: Vec<String>,
 }
@@ -197,6 +199,9 @@ impl Flags {
             match a.as_str() {
                 "--rpc" => f.rpc = Some(it.next().ok_or("--rpc needs a URL")?),
                 "--key" => f.key = Some(it.next().ok_or("--key needs a file")?),
+                "--relayer" => {
+                    f.relayer = Some(it.next().ok_or("--relayer needs a hosting node URL")?)
+                }
                 "--gas-limit" => {
                     f.gas_limit = Some(
                         it.next()
@@ -214,6 +219,10 @@ impl Flags {
     fn session(&self) -> Result<chain::Session, String> {
         let rpc = self.rpc.as_deref().ok_or("--rpc is required")?;
         let key = self.key.as_deref().ok_or("--key is required")?;
-        chain::Session::open(rpc, &PathBuf::from(key))
+        let s = chain::Session::open(rpc, &PathBuf::from(key))?;
+        match &self.relayer {
+            Some(host) => s.via_relay(host),
+            None => Ok(s),
+        }
     }
 }

@@ -7,6 +7,7 @@ pub mod attest;
 pub mod blockstore;
 pub mod channel_rpc;
 pub mod config;
+pub mod cross;
 pub mod dex_rpc;
 pub mod dkg;
 pub mod driver;

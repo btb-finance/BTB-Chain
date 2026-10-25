@@ -97,8 +97,8 @@ Everything that makes BTB a decentralized cloud.
 - [x] Hosting nodes: queries, subscriptions, websites, Merkle proofs on answers ([design](docs/HOSTING.md); `crates/btb-host`, no fees or storage-node files yet)
 - [x] Payment channels and signed vouchers for per-request fees
   - `TxKind::Channel` (open, top-up, payee close, payer timeout close with a challenge period) in `btb-chain`, locked funds in the supply invariant, parallel-equivalence tested; `btb-voucher` crate and `sdk-ts/src/voucher.ts` with a cross-language fixture ([CHAIN.md](docs/CHAIN.md#payment-channels)); hosting nodes that sell requests against vouchers come with the hosting-node item
-- [ ] Fee split for mutations (executor / relay host)
-  - the 80/20 split is accounted in `btb-chain`, but the relay share only accumulates in `relay_pool()`: paying it needs a signed `relayer` field and a hosting-node registry, see the design note in [CHAIN.md](docs/CHAIN.md#fees)
+- [x] Fee split for mutations (executor / relay host)
+  - signed optional `relayer` in the transaction body (tag high bit; old encodings unchanged), 80% validator pool / 20% to a registered relayer (else 100% validator pool), `Host` registry transaction, deferred relayer credits in the parallel executor (differential-tested), `POST /tx` relay on `btb-host` and `btb-edge`, `btb call --relayer`, `BtbClient.submit` in `sdk-ts` ([CHAIN.md](docs/CHAIN.md#fees), [HOSTING.md](docs/HOSTING.md#relaying-transactions)); no host bond yet
 - [x] Storage nodes ([design](docs/SCALING.md), [STORAGE.md](docs/STORAGE.md)): erasure-coded file pieces, random piece assignment, storage challenges, automatic repair
   - `crates/btb-storage` (Reed-Solomon, Merkle piece proofs, piece store with HTTP API, node daemon, store/fetch client), `TxKind::Storage` in `btb-chain` (deposits, escrow, deterministic assignment, challenges, slash, reassignment, payouts, supply-checked), `btb store` / `btb fetch` / `btb storage-node run`; end-to-end test with a 4-validator cluster and 6 storage-node processes (store 1 MiB, kill 2, fetch, repair); assignment and challenges are seeded by the randomness beacon once the block has one (the grindable block hash is the fallback only before the first beacon key or on chains without oracles); hosting nodes serve large site files from storage nodes by root (`<path>.root`, `/file/<root>`)
 - [x] Edge caching for popular content ([design](docs/EDGE.md))
@@ -113,6 +113,8 @@ Everything that makes BTB a decentralized cloud.
   - [x] Signed reports for other chains (BLS first step): `report_request` (host call 42) queues up to 1 KiB, the beacon committee threshold-signs it bound to chain, contract and id, `btb_oracleReport` serves report and signature, `btb_oracle::report::verify` checks it with only the 48-byte group key (Solidity sketch for EIP-2537 in [ORACLES.md](docs/ORACLES.md#4-btb-as-an-oracle-for-other-chains)); a threshold-ECDSA variant for cheap EVM verification waits for the cross-chain key (`crates/btb-node/tests/reports_cluster.rs`)
   - [ ] Remaining: **price feeds from real exchange sources** through HTTPS actions (the fetch machinery exists; the observation loop still uses a mock source), update rule, circuit breakers, TWAP, and **stake-weighted beacon shares** (the committee threshold counts validators, not stake)
 - [ ] Cross-chain: threshold signatures and native-asset vaults (Ethereum, Bitcoin, Solana)
+  - [x] Step 1, threshold keys: FROST over secp256k1/BIP-340 (Taproot) and Ed25519 (Solana) with on-chain DKG, resharing that keeps the group key, preprocessed nonces that are never reused, FROST signing over the oracle side channel, signatures stored on chain and served over RPC, evidence and exclusion of faulty signers; native vault with wrapped user tokens minted only against deposits two thirds of the stake agreed on, burn-before-sign withdrawals (mock observer); verified against a BIP-340 verifier and `ed25519-dalek`, cluster test included ([CROSS_CHAIN.md](docs/CROSS_CHAIN.md))
+  - [ ] Remaining: real Bitcoin and Solana chain watchers, chain-side transaction parsing, refunds, vault caps, slashing from evidence, **Ethereum** (threshold ECDSA is not built; BLS reports with an EIP-2537 verifier are the interim path)
 
 **Gate:** a full DEX runs end to end on testnet, frontend included.
 
@@ -137,7 +139,7 @@ Shown locally so far (not yet on a public testnet, so the gate stays open): on `
 - [ ] Whether to build an optional BTB DSL later, and its name
 - [ ] TypeScript support: compile to RISC-V or run an interpreter inside the VM
 - [ ] Fast-path design: owned objects (Sui-style) or a simpler rule
-- [ ] Mutation fee split between executor and relay host (80/20 proposed)
+- [x] Mutation fee split between executor and relay host (80/20, implemented in Phase 5: see above)
 - [ ] Genesis reserve for early validator rewards (10–20% proposed) and the rest of the allocation
 - [ ] Validator count and minimum stake
 - [ ] Reuse of Apache-2.0-converted Convex backend code (subject to license review)

@@ -656,6 +656,160 @@ fn resharing_keeps_the_group_key_through_three_epochs_with_a_validator_set_chang
     assert!(last.verify(CHAIN_ID, &k3.group));
 }
 
+// ------------------------------------------------------------------------------ degraded mode
+
+/// Operators `joiners` register and stake, operators `leavers` unbond everything, in one block.
+fn churn(s: &mut Sim, joiners: &[usize], leavers: &[usize]) {
+    let mut txs = Vec::new();
+    for &l in leavers {
+        txs.push(s.ops[l].sign(TxKind::Unstake { amount: STAKE }));
+    }
+    for &j in joiners {
+        txs.push(s.ops[j].sign(TxKind::RegisterValidator {
+            consensus_key: ckey_bytes(j),
+            network_addr: Vec::new(),
+        }));
+        let validator = s.ops[j].key.verifying_key().to_bytes();
+        txs.push(s.ops[j].sign(TxKind::Stake {
+            validator,
+            amount: STAKE,
+        }));
+    }
+    for r in s.block(txs) {
+        ok(&r);
+    }
+}
+
+fn deploy_roller(s: &mut Sim) -> Address {
+    let tx = s.user.deploy(elf("oracle"), manifest("oracle"));
+    let rs = s.block(vec![tx]);
+    let c = deployed(&rs[0]);
+    let fund = s.user.transfer(c, 100_000_000_000);
+    s.block(vec![fund]);
+    c
+}
+
+fn roll(s: &mut Sim, c: Address) -> Receipt {
+    let tx = s.user.call(c, "roll", &());
+    // pending DKG transactions come first; the call is the last transaction
+    s.block(vec![tx]).pop().unwrap()
+}
+
+fn assert_unavailable(r: &Receipt) {
+    match &r.status {
+        Status::Reverted(Revert::Trap(t)) => assert!(t.contains("RandomnessUnavailable"), "{t}"),
+        other => panic!("expected RandomnessUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_failed_reshare_whose_holders_left_enters_degraded_mode_and_a_fresh_dkg_restores_the_beacon() {
+    // Genesis validators 0..4 (threshold 3). Before the tail, 0 and 1 leave and stay silent, and
+    // 4..8 join: only holders 2 and 3 remain validators, below the threshold.
+    let mut s = Sim::new(4, 8, W);
+    s.run_to(W + 1);
+    let c = deploy_roller(&mut s);
+    ok(&roll(&mut s, c));
+    let k0 = s.epoch_key(0).unwrap();
+    assert!(dkg::degraded(s.kv()).unwrap().is_none());
+    s.behave[0] = Behave::Silent;
+    s.behave[1] = Behave::Silent;
+    churn(&mut s, &[4, 5, 6, 7], &[0, 1]);
+
+    // Run to the last block of epoch 0: the reshare has failed.
+    s.run_to(E);
+    let failed = s.session(1);
+    assert_eq!((failed.from, failed.status), (Some(0), dkg::STATUS_FAILED));
+    assert!(s.epoch_key(1).is_none(), "no key carried over");
+    let d = dkg::degraded(s.kv()).unwrap().expect("degraded");
+    assert_eq!((d.epoch, d.height, d.reachable, d.threshold), (1, E, 2, 3));
+
+    // The chain keeps finalizing without a beacon; randomness traps.
+    s.run_to(E + 1);
+    assert_eq!(s.height(), E + 1);
+    assert_unavailable(&roll(&mut s, c));
+    // A fresh generation (not a reshare) runs among epoch 1's validators.
+    let fresh = s.session(1);
+    assert_eq!(fresh.from, None);
+    assert_eq!(fresh.window_start, E + 1);
+    assert_eq!(fresh.committee().len(), 6);
+    assert!(dkg::degraded(s.kv()).unwrap().is_some());
+    assert_unavailable(&roll(&mut s, c));
+
+    // It completes, the beacon returns under a different group key, and the change is recorded.
+    s.run_to(E + W + 2);
+    assert_eq!(s.session(1).status, dkg::STATUS_DONE);
+    let k1 = s.epoch_key(1).expect("fresh key");
+    assert_eq!(k1.origin, 1);
+    assert_ne!(k1.group.public_key, k0.group.public_key);
+    assert!(dkg::degraded(s.kv()).unwrap().is_none());
+    let changes = dkg::key_changes(s.kv()).unwrap();
+    assert_eq!(changes.len(), 1);
+    let ch = &changes[0];
+    assert_eq!((ch.epoch, ch.height), (1, E + W));
+    assert_eq!((ch.degraded_epoch, ch.degraded_height), (1, E));
+    assert_eq!(ch.old_group, k0.group.public_key.to_bytes().to_vec());
+    assert_eq!(ch.new_group, k1.group.public_key.to_bytes().to_vec());
+    assert_eq!(dkg::key_change(s.kv(), 1).unwrap().as_ref(), Some(ch));
+    ok(&roll(&mut s, c));
+    let last = oracle::last_beacon(s.kv()).unwrap().unwrap();
+    assert!(last.verify(CHAIN_ID, &k1.group));
+    // The next epoch reshares the new key again.
+    s.run_to(2 * E + 3);
+    assert_eq!(s.session(2).from, Some(1));
+    assert_eq!(s.session(2).status, dkg::STATUS_DONE);
+    assert_eq!(
+        s.epoch_key(2).unwrap().group.public_key,
+        k1.group.public_key
+    );
+}
+
+#[test]
+fn degraded_mode_is_not_entered_while_enough_holders_remain_validators() {
+    // One holder leaves, two stay silent: reshare fails (2 of 4 dealt) but holders 1, 2, 3
+    // are still validators, exactly the threshold, so the old key carries over as before.
+    let mut s = Sim::new(4, 5, W);
+    s.run_to(W + 1);
+    let c = deploy_roller(&mut s);
+    let k0 = s.epoch_key(0).unwrap();
+    s.behave[0] = Behave::Silent;
+    s.behave[1] = Behave::Silent;
+    churn(&mut s, &[4], &[0]);
+    s.run_to(E + 3);
+    assert_eq!(s.session(1).status, dkg::STATUS_FAILED);
+    assert_eq!(s.epoch_key(1).unwrap(), k0);
+    assert!(dkg::degraded(s.kv()).unwrap().is_none());
+    assert!(dkg::key_changes(s.kv()).unwrap().is_empty());
+    ok(&roll(&mut s, c));
+}
+
+#[test]
+fn a_failed_fresh_generation_in_degraded_mode_retries_at_the_next_tail() {
+    let mut s = Sim::new(4, 8, W);
+    s.run_to(W + 1);
+    s.behave[0] = Behave::Silent;
+    s.behave[1] = Behave::Silent;
+    churn(&mut s, &[4, 5, 6, 7], &[0, 1]);
+    // Three of the six new validators stay silent in the recovery generation: it fails.
+    s.behave[4] = Behave::Silent;
+    s.behave[5] = Behave::Silent;
+    s.behave[6] = Behave::Silent;
+    s.run_to(E + W + 2);
+    assert_eq!(s.session(1).status, dkg::STATUS_FAILED);
+    assert!(s.epoch_key(1).is_none());
+    assert!(dkg::degraded(s.kv()).unwrap().is_some());
+    // They come back: the tail of epoch 1 deals a fresh key for epoch 2 and ends degraded mode.
+    s.behave[4] = Behave::Honest;
+    s.behave[5] = Behave::Honest;
+    s.behave[6] = Behave::Honest;
+    s.run_to(2 * E + 3);
+    let sess = s.session(2);
+    assert_eq!((sess.from, sess.status), (None, dkg::STATUS_DONE));
+    assert!(dkg::degraded(s.kv()).unwrap().is_none());
+    let ch = dkg::key_change(s.kv(), 2).unwrap().expect("key change");
+    assert_eq!((ch.degraded_epoch, ch.degraded_height), (1, E));
+}
+
 // ------------------------------------------------------------------------------ refusals
 
 #[test]

@@ -316,10 +316,7 @@ fn btb_fee_goes_to_the_validator_pool() {
     assert_eq!((c.n, c.d, c.base_volume), (5, 1, 1_000)); // lowest tied price
                                                           // The bid receives 1000 BTB units less 10% = 900; the 100 BTB fee goes to the validator pool
                                                           // next to the validator share of the two transaction fees.
-    let validator_share: u64 = r
-        .iter()
-        .map(|x| x.fee - x.fee * RELAY_SHARE_BPS / 10_000)
-        .sum();
+    let validator_share: u64 = r.iter().map(|x| x.fee).sum();
     let pool1 = w.net.state.validator_pool_balance().unwrap();
     assert_eq!(pool1 - pool0, 100 + validator_share);
     assert_eq!(w.tok(&gold, &a.addr()), FAUCET + 4_500); // 5000 gross less 10%

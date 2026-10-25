@@ -9,6 +9,7 @@
 mod support;
 use btb_chain::*;
 use btb_codec::Address as CodecAddress;
+use btb_codec::Encode;
 use btb_runtime::MemKv;
 use btb_vm::FunctionKind;
 use btb_voucher::{SignedVoucher, Voucher};
@@ -28,6 +29,7 @@ impl Lcg {
     }
 }
 
+static RELAYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CHANNEL_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const RICH: u64 = 10 * UNITS_PER_BTB;
 const WALLETS: usize = 14;
@@ -138,6 +140,12 @@ fn setup(rigs: &mut [Rig], w: &mut [Wallet]) -> World {
         .iter()
         .map(|c| w[0].transfer(*c, 2_000_000_000))
         .collect();
+    // two wallets are registered hosting nodes (relayers); the random blocks toggle them
+    for h in [12, 13] {
+        txs.push(w[h].sign(TxKind::Host(HostOp::Register {
+            url: b"http://host".to_vec(),
+        })));
+    }
     txs.push(w[0].call(token, "init", &(1_000_000u128,)));
     txs.push(w[0].call(dex, "add_liquidity", &(500_000u128, 500_000u128)));
     let r = step(rigs, txs);
@@ -182,7 +190,7 @@ fn random_block(
             // transfer-only block: hot recipients and disjoint pairs (fast path candidates)
             rng.below(3)
         } else {
-            rng.below(31)
+            rng.below(36)
         };
         let tx = match k {
             0 => w[i].transfer(to_hot, amt),
@@ -290,6 +298,45 @@ fn random_block(
                     }
                 }
             }
+            31..=33 => {
+                // a relayed transfer or call: registered host, unregistered, the sender itself,
+                // a hot account (deferred credits must not be visible to its other txs)
+                let relayer = [
+                    w[12].addr(),
+                    w[13].addr(),
+                    w[i].addr(),
+                    treasury(),
+                    w[1].addr(),
+                    w[12].addr(),
+                ][rng.below(6)];
+                let kind = if k == 33 {
+                    TxKind::Call {
+                        contract: c.counter,
+                        kind: FunctionKind::Mutation,
+                        function: "increment".into(),
+                        args: (3u64,).encode(),
+                        gas_limit: GAS,
+                        max_fee: u64::MAX,
+                    }
+                } else {
+                    TxKind::Transfer {
+                        to: if k == 31 { to_hot } else { w[j].addr() },
+                        amount: amt,
+                    }
+                };
+                w[i].sign_relayed(kind, Some(relayer))
+            }
+            34 => {
+                let h = 12 + rng.below(2);
+                w[h].sign(TxKind::Host(if rng.below(3) == 0 {
+                    HostOp::Unregister
+                } else {
+                    HostOp::Register {
+                        url: vec![b'u'; rng.below(300)],
+                    }
+                }))
+            }
+            35 => w[i].transfer(w[12 + rng.below(2)].addr(), amt), // pay a relayer directly
             _ => w[i].call(c.counter, "increment", &(1u64,)),
         };
         txs.push(tx);
@@ -320,6 +367,10 @@ fn run_seed(seed: u64, blocks: usize) -> Vec<Rig> {
             .map(|t| matches!(t.body.kind, TxKind::Channel(_)))
             .collect();
         let rec = step(&mut rigs, txs);
+        RELAYED.fetch_add(
+            rec.iter().filter(|r| r.relayer.is_some()).count(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for (r, is) in rec.iter().zip(kinds) {
             if is && r.status == Status::Success {
                 CHANNEL_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -357,6 +408,8 @@ fn parallel_equals_sequential_on_random_blocks() {
     assert!(conflicts > 50, "re-executions: {conflicts}");
     assert!(fast > 100, "fast-path txs: {fast}");
     assert!(fell_back > 0, "pool-touching blocks must fall back");
+    let relayed = RELAYED.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(relayed > 20, "relayer-paying txs: {relayed}");
     let ok = CHANNEL_OK.load(std::sync::atomic::Ordering::Relaxed);
     assert!(ok > 20, "successful channel txs: {ok}");
 }

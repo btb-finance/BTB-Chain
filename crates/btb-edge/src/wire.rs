@@ -246,7 +246,12 @@ pub struct Request {
     pub path: String,
     pub query: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
+    /// Body of a POST (`/tx`), at most [`MAX_BODY`] bytes.
+    pub body: Vec<u8>,
 }
+
+/// Largest request body the edge reads.
+pub const MAX_BODY: usize = 64 * 1024;
 
 pub fn read_request(conn: &TcpStream) -> Result<Request, String> {
     conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
@@ -274,6 +279,15 @@ pub fn read_request(conn: &TcpStream) -> Result<Request, String> {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
+    let len: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if len > MAX_BODY {
+        return Err("body too large".into());
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).map_err(|e| e.to_string())?;
     let (path, qs) = target.split_once('?').unwrap_or((&target, ""));
     let query = qs
         .split('&')
@@ -288,6 +302,7 @@ pub fn read_request(conn: &TcpStream) -> Result<Request, String> {
         path: pct_decode(path),
         query,
         headers,
+        body,
     })
 }
 

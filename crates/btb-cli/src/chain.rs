@@ -113,11 +113,52 @@ impl Rpc {
     }
 }
 
+/// A blocking HTTP request to `host:port` (`http://` optional); returns the status and body.
+fn http(host: &str, method: &str, path: &str, body: &str) -> Result<(u16, Vec<u8>), String> {
+    let h = host
+        .strip_prefix("http://")
+        .unwrap_or(host)
+        .trim_end_matches('/');
+    let addr = h
+        .to_socket_addrs()
+        .map_err(|e| format!("address {h}: {e}"))?
+        .next()
+        .ok_or("address does not resolve")?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
+        .map_err(|e| format!("connect {h}: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {h}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let at = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("bad http response")?;
+    let head = String::from_utf8_lossy(&raw[..at]);
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or("bad http status")?;
+    Ok((status, raw[at + 4..].to_vec()))
+}
+
+/// A hosting or edge node that forwards this account's transactions and earns the relay share.
+struct Relay {
+    host: String,
+    relayer: [u8; 32],
+}
+
 /// Everything needed to sign for one account against one node.
 pub struct Session {
     rpc: Rpc,
     key: SigningKey,
     chain_id: u64,
+    relay: Option<Relay>,
 }
 
 impl Session {
@@ -129,7 +170,31 @@ impl Session {
             rpc,
             key: load_key(key_file)?,
             chain_id,
+            relay: None,
         })
+    }
+
+    /// Submit through the hosting (or edge) node at `host` instead of straight to the node RPC:
+    /// its relayer address (`GET /relay`) is signed into every transaction, so it earns 20% of
+    /// the fees, and it cannot be changed by the node.
+    pub fn via_relay(mut self, host: &str) -> Result<Session, String> {
+        let (status, body) = http(host, "GET", "/relay", "")?;
+        let v: Value = serde_json::from_slice(&body).map_err(|e| format!("relay info: {e}"))?;
+        if status != 200 {
+            return Err(format!(
+                "{host} does not relay transactions: {}",
+                v["error"].as_str().unwrap_or("error")
+            ));
+        }
+        if v["chain_id"].as_u64().is_some_and(|c| c != self.chain_id) {
+            return Err(format!("{host} serves a different chain"));
+        }
+        let relayer = hex32(v["relayer"].as_str().ok_or("relay info has no relayer")?)?;
+        self.relay = Some(Relay {
+            host: host.to_string(),
+            relayer,
+        });
+        Ok(self)
     }
 
     /// A JSON-RPC call to the node this session talks to.
@@ -154,15 +219,29 @@ impl Session {
         let nonce = self.nonce()?;
         let tx = Transaction::sign(
             TxBody {
+                relayer: self.relay.as_ref().map(|r| r.relayer),
                 chain_id: self.chain_id,
                 nonce,
                 kind,
             },
             &self.key,
         );
-        let r = self
-            .rpc
-            .call("btb_sendTransaction", json!([hex_encode(&tx.encode())]))?;
+        let r = match &self.relay {
+            None => self
+                .rpc
+                .call("btb_sendTransaction", json!([hex_encode(&tx.encode())]))?,
+            Some(relay) => {
+                let (status, body) = http(&relay.host, "POST", "/tx", &hex_encode(&tx.encode()))?;
+                let v: Value = serde_json::from_slice(&body).map_err(|e| format!("relay: {e}"))?;
+                if status != 200 {
+                    return Err(format!(
+                        "relay refused the transaction: {}",
+                        v["error"].as_str().unwrap_or("error")
+                    ));
+                }
+                v
+            }
+        };
         let id = r["id"].as_str().ok_or("no transaction id")?.to_string();
         let end = Instant::now() + Duration::from_secs(60);
         while Instant::now() < end {
@@ -185,6 +264,7 @@ impl Session {
         if let Some(g) = gas_limit {
             let need = Transaction::sign(
                 TxBody {
+                    relayer: None,
                     chain_id: self.chain_id,
                     nonce: 0,
                     kind: kind.clone(),

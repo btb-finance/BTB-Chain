@@ -7,3 +7,6 @@ btb-host: a BTB Chain hosting node (follows the chain, serves queries, subscript
   --listen <multiaddr>       libp2p listen address (default /ip4/127.0.0.1/udp/0/quic-v1)
   --serve-followers          serve block sync to other hosting nodes
   --poll-ms <n>              block poll interval when caught up (default 100)
+  --relayer <hex>            account that clients sign into transactions relayed through POST /tx
+                             (register it on chain with a Host transaction to earn 20% of their fees)
+  --relay-rpc <host:port>    validator JSON-RPC to forward relayed transactions to (repeatable)

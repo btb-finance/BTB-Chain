@@ -917,7 +917,7 @@ fn rewards_split_the_pool_by_stake_and_sum_exactly() {
     let tx = e.rep.transfer([5; 32], 1);
     let r = e.run_one(tx);
     assert_eq!(e.height(), E);
-    let fee_part = r.fee - r.fee * RELAY_SHARE_BPS / 10_000;
+    let fee_part = r.fee; // no relayer: the whole fee
     let pool = pool_before_last + fee_part;
     assert_eq!(
         e.net.state.validator_pool_balance().unwrap(),
@@ -935,8 +935,8 @@ fn rewards_split_the_pool_by_stake_and_sum_exactly() {
         let idx = e.ops.iter().position(|w| w.addr() == *op).unwrap();
         assert_eq!(gains[idx], share + u64::from(i < rem));
     }
-    // The relay pool is untouched by validator rewards.
-    assert!(e.net.state.relay_pool_balance().unwrap() > 0);
+    // Transactions without a relayer pay the validator pool only.
+    assert_eq!(e.net.state.relay_pool_balance().unwrap(), 0);
 }
 
 #[test]

@@ -1267,3 +1267,102 @@ fn all_hosts_down_is_a_502_and_a_404_is_not_a_reason_to_fail_over() {
     assert_eq!(get(&e, &format!("/site/{C}/a.txt"), &[]).status, 404);
     assert_eq!(other.hits.load(Ordering::SeqCst), 0);
 }
+
+// ------------------------------------------------------------------------ transaction relay
+
+struct RelayRpc {
+    sent: Mutex<Vec<String>>,
+}
+
+impl Rpc for RelayRpc {
+    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        match method {
+            "btb_status" => Ok(json!({"chain_id": CHAIN_ID})),
+            "btb_sendTransaction" => {
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .push(params[0].as_str().unwrap().to_string());
+                Ok(json!({"id": "ab".repeat(32)}))
+            }
+            "btb_getReceipt" => Ok(Value::Null),
+            m => Err(format!("unexpected {m}")),
+        }
+    }
+}
+
+fn post(e: &Edge, path: &str, body: &str) -> UResp {
+    wire::request(
+        &e.addr().to_string(),
+        "POST",
+        path,
+        &[],
+        body.as_bytes(),
+        Duration::from_secs(10),
+        1 << 20,
+    )
+    .unwrap()
+}
+
+#[test]
+fn edge_relays_only_transactions_that_name_it() {
+    use btb_chain::{Transaction, TxBody, TxKind};
+    let relayer = [0x42u8; 32];
+    let key = SigningKey::from_bytes(&[3; 32]);
+    let sign = |relayer: Option<[u8; 32]>| {
+        Transaction::sign(
+            TxBody {
+                chain_id: CHAIN_ID,
+                nonce: 0,
+                relayer,
+                kind: TxKind::Transfer {
+                    to: [9; 32],
+                    amount: 1,
+                },
+            },
+            &key,
+        )
+    };
+    let rpc = Arc::new(RelayRpc {
+        sent: Mutex::new(Vec::new()),
+    });
+    let e = start_with(Fake::new(), None, Some(rpc.clone()), None, |c| {
+        c.relay = Some(btb_edge::RelayConfig {
+            relayer,
+            chain_id: None,
+        })
+    });
+    let info = get(&e, "/relay", &[]);
+    assert_eq!(info.status, 200);
+    let info: Value = serde_json::from_slice(&info.body).unwrap();
+    assert_eq!(info["relayer"], btb_storage::hex(&relayer));
+
+    let good = sign(Some(relayer));
+    let r = post(&e, "/tx", &btb_storage::hex(&good.encode()));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(rpc.sent.lock().unwrap().len(), 1);
+    // JSON body works too
+    let body = json!({"tx": btb_storage::hex(&good.encode())}).to_string();
+    assert_eq!(post(&e, "/tx", &body).status, 200);
+
+    // not named, named someone else, relayer changed after signing, wrong chain, garbage
+    let mut changed = sign(Some(relayer));
+    changed.body.relayer = Some([0x43; 32]);
+    let mut other_chain = sign(Some(relayer));
+    other_chain.body.chain_id = 1;
+    for (what, tx) in [
+        ("none", btb_storage::hex(&sign(None).encode())),
+        ("other", btb_storage::hex(&sign(Some([0x43; 32])).encode())),
+        ("changed", btb_storage::hex(&changed.encode())),
+        ("chain", btb_storage::hex(&other_chain.encode())),
+        ("garbage", "zz".to_string()),
+    ] {
+        let r = post(&e, "/tx", &tx);
+        assert_eq!(r.status, 400, "{what}");
+    }
+    assert_eq!(rpc.sent.lock().unwrap().len(), 2, "nothing else forwarded");
+    // an edge without relay config refuses
+    let plain = start(&Fake::new(), |_| {});
+    assert_eq!(post(&plain, "/tx", "00").status, 501);
+    assert_eq!(get(&plain, "/relay", &[]).status, 404);
+}

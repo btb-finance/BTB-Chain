@@ -34,6 +34,7 @@ const TAG_ACTION: u8 = 20;
 const TAG_REPORT_PARTIAL: u8 = 21;
 const TAG_REPORT_SIG: u8 = 22;
 const TAG_REPORT_WANT: u8 = 23;
+const TAG_CROSS: u8 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OracleMsg {
@@ -61,6 +62,8 @@ pub enum OracleMsg {
     ReportSig { id: u64, sig: [u8; G2_BYTES] },
     /// "Send me the signature of report `id`".
     ReportWant { id: u64 },
+    /// A cross-chain signing message (`crate::cross::XMsg`, encoded).
+    Cross(Vec<u8>),
 }
 
 impl OracleMsg {
@@ -104,6 +107,10 @@ impl OracleMsg {
                 o.push(TAG_REPORT_WANT);
                 o.extend_from_slice(&id.to_le_bytes());
             }
+            OracleMsg::Cross(b) => {
+                o.push(TAG_CROSS);
+                o.extend_from_slice(b);
+            }
         }
         o
     }
@@ -136,6 +143,7 @@ impl OracleMsg {
                 id: u64::from_le_bytes(body[..8].try_into().ok()?),
                 sig: body[8..].try_into().ok()?,
             }),
+            TAG_CROSS if !body.is_empty() => Some(OracleMsg::Cross(body.to_vec())),
             TAG_REPORT_WANT if body.len() == 8 => Some(OracleMsg::ReportWant {
                 id: u64::from_le_bytes(body.try_into().ok()?),
             }),

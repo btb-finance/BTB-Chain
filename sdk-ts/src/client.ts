@@ -1,5 +1,6 @@
 import { type Codec, decode, encode, fromHex, toHex } from "./codec.js";
 import type { ProofBundle } from "./proof.js";
+import { type TxKind, signTransaction } from "./tx.js";
 
 export class BtbError extends Error {
   constructor(
@@ -23,6 +24,21 @@ export interface BtbClientOptions {
   EventSource?: typeof EventSource | null;
   /** Delay before the fetch-stream fallback reconnects, in ms. Default 1000. */
   reconnectMs?: number;
+  /**
+   * Hosting (or edge) node that relays signed transactions (`POST /tx`) and earns the relay
+   * share of their fees. Default: the node `url` points at, without a `/c/<contract>` suffix.
+   */
+  relayUrl?: string;
+  /** Hex address of that node's relayer account. Default: asked from `GET /relay` on first use. */
+  relayer?: string;
+}
+
+/** A transaction submitted through a relay. */
+export interface Submitted {
+  /** Transaction id, hex. */
+  id: string;
+  /** Hex address of the relayer that was signed into the transaction. */
+  relayer: string;
 }
 
 export type Unsubscribe = () => void;
@@ -33,6 +49,8 @@ export class BtbClient {
   private readonly fetchFn: typeof fetch;
   private readonly ES: typeof EventSource | null;
   private readonly reconnectMs: number;
+  private readonly relayBase: string;
+  private relayerHex: string | undefined;
 
   constructor(opts: BtbClientOptions) {
     this.url = opts.url.replace(/\/+$/, "");
@@ -40,6 +58,54 @@ export class BtbClient {
     this.fetchFn = opts.fetch ?? ((...a) => globalThis.fetch(...a));
     this.ES = opts.EventSource === undefined ? (globalThis.EventSource ?? null) : opts.EventSource;
     this.reconnectMs = opts.reconnectMs ?? 1000;
+    this.relayBase = (opts.relayUrl ?? this.url.replace(/\/c\/[0-9a-fA-F]{64}$/, "")).replace(/\/+$/, "");
+    this.relayerHex = opts.relayer?.toLowerCase();
+  }
+
+  private async relayRequest<T>(path: string, init: RequestInit): Promise<T> {
+    let res: Response;
+    try {
+      res = await this.fetchFn(`${this.relayBase}${path}`, init);
+    } catch (e) {
+      throw new BtbError(`network error: ${(e as Error).message}`);
+    }
+    const text = await res.text();
+    if (!res.ok) throw new BtbError(errorMessage(text, res.status), res.status);
+    return JSON.parse(text) as T;
+  }
+
+  /** The relayer address (hex) and chain id of the relay host (`GET /relay`). */
+  async relayInfo(): Promise<{ relayer: string; chainId: bigint }> {
+    const j = await this.relayRequest<{ relayer: string; chain_id: number | null }>("/relay", { method: "GET" });
+    return { relayer: j.relayer, chainId: BigInt(j.chain_id ?? -1) };
+  }
+
+  /**
+   * Sign a transaction that names the relay host as its relayer and submit it through the host
+   * (`POST /tx`), which forwards it to validators. The relayer is part of the signed body, so the
+   * host cannot change it. `seed` is the account's 32-byte Ed25519 seed.
+   */
+  async submit(args: { seed: Uint8Array; chainId: bigint; nonce: bigint; kind: TxKind }): Promise<Submitted> {
+    if (this.relayerHex === undefined) this.relayerHex = (await this.relayInfo()).relayer.toLowerCase();
+    const wire = await signTransaction(
+      { chainId: args.chainId, nonce: args.nonce, relayer: fromHex(this.relayerHex), kind: args.kind },
+      args.seed,
+    );
+    return this.submitSigned(wire);
+  }
+
+  /** Submit an already signed transaction. The host accepts it only if it names the host as relayer. */
+  submitSigned(wire: Uint8Array): Promise<Submitted> {
+    return this.relayRequest<Submitted>("/tx", {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: toHex(wire),
+    });
+  }
+
+  /** The receipt of a transaction, or `null` while the host has not executed its block. */
+  receipt(id: string): Promise<Record<string, unknown> | null> {
+    return this.relayRequest(`/tx/${id}`, { method: "GET" });
   }
 
   private target(kind: "query" | "mutation" | "subscribe", name: string, args: Uint8Array): string {

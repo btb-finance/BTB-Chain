@@ -3,7 +3,8 @@
 //! ```text
 //! btb-host --genesis genesis.json --validator /ip4/.../udp/9000/quic-v1/p2p/<id> \
 //!          [--validator ...] [--http 127.0.0.1:8788] [--default-contract <hex>] \
-//!          [--listen /ip4/0.0.0.0/udp/9100/quic-v1] [--serve-followers]
+//!          [--listen /ip4/0.0.0.0/udp/9100/quic-v1] [--serve-followers] \
+//!          [--relayer <address hex> --relay-rpc HOST:PORT [--relay-rpc ...]]
 //! ```
 
 use btb_host::{Host, HostConfig};
@@ -25,6 +26,7 @@ fn run() -> Result<(), String> {
     let mut default_contract = None;
     let mut serve = false;
     let mut poll = None;
+    let (mut relayer, mut relay_rpc) = (None, Vec::new());
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -38,6 +40,8 @@ fn run() -> Result<(), String> {
             }
             "--poll-ms" => poll = Some(val("--poll-ms")?.parse().map_err(|_| "--poll-ms: number")?),
             "--serve-followers" => serve = true,
+            "--relayer" => relayer = Some(btb_node::hex::decode32(&val("--relayer")?)?),
+            "--relay-rpc" => relay_rpc.push(val("--relay-rpc")?),
             "-h" | "--help" => {
                 println!("{}", include_str!("usage.txt"));
                 return Ok(());
@@ -63,6 +67,16 @@ fn run() -> Result<(), String> {
     }
     if serve {
         cfg.serve_followers = Some(Default::default());
+    }
+    match (relayer, relay_rpc.is_empty()) {
+        (Some(relayer), false) => {
+            cfg.relay = Some(btb_host::RelayConfig {
+                relayer,
+                rpc: relay_rpc,
+            })
+        }
+        (None, true) => {}
+        _ => return Err("--relayer and --relay-rpc go together".into()),
     }
     let host = Host::start(cfg)?;
     println!("btb-host listening on http://{}", host.http_addr());

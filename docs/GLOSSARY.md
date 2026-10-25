@@ -40,7 +40,7 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 
 **Query.** A read-only function kind answered by hosting nodes without consensus. Queries cannot write state or use randomness, and frontends can subscribe to them. See [Languages](LANGUAGE.md#four-function-kinds).
 
-**Relayer.** A party that delivers BTB's signed reports and transactions to other chains and is paid a relay fee by the requesting app. See [Scaling](SCALING.md#five-ways-to-earn).
+**Relayer.** A party that delivers BTB's signed reports and transactions to other chains and is paid a relay fee by the requesting app. Also the registered hosting or edge node a sender signs into a mutation (`TxBody::relayer`), which earns 20% of its fee ([Chain](CHAIN.md#fees)). See [Scaling](SCALING.md#five-ways-to-earn).
 
 **RISC-V (rv64im).** The 64-bit, integer-only instruction set that BTB contracts compile to. Rust is first-class, and any language that targets RISC-V works. See [Languages](LANGUAGE.md#why-risc-v).
 

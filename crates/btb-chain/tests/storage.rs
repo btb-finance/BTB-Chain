@@ -404,9 +404,14 @@ fn challenge_proof_pays_the_node_from_the_escrow() {
     let r = w.prove(&f, node, p.index as usize, ch.chunk);
     assert_eq!(reverted(&r), &StorageError::NoChallenge);
     // Run past the deadline: nothing is slashed, since it was answered.
-    let dep = w.deposit(&p.node);
+    // (The node's other pieces may have their own challenges, so look at this piece only.)
     w.net.empty_blocks(5);
-    assert_eq!(w.deposit(&p.node), dep);
+    let later = w
+        .pieces(&f)
+        .into_iter()
+        .find(|q| q.index == p.index)
+        .unwrap();
+    assert_eq!((later.proven, later.missed), (1, 0));
 }
 
 #[test]

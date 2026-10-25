@@ -37,7 +37,7 @@ pub struct ShareStore {
     passphrase: Option<String>,
 }
 
-fn kdf(pass: &str, salt: &[u8; 16]) -> [u8; 32] {
+pub(crate) fn kdf(pass: &str, salt: &[u8; 16]) -> [u8; 32] {
     let mut k: [u8; 32] = Sha256::new()
         .chain_update(b"btb.share.kdf.v1")
         .chain_update(salt)

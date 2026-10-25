@@ -640,6 +640,7 @@ mod tests {
                 .map(|n| {
                     Transaction::sign(
                         TxBody {
+                            relayer: None,
                             chain_id: 7,
                             nonce: h * 10 + n,
                             kind: TxKind::Transfer {

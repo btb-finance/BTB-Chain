@@ -92,23 +92,32 @@ fn scalar_wide(parts: &[&[u8]]) -> Scalar {
     Scalar::from_hash(h)
 }
 
-fn sym_key(shared: &EdwardsPoint, ctx: &ShareCtx) -> [u8; 32] {
+/// `domain` separates uses of the same transport (the beacon DKG uses the empty domain; the
+/// FROST keys of `crate::frost` use `frost.<scheme>`), so a ciphertext of one cannot be replayed
+/// as another.
+fn sym_key(shared: &EdwardsPoint, ctx: &ShareCtx, domain: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"btb.dkg.key.v1");
     h.update(shared.compress().as_bytes());
     h.update(ctx.bytes());
+    h.update(domain);
     h.finalize().into()
 }
 
-fn seal(shared: &EdwardsPoint, ctx: &ShareCtx, share: &Fr) -> Option<[u8; CT_BYTES]> {
-    let key = sym_key(shared, ctx);
+fn seal_raw(
+    shared: &EdwardsPoint,
+    ctx: &ShareCtx,
+    domain: &[u8],
+    share: &[u8; 32],
+) -> Option<[u8; CT_BYTES]> {
+    let key = sym_key(shared, ctx, domain);
     let c = ChaCha20Poly1305::new((&key).into());
     let aad = ctx.bytes();
     let ct = c
         .encrypt(
             Nonce::from_slice(&[0u8; 12]),
             Payload {
-                msg: &share.to_bytes_be(),
+                msg: share,
                 aad: &aad,
             },
         )
@@ -116,8 +125,13 @@ fn seal(shared: &EdwardsPoint, ctx: &ShareCtx, share: &Fr) -> Option<[u8; CT_BYT
     ct.try_into().ok()
 }
 
-fn open(shared: &EdwardsPoint, ctx: &ShareCtx, ct: &[u8; CT_BYTES]) -> Option<Fr> {
-    let key = sym_key(shared, ctx);
+fn open_raw(
+    shared: &EdwardsPoint,
+    ctx: &ShareCtx,
+    domain: &[u8],
+    ct: &[u8; CT_BYTES],
+) -> Option<[u8; 32]> {
+    let key = sym_key(shared, ctx, domain);
     let c = ChaCha20Poly1305::new((&key).into());
     let aad = ctx.bytes();
     let pt = c
@@ -129,7 +143,15 @@ fn open(shared: &EdwardsPoint, ctx: &ShareCtx, ct: &[u8; CT_BYTES]) -> Option<Fr
             },
         )
         .ok()?;
-    Fr::from_bytes_be(&pt.try_into().ok()?)
+    pt.try_into().ok()
+}
+
+fn seal(shared: &EdwardsPoint, ctx: &ShareCtx, share: &Fr) -> Option<[u8; CT_BYTES]> {
+    seal_raw(shared, ctx, b"", &share.to_bytes_be())
+}
+
+fn open(shared: &EdwardsPoint, ctx: &ShareCtx, ct: &[u8; CT_BYTES]) -> Option<Fr> {
+    Fr::from_bytes_be(&open_raw(shared, ctx, b"", ct)?)
 }
 
 /// What a dealer publishes besides its commitments: the ephemeral public key and one
@@ -169,6 +191,50 @@ pub fn deliver(
         })
         .collect();
     Delivery { eph, ciphertexts }
+}
+
+/// Like [`deliver`] for 32 opaque bytes (a scalar of any curve) under a `domain`. The caller
+/// checks the plaintext is a canonical scalar of its own group.
+pub fn deliver_raw(
+    domain: &[u8],
+    chain_id: u64,
+    target: u64,
+    dealer: u32,
+    entropy: &[u8; 32],
+    recipients: &[[u8; 32]],
+    shares: &[[u8; 32]],
+) -> Delivery {
+    let e = scalar_wide(&[b"btb.dkg.eph.v1", domain, entropy, &target.to_le_bytes()]);
+    let eph = (e * BASE).compress().to_bytes();
+    let ciphertexts = recipients
+        .iter()
+        .zip(shares)
+        .enumerate()
+        .map(|(j, (key, share))| {
+            let ctx = ShareCtx {
+                chain_id,
+                target,
+                dealer,
+                recipient: j as u32,
+            };
+            point(key)
+                .and_then(|a| seal_raw(&(e * a), &ctx, domain, share))
+                .unwrap_or([0u8; CT_BYTES])
+        })
+        .collect();
+    Delivery { eph, ciphertexts }
+}
+
+/// Like [`decrypt`] for [`deliver_raw`] ciphertexts.
+pub fn decrypt_raw(
+    domain: &[u8],
+    key: &SigningKey,
+    eph: &[u8; 32],
+    ct: &[u8; CT_BYTES],
+    ctx: &ShareCtx,
+) -> Option<[u8; 32]> {
+    let e = point(eph)?;
+    open_raw(&(key.to_scalar() * e), ctx, domain, ct)
 }
 
 /// The recipient decrypts its ciphertext with its consensus key. `None`: undecryptable or not a
@@ -227,6 +293,11 @@ impl Opened {
     /// Decrypt `ct` with the proven shared point.
     pub fn open(&self, ct: &[u8; CT_BYTES], ctx: &ShareCtx) -> Option<Fr> {
         open(&self.0, ctx, ct)
+    }
+
+    /// Decrypt a [`deliver_raw`] ciphertext.
+    pub fn open_raw(&self, domain: &[u8], ct: &[u8; CT_BYTES], ctx: &ShareCtx) -> Option<[u8; 32]> {
+        open_raw(&self.0, ctx, domain, ct)
     }
 }
 

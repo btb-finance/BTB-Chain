@@ -32,8 +32,10 @@
 //! * **Finalize** (end of block `we`). Qualified dealers are those that dealt and were not
 //!   upheld against. If enough qualified (`t` for a fresh key, the old threshold for a reshare)
 //!   the group key and every public share are derived from the board and stored as the key of
-//!   epoch `e + 1`. Otherwise the previous key carries over unchanged (same holders): liveness
-//!   then depends on those holders, see `docs/ORACLES.md`.
+//!   epoch `e + 1`. Otherwise the previous key carries over unchanged (same holders) if at
+//!   least its threshold of them are validators of `e + 1`; if fewer are, the chain enters
+//!   degraded mode and a fresh generation runs at the start of `e + 1` (`degraded.rs`,
+//!   `docs/ORACLES.md`).
 //!
 //! # State (all under tag `0x50`)
 //!
@@ -42,9 +44,14 @@
 //! | `50 30 epoch:u64be` | [`EpochKey`]: origin epoch, group key, holders; signs the beacons of `epoch` |
 //! | `50 40 target:u64be` | [`Session`] of the key generation for epoch `target` |
 //! | `50 41 target:u64be dealer:u32be` | [`Deal`] |
+//! | `50 32 epoch:u64be` | [`KeyChange`]: the group key changed at `epoch` (end of degraded mode) |
+//! | `50 34` | [`Degraded`]: present while the chain is in degraded mode |
 //!
 //! Sessions and deals older than the previous key generation are pruned at each finalization;
 //! epoch keys are small and kept.
+
+mod degraded;
+pub use degraded::{degraded, key_change, key_changes, Degraded, KeyChange};
 
 use crate::staking::{self, ActiveValidator};
 use crate::state::StateError;
@@ -682,9 +689,19 @@ pub(crate) fn begin_block(
     }
     let epoch_len = cfg.epoch_len.max(1);
     let epoch = height.saturating_sub(1) / epoch_len;
-    if height == 1 && epoch_key(&*kv, 0)?.is_none() {
-        if let Some(rec) = staking::epoch_record(&*kv, 0)? {
-            open_session(kv, 0, None, (1, window), rec.validators)?;
+    // Genesis without a key, or the recovery generation of degraded mode (`degraded.rs`).
+    let first = epoch.saturating_mul(epoch_len) + 1;
+    if height == first
+        && ((epoch == 0 && epoch_key(&*kv, 0)?.is_none()) || degraded::recovery_due(kv, epoch)?)
+    {
+        if let Some(rec) = staking::epoch_record(&*kv, epoch)? {
+            open_session(
+                kv,
+                epoch,
+                None,
+                (height, height + window - 1),
+                rec.validators,
+            )?;
         }
     }
     let (ws, we) = tail(epoch_len, window, epoch);
@@ -713,6 +730,7 @@ pub(crate) fn end_block(
         targets.push(height / epoch_len); // the session for the next epoch
     }
     targets.push(0); // the genesis session
+    targets.push(height.saturating_sub(1) / epoch_len); // a recovery session (degraded mode)
     for target in targets {
         let Some(mut s) = session(&*kv, target)? else {
             continue;
@@ -728,6 +746,9 @@ pub(crate) fn end_block(
 fn finalize(kv: &mut impl KvStore, s: &mut Session) -> Result<(), StateError> {
     match outcome(&*kv, s)? {
         Some((_, out)) => {
+            if s.from.is_none() {
+                degraded::after_fresh_key(kv, s.target, s.window_end, &out.group)?;
+            }
             put_epoch_key(
                 kv,
                 s.target,
@@ -740,10 +761,14 @@ fn finalize(kv: &mut impl KvStore, s: &mut Session) -> Result<(), StateError> {
             s.status = STATUS_DONE;
         }
         None => {
-            // Too few qualified dealers: keep the key we had, with its holders.
-            if let Some(prev) = s.target.checked_sub(1) {
-                if let Some(k) = epoch_key(&*kv, prev)? {
-                    put_epoch_key(kv, s.target, &k)?;
+            // Too few qualified dealers: a reshare keeps the key we had, with its holders, if
+            // enough of them are still validators; otherwise degraded mode (`degraded.rs`).
+            // A failed fresh generation leaves the epoch without a key.
+            if let (Some(from), Some(prev)) = (s.from, s.target.checked_sub(1)) {
+                if from == prev {
+                    if let Some(k) = epoch_key(&*kv, prev)? {
+                        degraded::after_failed_reshare(kv, s, &k, s.window_end)?;
+                    }
                 }
             }
             s.status = STATUS_FAILED;

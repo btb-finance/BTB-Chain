@@ -66,6 +66,8 @@ Writes a new account key (`{"secret", "public"}` JSON, mode 0600, the same forma
 
 `btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]` signs and sends a `mutation` (default gas limit 2,000,000), waits for the receipt and prints `output` (hex), `gas_used` and `height`. `btb query --rpc URL <contract> <fn> [args]` runs a read-only `btb_query` and prints `output` and `gas_used`; it needs no key.
 
+`--relayer URL` submits through a hosting or edge node instead of straight to the RPC: the CLI reads the node's relayer address (`GET /relay`), signs it into the transaction and `POST`s it to `/tx`; the node forwards it and earns 20% of the fee ([HOSTING.md](HOSTING.md#relaying-transactions)). Nonce, chain id and receipt still come from `--rpc`.
+
 `contract` is the 64-character hex address. `args` is either the canonical encoding as hex ([ENCODING.md](ENCODING.md)) or a JSON array: integers become `u64` (negative ones `i64`), booleans one byte, `"0x"` plus 64 hex characters a raw 32-byte address, any other string a length-prefixed string. Omit it for no arguments. Outputs are hex of the canonical encoding.
 
 ## Tests

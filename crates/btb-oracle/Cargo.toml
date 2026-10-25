@@ -14,3 +14,17 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables"] }
 # Apache-2.0 OR MIT. Encrypts the DKG shares to their recipients.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# MIT OR Apache-2.0 (ZF FROST, RFC 9591). Threshold Schnorr for other chains: `frost-secp256k1-tr`
+# is BIP-340/BIP-341 (Bitcoin Taproot), `frost-ed25519` is Ed25519 (Solana). Only the signing
+# and key-package machinery is used; key generation is our own on-chain DKG (`frost::keys`).
+frost-core = "3.0.0"
+frost-secp256k1-tr = "3.0.0"
+frost-ed25519 = "3.0.0"
+# MIT OR Apache-2.0. The `rand_core` 0.6 line is the one FROST uses; ChaCha20 expands the DKG
+# entropy into polynomial coefficients deterministically.
+rand_core = "0.6"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+# Independent verifiers for the tests: BIP-340 Schnorr (MIT OR Apache-2.0).
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "std"] }

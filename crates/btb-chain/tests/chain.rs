@@ -15,11 +15,6 @@ fn net(wallets: &[&Wallet], each: u64) -> MemNet {
 
 const RICH: u64 = 10 * UNITS_PER_BTB;
 
-fn split(fee: u64) -> (u64, u64) {
-    let relay = fee * RELAY_SHARE_BPS / 10_000;
-    (fee - relay, relay)
-}
-
 #[test]
 fn supply_units_and_genesis() {
     assert_eq!(BTB_DECIMALS, 9);
@@ -62,7 +57,7 @@ fn genesis_rejects_wrong_supply_and_duplicates() {
 }
 
 #[test]
-fn transfer_pays_fee_split_80_20() {
+fn transfer_without_relayer_pays_validator_pool() {
     let (mut a, b) = (Wallet::new(1), Wallet::new(2));
     let mut n = net(&[&a, &b], RICH);
     let r = n.run(vec![a.transfer(b.addr(), 1_000_000)]);
@@ -71,10 +66,9 @@ fn transfer_pays_fee_split_80_20() {
     assert_eq!(r[0].fee, fee);
     assert_eq!(n.bal(&a.addr()), RICH - 1_000_000 - fee);
     assert_eq!(n.bal(&b.addr()), RICH + 1_000_000);
-    let (exec, relay) = split(fee);
-    assert_eq!(n.state.validator_pool_balance().unwrap(), exec);
-    assert_eq!(n.state.relay_pool_balance().unwrap(), relay);
-    assert_eq!(relay * 5, fee, "20% to the relay host");
+    // No relayer in the body: the whole fee is the validator pool's (tests/relay.rs pays one).
+    assert_eq!(n.state.validator_pool_balance().unwrap(), fee);
+    assert_eq!(n.state.relay_pool_balance().unwrap(), 0);
     assert_eq!(n.state.nonce(&a.addr()).unwrap(), 1);
     assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
 }
@@ -422,9 +416,7 @@ fn gas_exhaustion_charges_fee_and_reverts() {
     );
     assert_eq!(n.state.nonce(&who).unwrap(), 3, "nonce consumed");
     assert_eq!(n.state.deposit(&c).unwrap(), 0);
-    let (exec, relay) = split(limit);
-    assert!(n.state.validator_pool_balance().unwrap() >= exec);
-    assert!(n.state.relay_pool_balance().unwrap() >= relay);
+    assert!(n.state.validator_pool_balance().unwrap() >= limit);
     // Unused gas is refunded: a normal call costs far less than its limit.
     let r = n.run(vec![a.call(c, "increment", &(1u64,))]);
     ok(&r[0]);
@@ -639,10 +631,10 @@ fn tx_and_block_wire_roundtrip_and_rejects_garbage() {
         assert!(Transaction::decode(&wire[..wire.len() - 1]).is_err());
     }
     let mut bad_tag = txs[2].encode();
-    bad_tag[16] = 200;
+    bad_tag[16] = 100;
     assert!(matches!(
         Transaction::decode(&bad_tag),
-        Err(TxError::BadTag(200))
+        Err(TxError::BadTag(100))
     ));
     let blk = Block::new(3, [1; 32], 5, [2; 32], txs);
     assert_eq!(Block::decode(&blk.encode()).unwrap(), blk);

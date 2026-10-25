@@ -23,6 +23,7 @@ use crate::actions::ActionNode;
 use crate::attest;
 use crate::blockstore::{BlockStore, StoredBlock, StoredReceipt};
 use crate::config::NodeParams;
+use crate::cross::CrossNode;
 use crate::explorer::tx_json;
 use crate::hex;
 use crate::net::NetHandle;
@@ -208,6 +209,10 @@ struct Driver<S: KvStore + 'static> {
     actions: ActionNode,
     /// Signed reports for other chains (`crate::reports`).
     reports: ReportNode,
+    /// Cross-chain keys, signing and vault duties (`crate::cross`); chains with oracles only.
+    cross: Option<CrossNode>,
+    /// Next nonce for transactions signed by the consensus key (DKG and cross-chain messages).
+    ckey_nonce: glue::CkeyNonce,
 }
 
 /// `(sender, nonce)` of every transaction in the given block payloads.
@@ -353,7 +358,19 @@ impl<S: KvStore + 'static> Driver<S> {
             applying_sync: false,
             actions: ActionNode::new(p.genesis.chain_id, p.key.clone(), p.fetch_policy.clone()),
             reports: ReportNode::new(p.genesis.chain_id),
+            cross: None,
+            ckey_nonce: Default::default(),
         };
+        if d.oracle.is_some() {
+            d.cross = Some(CrossNode::new(
+                p.genesis.chain_id,
+                p.key.clone(),
+                p.dkg_dir.as_ref().map(|d| d.join("cross")),
+                p.key_passphrase.clone(),
+                p.cross.clone(),
+                p.observer.clone(),
+            )?);
+        }
         d.begin_epoch(epoch)?;
         d.oracle_after_block();
         Ok(d)
@@ -1048,6 +1065,7 @@ impl<S: KvStore + 'static> Driver<S> {
             }
             // handled by `on_action_msg` above
             OracleMsg::Action(_)
+            | OracleMsg::Cross(_)
             | OracleMsg::ReportPartial { .. }
             | OracleMsg::ReportSig { .. }
             | OracleMsg::ReportWant { .. } => false,
@@ -1088,6 +1106,7 @@ impl<S: KvStore + 'static> Driver<S> {
         if !ops.is_empty() && !self.applying_sync {
             self.submit_dkg(ops);
         }
+        self.cross_after_block();
     }
 
     /// Sign key generation operations with the consensus key and submit them.
@@ -1098,21 +1117,19 @@ impl<S: KvStore + 'static> Driver<S> {
             o.dkg.pending.retain(|id| mempool.contains(id));
         }
         for op in ops {
-            // The next free nonce: committed ones plus our own still waiting in the mempool.
-            let waiting = self
-                .oracle
-                .as_ref()
-                .map_or(0, |o| o.dkg.pending.len() as u64);
+            let nonce = self.next_ckey_nonce(&addr);
             let tx = Transaction::sign(
                 TxBody {
+                    relayer: None,
                     chain_id: self.chain_id,
-                    nonce: self.state.nonce(&addr).unwrap_or(0) + waiting,
+                    nonce,
                     kind: TxKind::Dkg(op),
                 },
                 &self.signing,
             );
             match self.add_tx(&tx.encode(), None) {
                 Ok(id) => {
+                    self.ckey_nonce.used(nonce);
                     if let Some(o) = self.oracle.as_mut() {
                         o.dkg.pending.push(id);
                     }
@@ -1596,10 +1613,17 @@ impl<S: KvStore + 'static> Driver<S> {
         let addr = account_address(&self.reporter.verifying_key().to_bytes());
         let mempool = &self.mempool;
         self.reporter_pending.retain(|id| mempool.contains(id));
-        let nonce = self.state.nonce(&addr).unwrap_or(0) + self.reporter_pending.len() as u64;
+        let shared = addr == account_address(&self.signing.verifying_key().to_bytes());
+        let nonce = if shared {
+            // same account as the DKG and cross-chain messages: one allocator for all
+            self.next_ckey_nonce(&addr)
+        } else {
+            self.state.nonce(&addr).unwrap_or(0) + self.reporter_pending.len() as u64
+        };
         let off = ev.offender();
         let tx = Transaction::sign(
             TxBody {
+                relayer: None,
                 chain_id: self.chain_id,
                 nonce,
                 kind: TxKind::SubmitEvidence {
@@ -1611,6 +1635,9 @@ impl<S: KvStore + 'static> Driver<S> {
         );
         match self.add_tx(&tx.encode(), None) {
             Ok(id) => {
+                if shared {
+                    self.ckey_nonce.used(nonce);
+                }
                 self.reporter_pending.push(id);
                 self.evidence_seen.insert((epoch, off), Instant::now());
                 self.evidence_submitted.push(hex::encode(&id));
@@ -1897,6 +1924,7 @@ impl<S: KvStore + 'static> Driver<S> {
             }
             "btb_actionRequests" => self.rpc_action_requests(),
             "btb_oracleReport" => self.rpc_report(arr),
+            m if m.starts_with("btb_cross") || m == "btb_vault" => self.rpc_cross(m, arr),
             m if m.starts_with("btb_oracle") => {
                 crate::oracle_rpc::handle(&self.state, &self.store, m, arr)
             }
@@ -1965,6 +1993,18 @@ impl<S: KvStore + 'static> Driver<S> {
                 "dkg_deals_sent": o.dkg.deals_sent,
                 "dkg_complaints_sent": o.dkg.complaints_sent,
                 "pending_prices": o.prices.pending(),
+            })),
+            "cross": self.cross.as_ref().map(|c| json!({
+                "deals_sent": c.stats.deals_sent,
+                "complaints_sent": c.stats.complaints_sent,
+                "signatures_made": c.stats.signatures_made,
+                "nonces_used": c.stats.nonces_used,
+                "attempts_abandoned": c.stats.attempts_abandoned,
+                "evidence_sent": c.stats.evidence_sent,
+                "attestations_sent": c.stats.attestations_sent,
+                "proposals_sent": c.stats.proposals_sent,
+                "in_flight": c.in_flight(),
+                "last_error": c.last_error(),
             })),
             "evidence": self.evidence,
             "evidence_submitted": self.evidence_submitted,
@@ -2069,6 +2109,7 @@ mod tests {
             .map(|nonce| {
                 Transaction::sign(
                     TxBody {
+                        relayer: None,
                         chain_id: CHAIN_ID,
                         nonce,
                         kind: TxKind::Transfer {

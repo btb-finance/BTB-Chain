@@ -18,8 +18,12 @@
 //! | `GET /proof/<contract>/site/<path>[?height=N]` | proof bundle for a site file |
 //! | `GET /proof/raw?key=<hex full state key>[&height=N]` | proof bundle for any state key |
 //! | `GET /status`, `GET /health` | node and sync status |
+//! | `GET /relay` | the relayer address to sign into a transaction (404 if this node does not relay) |
+//! | `POST /tx` (hex or `{"tx": hex}`) | relay a client-signed transaction naming this node as relayer to the validators: `{id, relayer}` |
+//! | `GET /tx/<id>` | the receipt, or `null` until this node has executed the block |
 //!
-//! Mutations are not served: they are signed transactions for a validator (`btb_sendTransaction`).
+//! Mutations are not run here: a signed transaction goes to a validator, either directly
+//! (`btb_sendTransaction`) or through `POST /tx`, which earns this node the relay share of the fee.
 //! Read endpoints answer cross-origin (`Access-Control-Allow-Origin: *`): everything served is
 //! public chain data. Site files are served inside a CSP sandbox with an opaque origin, so one
 //! contract's site cannot read another's storage in the browser.
@@ -48,6 +52,8 @@ const MAX_LINE: u64 = 8192;
 pub(crate) struct Ctx {
     pub node: Arc<Node>,
     pub shared: Arc<Shared>,
+    pub relay: Option<crate::relay::RelayConfig>,
+    pub chain_id: u64,
 }
 
 struct Request {
@@ -55,6 +61,7 @@ struct Request {
     path: String,
     query: BTreeMap<String, String>,
     headers: BTreeMap<String, String>,
+    body: Vec<u8>,
 }
 
 fn pct_decode(s: &str) -> String {
@@ -110,6 +117,8 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
     if len > MAX_BODY {
         return Err("body too large".into());
     }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).map_err(|e| e.to_string())?;
     let (path, qs) = target.split_once('?').unwrap_or((&target, ""));
     let query = qs
         .split('&')
@@ -124,6 +133,7 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
         path: pct_decode(path),
         query,
         headers,
+        body,
     })
 }
 
@@ -216,8 +226,11 @@ fn route(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<()> 
         (_, ["mutation", ..]) | (_, ["c", _, "mutation", ..]) => err(
             conn,
             "501 Not Implemented",
-            "hosting nodes do not run mutations: send a signed transaction to a validator (btb_sendTransaction)",
+            "hosting nodes do not run mutations: sign a transaction and POST it to /tx (relay) or send it to a validator (btb_sendTransaction)",
         ),
+        ("GET", ["relay"]) => relay_info(ctx, conn),
+        ("POST", ["tx"]) => relay_tx(ctx, conn, req),
+        ("GET", ["tx", id]) => receipt(ctx, conn, id),
         ("GET", ["file", root]) => storage_file_route(ctx, conn, req, root),
         ("GET", ["site", c]) => site_file(ctx, conn, req, c, ""),
         ("GET", ["site", c, rest @ ..]) => site_file(ctx, conn, req, c, &rest.join("/")),
@@ -226,7 +239,53 @@ fn route(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<()> 
         ("GET", ["proof", c]) => proof_storage(ctx, conn, req, c),
         ("GET", ["proof", c, "site", path]) => proof_site(ctx, conn, req, c, path),
         ("GET", _) => err(conn, "404 Not Found", "not found"),
-        _ => err(conn, "405 Method Not Allowed", "use GET"),
+        _ => err(conn, "405 Method Not Allowed", "use GET (POST /tx to relay)"),
+    }
+}
+
+fn relay_info(ctx: &Ctx, conn: &mut TcpStream) -> std::io::Result<()> {
+    match &ctx.relay {
+        Some(r) => json_response(
+            conn,
+            "200 OK",
+            &json!({"relayer": hex::encode(&r.relayer), "chain_id": ctx.chain_id}),
+        ),
+        None => err(
+            conn,
+            "404 Not Found",
+            "this hosting node does not relay transactions",
+        ),
+    }
+}
+
+/// `POST /tx`: forward a client-signed transaction that names this node as its relayer.
+fn relay_tx(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    let Some(cfg) = &ctx.relay else {
+        return err(
+            conn,
+            "501 Not Implemented",
+            "this hosting node does not relay transactions",
+        );
+    };
+    let bytes = match crate::relay::tx_bytes(&req.body) {
+        Ok(b) => b,
+        Err(e) => return err(conn, "400 Bad Request", &e),
+    };
+    match crate::relay::submit(cfg, ctx.chain_id, &bytes) {
+        Ok(id) => json_response(
+            conn,
+            "200 OK",
+            &json!({"id": id, "relayer": hex::encode(&cfg.relayer)}),
+        ),
+        Err(crate::relay::Refused(status, msg)) => err(conn, status, &msg),
+    }
+}
+
+/// `GET /tx/<id>`: the receipt, once this node has executed the block (null before).
+fn receipt(ctx: &Ctx, conn: &mut TcpStream, id: &str) -> std::io::Result<()> {
+    match ctx.node.call("btb_getReceipt", json!([id])) {
+        Ok(v) => json_response(conn, "200 OK", &v),
+        Err(e) => err(conn, "400 Bad Request", &e.message),
     }
 }
 

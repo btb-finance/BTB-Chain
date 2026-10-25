@@ -19,11 +19,11 @@ An account is a 32-byte address: `SHA256("btb.account.v1" || ed25519_public_key)
 
 ## Transactions
 
-Seven kinds, all encoded with `btb-codec` (little-endian, length-prefixed):
+Transaction kinds, all encoded with `btb-codec` (little-endian, length-prefixed):
 
 ```
 tx       = body || public_key[32] || signature[64]
-body     = chain_id:u64 || nonce:u64 || tag:u8 || fields
+body     = chain_id:u64 || nonce:u64 || tag:u8 [|| relayer[32]] || fields     (relayer present iff tag & 0x80)
 Deploy   (0): code:bytes || manifest
 Call     (1): contract[32] || kind:u8 || function:string || args:bytes || gas_limit:u64 || max_fee:u64
 Transfer (2): to[32] || amount:u64
@@ -33,6 +33,8 @@ RegisterValidator (5): consensus_key[32] || network_addr:bytes
 SubmitEvidence    (6): epoch:u64 || evidence
 Storage  (12): op:u8 || fields   (0 Register: endpoint:bytes || deposit:u64 | 1 AddDeposit: amount:u64 | 2 Withdraw: amount:u64 | 3 Store: root[32] || size:u64 || k:u8 || m:u8 || periods:u32 | 4 Prove: file[32] || index:u8 || chunk:bytes || chunk_path:[hash] || piece_path:[hash])
 Channel  (8): op:u8 || fields   (0 Open: payee[32] || deposit:u64 || expiry_blocks:u64 | 1 TopUp: channel[32] || amount:u64 | 2 Close: voucher[120] | 3 StartClose: channel[32] || has_voucher:u8 [|| voucher[120]] | 4 Finalize: channel[32])
+Cross    (21): op:u8 || fields   (0 Deal | 1 Complain | 2 Signature | 3 Evidence | 4 Attest | 5 Prepare | 6 Withdraw; see Cross-chain keys and vault)
+Host     (20): op:u8 || fields   (0 Register: url:bytes (at most 256 bytes) | 1 Unregister)
 Action   (13): op:u8 || fields  (0 Request: contract[32] || function:string || args:bytes || gas_limit:u64 || max_fee:u64 | 1 SetHosts: contract[32] || hosts:[string])
 Site     (9): op:u8 || fields   (0 Publish: contract[32] || path:string || content:bytes | 1 Remove: contract[32] || path:string)
 evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2        (DoubleVote)
@@ -43,6 +45,7 @@ manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes
 - **Call kinds.** `kind` is 0 query, 1 mutation, 2 cron, 3 action. All four decode, but only **mutation** is valid in a `Call` transaction; query, cron and action are rejected as `Invalid::KindNotAllowed` (an action is requested with the `Action` transaction, tag 13, not called). Queries never go through consensus (run them with `Executor::query` against the head state), actions are not transactions, and crons are scheduled-only: users cannot invoke them by hand, so a cron (for example a payout) runs only on its schedule, with `caller() == contract_address()`.
 - **Signature.** Ed25519 (`ed25519-dalek`, strict verification) over `SHA256("btb.tx.sig.v1" || body)`. The body contains the chain id and nonce, so a signature is valid for one chain and one nonce only.
 - **Transaction id.** `SHA256("btb.tx.id.v1" || wire bytes)`.
+- **Versions and the relayer.** A body may name the hosting node that relayed it (`TxBody::relayer`). Then the tag byte has its high bit set (`tag | 0x80`) and the 32-byte relayer address follows the tag, before the fields. A body with no relayer is **byte for byte the original encoding**, so every old transaction still decodes, keeps its signature and id, and executes (its fee goes wholly to the validator pool). The relayer is inside the signed body: the sender chooses it, and nobody who handles the transaction (the relay host, a proposer, a validator) can add, drop or change it without breaking the signature. See [Fees](#fees).
 - **Manifest.** `crons` lists `(function, every_blocks)`: the `cron` entry point `function` runs every `every_blocks` blocks, `every = "N blocks"` (1 to 2^32; at most 16). `indexes` are table index declarations in the same temporary form as `btb dev --index` (`Table:index:addr@offset` or `Table:index:u64@offset`, see [DEV_SERVER.md](DEV_SERVER.md)); the chain registers them from state, so a restarted node rebuilds them. This is a binary struct, not the CLI's `manifest.json`; the CLI bundle's `manifest.json` already carries `crons` (`{function, every_blocks}`), taken from `#[btb::cron(every = "N blocks")]` ([LANGUAGE.md](LANGUAGE.md)); `btb deploy --rpc` converts a bundle into a `Deploy` transaction ([CLI.md](CLI.md)).
 - **Limits.** Code up to 1 MiB, arguments up to 1 MiB, function names up to 64 bytes.
 
@@ -78,16 +81,21 @@ Gas is the VM's gas plus an intrinsic part charged before the VM runs:
 
 Stored contract code is paid for by deploy gas, not by a storage deposit (a deposit for code is future work). State a contract writes locks the usual storage deposit from the **contract's** balance (fund a contract with a `Transfer` before calling it).
 
-**Fee split.** Fees are not minted or burned; they move into two pool accounts at reserved addresses (`validator_pool()`, `relay_pool()`), which are ordinary balance entries:
+**Fee split.** Fees are not minted or burned; they move into the validator pool (a reserved address, an ordinary balance entry) and, for relayed transactions, to the relay host:
 
-| Source | Executor (validator) pool | Relay host pool |
+| Source | Executor (validator) pool | Relay host |
 | --- | --- | --- |
-| User transaction (deploy, call, transfer) | 80% (the rounding remainder) | 20% (`RELAY_SHARE_BPS` = 2,000) |
+| User transaction naming a registered relayer | 80% (the rounding remainder) | 20% (`RELAY_SHARE_BPS` = 2,000) to the relayer's account |
+| User transaction with no relayer, an unregistered one, or the sender itself as relayer | 100% | none |
 | Cron run | 100% | none |
 
-This implements the "80/20 proposed" mutation split of [TOKENOMICS.md](TOKENOMICS.md) as accounting only. The **validator pool is paid out at every epoch end** to the epoch's validators, pro rata by stake (see [Staking, epochs and slashing](#staking-epochs-and-slashing)). The relay pool still just accumulates (see the design note below).
+This is the "80/20" mutation split of [TOKENOMICS.md](TOKENOMICS.md). The **validator pool is paid out at every epoch end** to the epoch's validators, pro rata by stake (see [Staking, epochs and slashing](#staking-epochs-and-slashing)). The relay share is credited to the relayer's account in the block, and `Receipt::relayer` records who earned it. The old `relay_pool()` address stays reserved but is no longer credited.
 
-**Design note: paying the relay pool (not implemented).** Nothing in a transaction says which hosting node relayed it, so the 20% cannot be attributed. Paying it needs (1) an optional `relayer: Address` field in the signed transaction body (the relay host that accepted it from the user and put it in the mempool; the sender signs it, so a proposer cannot steal the attribution), (2) at execution, crediting `fee * RELAY_SHARE_BPS / 10000` to that address instead of `relay_pool()` (falling back to the validator pool when absent or when the relayer is not a registered hosting node, so the fee is never burned), and (3) a hosting-node registry to check against, which belongs to the Phase 5 hosting-node item. Parallel mode stays valid only if relayer credits are applied after the block like the pool credits (they commute). This changes the transaction encoding and so needs a Design Proposal; until then `relay_pool()` is accounting only.
+**Relayers and the hosting-node registry.** A hosting or edge node that forwards client-signed transactions ([HOSTING.md](HOSTING.md#relaying-transactions), [EDGE.md](EDGE.md#transaction-relay)) registers its account with `Host::Register { url }` (tag 20; `Unregister` removes it; `HOST_GAS` 10,000). The registry is one state key per host (`0x60 || address` -> URL). At execution the share goes to `body.relayer` only if that account is registered at that moment and is not the sender; otherwise the whole fee goes to the validator pool, so a fee is never burned and a typo or a deregistered host costs the sender nothing extra. Refusing the sender as its own relayer stops the trivial 20% rebate; there is **no bond yet**, so a sender who registers a second account can still rebate itself 20% of its fees (a registration deposit, or a minimum stake for hosts, is future work and the reason the share is "proposed").
+
+**Parallel mode.** Relayer credits commute, so they are deferred like the pool credits: each transaction only debits its sender, and the receipts carry the relayer; after the transactions the per-relayer sums are credited once. A block with relayed transactions has them (and any transaction touching a relayer account) on the dynamic path, whose reads are tracked, so the registry check is validated like any other read; a transaction that reads or writes a named relayer's balance makes the block fall back to sequential, exactly as for the pool balances. The differential test (`tests/parallel.rs`) mixes registered, unregistered, self and hot-account relayers, transfers to relayers, and registrations in the same block.
+
+**Design note (implemented above).** The relay share needed three things: (1) an optional signed `relayer: Address` in the transaction body (versioned by the tag's high bit, so old transactions are unchanged); (2) crediting `fee * RELAY_SHARE_BPS / 10000` to that address at execution, with the validator pool as the fallback; (3) a registry of hosting nodes to check against, which is the `Host` transaction. Supply is unchanged: every unit debited from the sender is credited to the validator pool or the relayer.
 
 ## Staking, epochs and slashing
 
@@ -184,6 +192,12 @@ HTTPS actions with validator-agreed results (`crates/btb-chain/src/actions.rs`; 
 - **Reports**, state tag `0x52`: `52 00` next id, `52 01 id` `height:u64 LE || contract[32] || data`. Written by the `report_request` host call (`RuntimeHost`) inside the calling mutation or cron, so they commit or revert with it; `reports::end_block` drops records older than 100,000 blocks (64 per block at most). The committee's signature is not in state: it is a deterministic function of the record and the epoch key, held by the validators and served over RPC.
 - **Parallel execution.** Requests are ordinary transactions (they conflict on the queue counter, so Block-STM re-executes them in order); votes and deliveries are in the sequential end-of-block part. Sequential and parallel runs are byte-identical (`tests/actions.rs::sequential_and_parallel_execution_agree`).
 
+## Cross-chain keys and vault
+
+Threshold FROST keys for Bitcoin Taproot and Solana, their signatures and the native vault ([CROSS_CHAIN.md](CROSS_CHAIN.md)). `TxKind::Cross(CrossOp)`, tag 21 (`cross.rs`): `Deal`/`Complain` (validator consensus key, gas 80,000 + 2,500 per item / 300,000), `Signature` (150,000, anyone), `Evidence` (400,000), `Attest` (30,000 + 20,000 per claim, validator), `Prepare` (60,000, validator), `Withdraw` (50,000). Refusals are `Revert::Cross(CrossError)` and change nothing.
+
+State, tag `0x70` (`xdkg.rs`, `xsign.rs`, `vault.rs`): `01 scheme epoch` keys, `10`/`11` sessions and deals, `20`-`22` signing requests (next id, record, pending index), `30` offenders, `31` evidence markers, `50`-`55` vault (asset totals, claim votes, credited markers, withdrawals, prepare votes). Key generation sessions are opened and finalized by `cross::begin_block`/`end_block` right after the beacon DKG hooks. Finished requests are pruned after 100,000 blocks. Wrapped tokens are ordinary entries of the token ledger (`0x0A`, `0x0B`); BTB balances are never touched and the supply invariant holds every block.
+
 ## Site files
 
 `TxKind::Site(SiteOp)` (wire tag 9, `crates/btb-chain/src/site.rs`) lets a contract's **deployer** publish static website files that hosting nodes serve ([HOSTING.md](HOSTING.md#websites)). `Publish { contract, path, content }` creates or replaces `0x32 | contract | path -> SHA-256(content) || content`; `Remove { contract, path }` deletes it. Paths are 1 to 128 bytes of `[A-Za-z0-9._~-]` segments separated by single `/`; files are at most 96 KiB and a contract has at most 256 (large files belong on storage nodes, which do not exist yet). A sender that is not the deployer, an unknown contract, a full contract or a missing file to remove is refused with `Revert::Site(..)` after the fee is charged; nothing changes. Malformed paths and oversize files are `Invalid::TooLarge` and never enter a block. The transaction touches no balance but the sender's fee, so in parallel mode it takes the generic (multi-version) path like every non-transfer. No BTB moves, so the supply invariant is unaffected.
@@ -234,7 +248,7 @@ Contract code runs in `btb-vm` with the call's gas limit. A reverted call's writ
 - *Validation and re-execution.* A transaction is valid if every logged read still returns what it saw. An invalid one has its writes marked `ESTIMATE` and runs again with a new incarnation; a reader that meets an estimate waits for the (lower-index, already claimed) writer instead of reading a value about to change. Transactions above a failed one that read what it wrote are re-executed in the same wave. Waves repeat until a validation pass fails nothing; then every transaction has read exactly what the sequential order gives it, so by induction on the index its outputs are the sequential ones. The commit is the highest-index write per key, in block order, independent of thread timing.
 - *Errors.* A state fault inside a speculative run is just a result that is validated like any other; the lowest-index genuine fault is returned as the block error, as the sequential loop would.
 
-**Fee pools.** Every transaction would credit the validator and relay pool balances and so conflict with all others. Those credits commute, so in parallel mode each transaction only debits its sender, and the sums (computed from the receipts, same 80/20 split) are credited once after the transactions. This is invisible unless something reads or writes a pool balance (a transfer to a pool address, a contract asking for its balance): if any final execution does, the block is re-run sequentially.
+**Fee pools.** Every transaction would credit the validator pool (and its relayer) and so conflict with all others. Those credits commute, so in parallel mode each transaction only debits its sender, and the sums (computed from the receipts, same 80/20 split, per relayer) are credited once after the transactions. This is invisible unless something reads or writes a pool or relayer balance (a transfer to a pool address, a contract asking for its balance): if any final execution does, the block is re-run sequentially.
 
 **Deploys.** Tables are registered per worker from the stored manifest of the contract being called; the shared registry is updated after the block from the successful deploys, in block order.
 
@@ -289,7 +303,7 @@ No floats, clocks, thread timing or hash-map iteration order reach state (parall
 ## Not done yet
 
 - A consensus-level fast path (ordering-free confirmation of owner-only transactions), and parallel crons / end-of-block logic.
-- A fee market (a per-gas bid) and payout of the relay pool.
+- A fee market (a per-gas bid), and a bond for registered hosts (see Relayers above).
 - Channel parameters (challenge length) in the genesis config, and batched settlement of many channels.
 - Delegation (stake behind someone else's validator), un-jailing, reward weighting by proposals and uptime, and slashing for downtime.
 - A storage deposit for contract code and for user-token records.

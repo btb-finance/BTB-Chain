@@ -276,6 +276,7 @@ mod tests {
     fn tx(chain_id: u64, nonce: u64, key: &SigningKey) -> Transaction {
         Transaction::sign(
             TxBody {
+                relayer: None,
                 chain_id,
                 nonce,
                 kind: TxKind::Transfer {

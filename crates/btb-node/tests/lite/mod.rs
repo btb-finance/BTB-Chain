@@ -53,8 +53,13 @@ impl Wallet {
         account_address(&self.key.verifying_key().to_bytes())
     }
     pub fn sign(&mut self, kind: TxKind) -> Transaction {
+        self.sign_relayed(kind, None)
+    }
+    /// Sign a transaction that names `relayer` (the hosting node that earns the relay share).
+    pub fn sign_relayed(&mut self, kind: TxKind, relayer: Option<Address>) -> Transaction {
         let tx = Transaction::sign(
             TxBody {
+                relayer,
                 chain_id: CHAIN_ID,
                 nonce: self.nonce,
                 kind,

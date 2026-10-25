@@ -36,6 +36,8 @@ ureq = { version = "2.12", default-features = false, features = ["tls"], optiona
 [dev-dependencies]
 tempfile = "3"
 btb-vm = { path = "../btb-vm" }
+# MIT OR Apache-2.0. An independent BIP-340 verifier for the cross-chain cluster test.
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "std"] }
 
 [features]
 # `https`: validators can fetch HTTPS actions (docs/ORACLES.md). Without it they answer every

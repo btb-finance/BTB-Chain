@@ -13,9 +13,13 @@ const USAGE: &str = "btb-edge --upstream HOST:PORT[,HOST:PORT..] [--listen 127.0
          [--site-ttl-secs 5] [--max-object-mb 1024] [--max-subscriptions 1024]
          [--key FILE --price UNITS [--free-requests 100 --free-window-secs 3600]
           [--redeem-min UNITS] [--redeem-every-secs 3600]]
+         [--relayer ADDRESS_HEX]
 
 --upstream  hosting nodes, tried in order with failover
 --rpc       node JSON-RPC: storage lookups for large files and payment channels
+--relayer   relay client-signed transactions (POST /tx) to the --rpc nodes; clients sign this
+            account into the transaction as relayer and it earns 20% of the fee. Register the
+            account on chain with a Host transaction first.
 --key       the edge's account key file ({\"secret\": hex}); vouchers must pay its address.
             With --price, requests beyond the free quota need an X-BTB-Voucher header.";
 
@@ -41,6 +45,7 @@ fn run() -> Result<(), String> {
     let (mut mem_mb, mut disk_mb, mut disk_dir) = (256usize, 4096u64, None::<String>);
     let (mut ttl, mut max_mb, mut max_subs) = (5u64, 1024usize, 1024usize);
     let (mut key, mut price) = (None::<String>, None::<u64>);
+    let mut relayer = None::<[u8; 32]>;
     let (mut free, mut window, mut redeem_min, mut redeem_every) = (100u64, 3600u64, 1u64, 3600u64);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -60,6 +65,7 @@ fn run() -> Result<(), String> {
             "--max-subscriptions" => {
                 max_subs = num("--max-subscriptions", val("--max-subscriptions")?)?
             }
+            "--relayer" => relayer = Some(btb_storage::unhex32(&val("--relayer")?)?),
             "--key" => key = Some(val("--key")?),
             "--price" => price = Some(num("--price", val("--price")?)?),
             "--free-requests" => free = num("--free-requests", val("--free-requests")?)?,
@@ -92,6 +98,15 @@ fn run() -> Result<(), String> {
     );
     let rpc: Option<Arc<dyn Rpc>> = (!rpc_urls.is_empty())
         .then(|| Arc::new(HttpRpc::new(rpc_urls, Duration::from_secs(30))) as Arc<dyn Rpc>);
+    if let Some(relayer) = relayer {
+        if rpc.is_none() {
+            return Err("--relayer needs --rpc (transactions are forwarded to the node)".into());
+        }
+        cfg.relay = Some(btb_edge::RelayConfig {
+            relayer,
+            chain_id: None,
+        });
+    }
     let mut svc = Services {
         upstream: Arc::new(up),
         storage: rpc

@@ -1,6 +1,6 @@
 # Hosting nodes
 
-Status: working on a local multi-validator network (`crates/btb-host`, tests in `crates/btb-host/tests/host.rs`). Not done: payment-channel fees on requests, RocksDB persistence of the follower's state, state sync from snapshots, a relay for signed transactions (see [Limits](#limits)). Large files from storage nodes are served ([below](#large-files-from-storage-nodes)); edge caching in front of hosting nodes is [EDGE.md](EDGE.md).
+Status: working on a local multi-validator network (`crates/btb-host`, tests in `crates/btb-host/tests/host.rs`). Not done: payment-channel fees on requests, RocksDB persistence of the follower's state, state sync from snapshots (see [Limits](#limits)). Transaction relay with the 20% fee share: [below](#relaying-transactions). Large files from storage nodes are served ([below](#large-files-from-storage-nodes)); edge caching in front of hosting nodes is [EDGE.md](EDGE.md).
 
 A hosting node is a **non-validator that follows the chain without trusting anyone** and serves the read side of an app: queries, live subscriptions, websites and Merkle proofs. Doubling the number of hosting nodes doubles read capacity without adding work for validators ([SCALING.md](SCALING.md)).
 
@@ -16,7 +16,8 @@ validators (consensus)  ──verified block sync──►  btb-host  ──HTTP
 btb-host --genesis genesis.json \
          --validator /ip4/10.0.0.1/udp/9000/quic-v1/p2p/<peer id> [--validator ...] \
          [--http 127.0.0.1:8788] [--default-contract <64 hex>] \
-         [--listen /ip4/0.0.0.0/udp/9100/quic-v1] [--serve-followers]
+         [--listen /ip4/0.0.0.0/udp/9100/quic-v1] [--serve-followers] \
+         [--relayer <64 hex> --relay-rpc HOST:PORT [--relay-rpc ...]]
 ```
 
 - `--genesis` is the same file the validators use. It fixes the chain id and the epoch-0 validator set, the only thing the node has to be given to trust.
@@ -55,7 +56,10 @@ The query and subscription routes have the shape of `btb-dev` ([DEV_SERVER.md](D
 | `GET /proof/<contract>/site/<path>[?height=N]` | proof bundle for a site file |
 | `GET /proof/raw?key=<hex full state key>[&height=N]` | proof bundle for any state key (balances, rows, ...) |
 | `GET /status`, `GET /health` | `btb_status` of the node plus `host: {subscriptions, connections, executed_height}` |
-| `POST /c/<contract>/mutation/<fn>` | `501`: mutations are signed transactions for a validator (`btb_sendTransaction`) |
+| `GET /relay` | `{relayer, chain_id}`: the address to sign into a transaction (`404` without `--relayer`) |
+| `POST /tx` | body: hex of a signed transaction (or `{"tx": hex}`); forwards it to a validator, answers `{id, relayer}` ([below](#relaying-transactions)) |
+| `GET /tx/<id>` | the receipt once this node has executed the block, else `null` |
+| `POST /c/<contract>/mutation/<fn>` | `501`: mutations are signed transactions: `POST /tx` or a validator's `btb_sendTransaction` |
 
 Arguments, results and the caller identity are those of `btb-dev` (`args` is hex of `btb-codec` bytes; `caller` or `X-BTB-Caller` is 64 hex characters, or any text that is hashed). The caller of a query is **unauthenticated**: a contract must not hide data behind `caller()` in a query. Errors are `{"error": "..."}` with `404` for an unknown contract or function and `400` for an abort. Read routes answer cross-origin (`Access-Control-Allow-Origin: *`): everything served is public chain data.
 
@@ -145,6 +149,16 @@ Files above the on-chain limit live on storage nodes ([STORAGE.md](STORAGE.md)).
 
 The whole file is held in memory while it is fetched and there is no range support here; put an edge node in front for popular or very large files.
 
+## Relaying transactions
+
+A hosting node can accept transactions from browsers and forward them to validators, and earn for it: 20% of the fee of every transaction that names it as `relayer` ([CHAIN.md](CHAIN.md#fees)).
+
+1. The operator creates an account, registers it on chain with a `Host::Register { url }` transaction, and starts the node with `--relayer <that address> --relay-rpc <validator rpc>` (repeatable; first answer wins).
+2. A client asks `GET /relay` for the address and **signs it into its transaction** (`@btb/client`: `new BtbClient({url}).submit({seed, chainId, nonce, kind})`; `btb call --relayer http://host:8788 ...`).
+3. `POST /tx`. The node decodes the transaction, checks the signature, the chain id and that it names *this node's* relayer, then sends `btb_sendTransaction` to the validators. A transaction naming no relayer or another one is refused with `400`: it would earn this node nothing.
+
+The node never signs and cannot change the relayer: it is part of the signed body, so any change breaks the signature. The node also cannot be sure the fee is paid to it: that depends on its account being registered when the block executes (otherwise the validators get the whole fee), and a client can always bypass it and send to a validator. The endpoint is unauthenticated (anyone may submit; validators charge the sender's fee as for any transaction), so put rate limits in front, as for the read routes.
+
 ## Tests
 
 `crates/btb-host/tests/host.rs` runs a real 4-validator cluster (`crates/btb-node/tests/lite`, real QUIC and consensus) and a hosting node:
@@ -154,6 +168,7 @@ The whole file is held in memory while it is fetched and there is no range suppo
 - a subscription pushes after a commit, stays silent for unrelated commits, and is cleaned up when the client leaves;
 - a site is served with the right content types and hash after the deployer publishes it, a stranger's publish is refused on chain and the page is unchanged;
 - a follower fed forged sync responses by a validator key rejects them all;
+- a relay: the client signs the host's relayer address, `POST /tx` forwards the transaction to a validator, the host serves the receipt, and the host account receives exactly 20% of the fee; transactions with no relayer, another relayer, a changed relayer or garbage are refused with `400`, and a host without `--relayer` answers `404`/`501`;
 - the unchanged TypeScript client (`sdk-ts/test/host.test.ts`, run by the Rust test when `npm ci` was run in `sdk-ts`) queries, gets a `501` for a mutation, receives subscription pushes and verifies a proof.
 
 `crates/btb-node/tests/followers.rs` covers the validator side: no follower is served unless the operator opted in, a follower gets sync and nothing else (other frames are dropped and counted), the number of followers and their request rate are limited. `crates/btb-chain/tests/site.rs` covers the transaction.
@@ -161,8 +176,8 @@ The whole file is held in memory while it is fetched and there is no range suppo
 ## Limits
 
 - **State is in memory.** A restarted hosting node replays the chain from genesis, which needs validators that still hold the history (RocksDB validators keep all of it, memory validators 4096 heights). Persisting the follower's state in RocksDB and state sync from snapshots are not done.
-- **No fees yet.** Hosting nodes are meant to earn per-request fees through payment-channel vouchers ([TOKENOMICS.md](TOKENOMICS.md)); this crate serves requests for free (edge nodes already sell requests against vouchers, [EDGE.md](EDGE.md#payments)). The relay share of mutation fees is not paid either ([CHAIN.md](CHAIN.md#fees)).
-- **No transaction relay.** A hosting node does not accept signed transactions; send them to a validator. (Validators accept sync requests from followers but not transactions or consensus messages.)
+- **No fees yet.** Hosting nodes are meant to earn per-request fees through payment-channel vouchers ([TOKENOMICS.md](TOKENOMICS.md)); this crate serves requests for free (edge nodes already sell requests against vouchers, [EDGE.md](EDGE.md#payments)). The relay share of mutation fees is paid when clients relay through the node ([above](#relaying-transactions)).
+- **Relay is opt-in and unmetered.** Without `--relayer` a hosting node accepts no transactions. With it, `POST /tx` is not rate limited and a host has no bond (see [CHAIN.md](CHAIN.md#fees)). (Validators accept sync requests from followers but not transactions or consensus messages.)
 - **Reads share the block-execution thread** (see above), and the HTTP server is a simple thread-per-connection one with a connection cap (`max_connections`, 256).
 - **Head proofs are unanchored** until a few blocks later (the attestation and the commit evidence need the blocks after the height); ranges cannot be proven (see [Proofs](#proofs)). State roots *are* validator-attested; a client that does not pass the validator set still gets only the Merkle check.
 - **Epoch changes** work as for any observing node; a node absent for longer than validators keep epoch records for evidence would need state sync.

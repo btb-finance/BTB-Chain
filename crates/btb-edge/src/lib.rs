@@ -61,6 +61,18 @@ pub struct EdgeConfig {
     pub pay: Option<PayConfig>,
     /// How often to settle vouchers on chain. `None`: only on [`Edge::redeem`].
     pub redeem_every: Option<Duration>,
+    /// Relay client-signed transactions to the node RPC (`POST /tx`) and earn the relay share
+    /// of their fees. Needs `Services::rpc`.
+    pub relay: Option<RelayConfig>,
+}
+
+/// Transaction relay of an edge node (`docs/EDGE.md#transaction-relay`).
+#[derive(Clone, Debug)]
+pub struct RelayConfig {
+    /// The account clients sign into their transactions; register it with a `Host` transaction.
+    pub relayer: btb_chain::Address,
+    /// Chain id to accept. `None`: ask the node (`btb_status`) on first use.
+    pub chain_id: Option<u64>,
 }
 
 impl EdgeConfig {
@@ -75,6 +87,7 @@ impl EdgeConfig {
             max_connections: 512,
             pay: None,
             redeem_every: None,
+            relay: None,
         }
     }
 }
@@ -175,6 +188,7 @@ struct Core {
     cfg: EdgeConfig,
     up: Arc<dyn Upstream>,
     storage: Option<Arc<dyn StorageSource>>,
+    rpc: Option<Arc<dyn Rpc>>,
     cache: Cache,
     metrics: Arc<Metrics>,
     pay: Option<Pay>,
@@ -623,12 +637,15 @@ impl Core {
                     "edge nodes do not run mutations: send a signed transaction to a validator",
                 )
             }
+            ("GET", ["relay"]) => return self.relay_info(),
+            ("POST", ["tx"]) => return self.relay_tx(req),
+            ("GET", ["tx", id]) => return self.receipt(id),
             ("GET" | "HEAD", ["health"]) => {
                 return Response::json(200, &serde_json::json!({"ok": true}))
             }
             ("GET" | "HEAD", ["metrics"]) => return self.metrics_response(),
             ("GET" | "HEAD", _) => {}
-            _ => return Response::error(405, "use GET"),
+            _ => return Response::error(405, "use GET (POST /tx to relay)"),
         }
         if let Some(pay) = &self.pay {
             let v = req.headers.get("x-btb-voucher").map(String::as_str);
@@ -667,6 +684,77 @@ impl Core {
                 self.respond(req, o, kind)
             }
             Err(f) => Response::error(f.status, &f.msg),
+        }
+    }
+
+    fn relay_info(&self) -> Response {
+        match &self.cfg.relay {
+            Some(r) => Response::json(
+                200,
+                &serde_json::json!({"relayer": btb_storage::hex(&r.relayer), "chain_id": r.chain_id}),
+            ),
+            None => Response::error(404, "this edge does not relay transactions"),
+        }
+    }
+
+    /// `POST /tx`: forward a client-signed transaction that names this edge as its relayer to
+    /// the node RPC. The client chose and signed the relayer, so the edge cannot change it.
+    fn relay_tx(&self, req: &Request) -> Response {
+        let (Some(cfg), Some(rpc)) = (&self.cfg.relay, &self.rpc) else {
+            return Response::error(501, "this edge does not relay transactions");
+        };
+        let text = String::from_utf8_lossy(&req.body);
+        let text = text.trim();
+        let hex = if text.starts_with('{') {
+            match serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|v| v["tx"].as_str().map(String::from))
+            {
+                Some(h) => h,
+                None => return Response::error(400, "JSON body needs a \"tx\" hex string"),
+            }
+        } else {
+            text.to_string()
+        };
+        let Ok(bytes) = btb_storage::unhex(hex.trim_start_matches("0x")) else {
+            return Response::error(400, "tx must be hex");
+        };
+        let chain_id = match cfg.chain_id {
+            Some(c) => c,
+            None => match rpc.call("btb_status", serde_json::json!([])) {
+                Ok(v) => match v["chain_id"].as_u64() {
+                    Some(c) => c,
+                    None => return Response::error(502, "node status has no chain_id"),
+                },
+                Err(e) => return Response::error(502, &e),
+            },
+        };
+        if let Err(e) = btb_chain::host::check_relayed(&bytes, chain_id, &cfg.relayer) {
+            return Response::error(400, &e);
+        }
+        match rpc.call(
+            "btb_sendTransaction",
+            serde_json::json!([btb_storage::hex(&bytes)]),
+        ) {
+            Ok(v) => {
+                self.metrics.inc("relayed");
+                Response::json(
+                    200,
+                    &serde_json::json!({"id": v["id"], "relayer": btb_storage::hex(&cfg.relayer)}),
+                )
+            }
+            Err(e) => Response::error(400, &e),
+        }
+    }
+
+    /// `GET /tx/<id>`: the receipt from the node RPC (`null` until executed).
+    fn receipt(&self, id: &str) -> Response {
+        let Some(rpc) = &self.rpc else {
+            return Response::error(501, "no node RPC configured");
+        };
+        match rpc.call("btb_getReceipt", serde_json::json!([id])) {
+            Ok(v) => Response::json(200, &v),
+            Err(e) => Response::error(400, &e),
         }
     }
 
@@ -895,6 +983,7 @@ impl Edge {
         let core = Arc::new(Core {
             up: svc.upstream,
             storage: svc.storage,
+            rpc: svc.rpc.clone(),
             cache,
             metrics,
             pay,

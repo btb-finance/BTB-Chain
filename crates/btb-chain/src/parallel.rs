@@ -37,10 +37,10 @@
 //! Transactions whose account footprint is statically known and closed skip the multi-version
 //! memory entirely; see `classify`. Everything else is a "dynamic" transaction handled above.
 
-use crate::exec::{BlockError, Ctx, Origin, Receipt, Status};
+use crate::exec::{relay_share, BlockError, Ctx, Origin, Receipt, Status};
 use crate::state::{nonce_key, ChainConfig, StateError};
 use crate::tx::{Address, Hash, Manifest, Transaction, TxKind};
-use crate::{relay_pool, slash_vault, validator_pool, RELAY_SHARE_BPS};
+use crate::{relay_pool, slash_vault, validator_pool};
 use btb_runtime::kv::{BatchOp, Entry as KvEntry, KvError, KvStore, Overlay, WriteBatch};
 use btb_runtime::{layout, ReadSet, Tables};
 use btb_vm::Contract;
@@ -72,7 +72,8 @@ pub(crate) struct ParOut {
     pub receipts: Vec<Receipt>,
     /// Final writes of the transactions (begin-block writes and pool credits excluded).
     pub writes: WriteBatch,
-    pub relay: u64,
+    /// Relay shares per registered relayer (credited after the block, like the pools).
+    pub relayers: BTreeMap<Address, u64>,
     pub validator: u64,
     pub any_fee: bool,
     pub deploys: Vec<(Address, Manifest)>,
@@ -531,13 +532,15 @@ fn classify(txs: &[Transaction]) -> (Vec<Vec<usize>>, Vec<usize>) {
         }
         x
     }
-    let special = [
+    // A declared relayer's balance gets deferred credits, so it behaves like a pool address.
+    let mut special = vec![
         validator_pool(),
         relay_pool(),
         slash_vault(),
         crate::dex_vault(),
         crate::dex_fees(),
     ];
+    special.extend(txs.iter().filter_map(|t| t.body.relayer));
     let mut tx_acct: Vec<usize> = Vec::with_capacity(txs.len());
     let mut bad: Vec<bool> = Vec::new(); // per account id: special address
     let mut id_of = |a: Address, parent: &mut Vec<usize>, bad: &mut Vec<bool>| -> usize {
@@ -573,7 +576,8 @@ fn classify(txs: &[Transaction]) -> (Vec<Vec<usize>>, Vec<usize>) {
         }
     }
     for (i, tx) in txs.iter().enumerate() {
-        if !matches!(tx.body.kind, TxKind::Transfer { .. }) {
+        // (a relayer is checked against the host registry, which only the dynamic path tracks)
+        if !matches!(tx.body.kind, TxKind::Transfer { .. }) || tx.body.relayer.is_some() {
             let r = find(&mut parent, tx_acct[i]);
             dynamic[r] = true;
         }
@@ -836,10 +840,15 @@ pub(crate) fn run(
 
     // ---- no dynamic transaction may have seen or touched a pool balance or a confined
     // account (their effects would differ from the sequential order)
-    let pools = [
+    let mut pools = vec![
         layout::balance_key(&validator_pool()),
         layout::balance_key(&relay_pool()),
     ];
+    pools.extend(
+        txs.iter()
+            .filter_map(|t| t.body.relayer)
+            .map(|r| layout::balance_key(&r)),
+    );
     for &t in &stm {
         let Some(out) = slots[t].as_ref() else {
             continue;
@@ -912,19 +921,26 @@ pub(crate) fn run(
     };
 
     // ---- fees and deploys, in block order
-    let (mut relay, mut validator, mut any_fee) = (0u64, 0u64, false);
+    let (mut relayers, mut validator, mut any_fee) = (BTreeMap::<Address, u64>::new(), 0u64, false);
     let mut deploys = Vec::new();
     for (tx, r) in txs.iter().zip(&receipts) {
         debug_assert!(matches!(r.origin, Origin::Tx { .. }));
         if r.fee > 0 {
             any_fee = true;
-            let rp = (u128::from(r.fee) * u128::from(RELAY_SHARE_BPS) / 10_000) as u64;
-            let (Some(a), Some(b)) = (relay.checked_add(rp), validator.checked_add(r.fee - rp))
-            else {
-                return ParResult::Err(BlockError::State(StateError("balance overflow".into())));
+            let rp = relay_share(r.fee, r.relayer.is_some());
+            let overflow =
+                || ParResult::Err(BlockError::State(StateError("balance overflow".into())));
+            let Some(b) = validator.checked_add(r.fee - rp) else {
+                return overflow();
             };
-            relay = a;
             validator = b;
+            if let Some(who) = r.relayer {
+                let slot = relayers.entry(who).or_insert(0);
+                let Some(a) = slot.checked_add(rp) else {
+                    return overflow();
+                };
+                *slot = a;
+            }
         }
         if let (TxKind::Deploy { manifest, .. }, Status::Success) = (&tx.body.kind, &r.status) {
             if let Ok(addr) = Address::try_from(r.output.as_slice()) {
@@ -935,7 +951,7 @@ pub(crate) fn run(
     ParResult::Done(Box::new(ParOut {
         receipts,
         writes,
-        relay,
+        relayers,
         validator,
         any_fee,
         deploys,

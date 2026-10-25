@@ -524,6 +524,7 @@ fn nonce_conflicts_with_other_users_of_the_key_are_retried() {
     let thief = recipient("thief");
     let tx = Transaction::sign(
         TxBody {
+            relayer: None,
             chain_id: CHAIN_ID,
             nonce,
             kind: TxKind::Transfer {

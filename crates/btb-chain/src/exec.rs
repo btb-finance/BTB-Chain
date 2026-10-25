@@ -23,7 +23,16 @@ use crate::tx::{
     contract_address, Address, Hash, Transaction, TxKind, MAX_ARG_BYTES, MAX_CODE_BYTES,
     MAX_NAME_BYTES,
 };
-use crate::{relay_pool, sha256, validator_pool, RELAY_SHARE_BPS, TOTAL_SUPPLY};
+use crate::{sha256, validator_pool, RELAY_SHARE_BPS, TOTAL_SUPPLY};
+
+/// The relay host's part of `fee` when a registered relayer is paid, else 0.
+pub(crate) fn relay_share(fee: u64, paid: bool) -> u64 {
+    if paid {
+        (u128::from(fee) * u128::from(RELAY_SHARE_BPS) / 10_000) as u64
+    } else {
+        0
+    }
+}
 use btb_codec::{Decode, Encode};
 use btb_runtime::kv::{BatchOp, KvStore, Overlay, WriteBatch};
 use btb_runtime::{layout, merkle, RuntimeHost};
@@ -89,8 +98,12 @@ pub enum Revert {
     Storage(crate::storage::StorageError),
     /// A beacon key-generation transaction was refused (nothing changed).
     Dkg(crate::dkg::DkgError),
+    /// A cross-chain transaction was refused (nothing changed).
+    Cross(crate::cross::CrossError),
     /// An action transaction was refused (nothing changed).
     Action(ActionError),
+    /// A hosting-node registry transaction was refused (nothing changed).
+    Host(crate::host::HostError),
     Vm(String),
 }
 
@@ -130,6 +143,9 @@ pub struct Receipt {
     pub gas_used: u64,
     /// Base units charged (to the sender, or to the contract for a cron).
     pub fee: u64,
+    /// The registered relay host that earned `RELAY_SHARE_BPS` of `fee` (None: no relayer, or
+    /// not a registered host, or the sender itself; the validator pool got the whole fee).
+    pub relayer: Option<Address>,
     pub output: Vec<u8>,
 }
 
@@ -271,6 +287,14 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::BadSignature);
             }
         }
+        TxKind::Cross(op) => {
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
         TxKind::Action(op) => {
             if op.check_static().is_err() {
                 return Err(Invalid::TooLarge);
@@ -287,6 +311,14 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::GasLimitTooHigh {
                     max: cfg.max_tx_gas,
                 });
+            }
+        }
+        TxKind::Host(op) => {
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
             }
         }
         TxKind::Site(op) => {
@@ -380,24 +412,34 @@ impl<S: KvStore> Ctx<'_, S> {
         self.set_balance(a, b)
     }
 
-    /// Move `fee` from `payer` into the fee pools. User transactions split it
-    /// `RELAY_SHARE_BPS` to the relay pool and the rest to the validator pool; crons pay the
-    /// validator pool in full.
-    fn charge(&mut self, payer: &Address, fee: u64, relay: bool) -> Result<(), StateError> {
+    /// Move `fee` from `payer` into the fee pools. A user transaction (`relayer` is `Some`
+    /// for it, `None` for a cron) with a registered relayer other than the payer pays that
+    /// relayer `RELAY_SHARE_BPS` of the fee; everything else goes to the validator pool.
+    /// Returns the relayer that earns a share. In parallel mode (`defer_fees`) the credits are
+    /// applied after the block from the receipts.
+    fn charge(
+        &mut self,
+        payer: &Address,
+        fee: u64,
+        relayer: Option<Address>,
+    ) -> Result<Option<Address>, StateError> {
         if fee == 0 {
-            return Ok(());
+            return Ok(None);
         }
         self.debit(payer, fee)?;
-        if self.defer_fees {
-            return Ok(());
-        }
-        let relay_part = if relay {
-            (u128::from(fee) * u128::from(RELAY_SHARE_BPS) / 10_000) as u64
-        } else {
-            0
+        let paid = match relayer {
+            Some(r) if &r != payer && crate::host::is_host(&self.overlay, &r)? => Some(r),
+            _ => None,
         };
-        self.credit(&relay_pool(), relay_part)?;
-        self.credit(&validator_pool(), fee - relay_part)
+        if self.defer_fees {
+            return Ok(paid);
+        }
+        let relay_part = relay_share(fee, paid.is_some());
+        if let Some(r) = &paid {
+            self.credit(r, relay_part)?;
+        }
+        self.credit(&validator_pool(), fee - relay_part)?;
+        Ok(paid)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -831,6 +873,7 @@ impl<S: KvStore> Ctx<'_, S> {
             status: Status::Success,
             gas_used: 0,
             fee: 0,
+            relayer: None,
             output: Vec::new(),
         };
         let price = self.cfg.gas_price;
@@ -887,6 +930,7 @@ impl<S: KvStore> Ctx<'_, S> {
             status: Status::Invalid(i),
             gas_used: 0,
             fee: 0,
+            relayer: None,
             output: Vec::new(),
         };
         if let Err(i) = check_static(tx, &self.cfg) {
@@ -1018,7 +1062,48 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::dkg::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Cross(op) => {
+                let (scfg, chain, height) = (self.cfg.staking, self.cfg.chain_id, self.height);
+                let gas_used = tx.intrinsic_gas();
+                match crate::cross::apply(
+                    &mut self.overlay,
+                    &scfg,
+                    chain,
+                    height,
+                    &sender,
+                    &tx.public_key,
+                    op,
+                ) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::cross::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Cross(e)),
+                    },
+                    Err(crate::cross::Fail::State(e)) => return Err(e),
+                }
+            }
             TxKind::Action(op) => self.exec_action(&sender, op, &id, tx.intrinsic_gas())?,
+            TxKind::Host(op) => {
+                let gas_used = tx.intrinsic_gas();
+                match crate::host::apply(&mut self.overlay, &sender, op) {
+                    Ok(()) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Ok(()),
+                    },
+                    Err(crate::host::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Host(e)),
+                    },
+                    Err(crate::host::Fail::State(e)) => return Err(e),
+                }
+            }
             TxKind::Site(op) => {
                 let gas_used = tx.intrinsic_gas();
                 match crate::site::apply(&mut self.overlay, &sender, op) {
@@ -1058,7 +1143,7 @@ impl<S: KvStore> Ctx<'_, S> {
             .checked_mul(self.cfg.gas_price)
             .ok_or_else(|| StateError("fee overflow".into()))?;
         self.set_u64(&nonce_key(&sender), next.expect("checked above"))?;
-        self.charge(&sender, fee, true)?;
+        let relayer = self.charge(&sender, fee, tx.body.relayer)?;
         Ok(Receipt {
             id,
             origin,
@@ -1068,6 +1153,7 @@ impl<S: KvStore> Ctx<'_, S> {
             },
             gas_used: done.gas_used,
             fee,
+            relayer,
             output: done.output,
         })
     }
@@ -1124,6 +1210,7 @@ impl<S: KvStore> Ctx<'_, S> {
                 status: Status::Paused,
                 gas_used: 0,
                 fee: 0,
+                relayer: None,
                 output: Vec::new(),
             };
             let balance = self.balance(&contract)?;
@@ -1176,7 +1263,7 @@ impl<S: KvStore> Ctx<'_, S> {
                 }
                 Err(r) => receipt.status = Status::Reverted(r),
             }
-            self.charge(&contract, fee, false)?;
+            self.charge(&contract, fee, None)?;
             gas_total += used;
             receipts.push(receipt);
         }
@@ -1360,7 +1447,9 @@ impl Executor {
                     let out = *out;
                     ctx.overlay.commit(out.writes)?;
                     if out.any_fee {
-                        ctx.credit(&relay_pool(), out.relay)?;
+                        for (relayer, amount) in &out.relayers {
+                            ctx.credit(relayer, *amount)?;
+                        }
                         ctx.credit(&validator_pool(), out.validator)?;
                     }
                     for (addr, manifest) in &out.deploys {

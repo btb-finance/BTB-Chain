@@ -4,6 +4,7 @@
 //! | --- | --- | --- |
 //! | `btb_oracleConfig` | `[]` | `null` (no oracles) or `{epoch, key, interim_dealer, dkg_window, max_age_blocks, pairs}`; `key` is `null` while the epoch has none, else `{origin, threshold, group_key, holders}` |
 //! | `btb_oracleDkg` | `[]` | the key generations on the board: `[{target, from, status, window_start, window_end, deal_end, committee, deals, disqualified}]` |
+//! | `btb_oracleKeyChanges` | `[]` | every change of the group key: `[{epoch, height, degraded_epoch, degraded_height, old_group_key, new_group_key}]`; external consumers of reports must re-trust the new key |
 //! | `btb_oracleBeacon` | `[]` or `[height]` | `{epoch, height, signature, seed}`; no height: the last executed block's |
 //! | `btb_oraclePrice` | `[pair_id]` | `null` or `{pair, name, price, decimals, height, reporters}` |
 //!
@@ -55,6 +56,13 @@ pub fn handle<S: KvStore>(
                     "group_key": hex::encode(&k.group.public_key.to_bytes()),
                     "holders": k.holders.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
                 })),
+                "degraded": dkg::degraded(st.store()).map_err(app)?.map(|d| json!({
+                    "epoch": d.epoch,
+                    "since_height": d.height,
+                    "reachable_holders": d.reachable,
+                    "threshold": d.threshold,
+                    "abandoned_group_key": hex::encode(&d.old_group),
+                })),
                 "interim_dealer": !og.group_key.is_empty(),
                 "dkg_window": og.dkg_window,
                 "max_age_blocks": og.max_age_blocks,
@@ -62,6 +70,23 @@ pub fn handle<S: KvStore>(
                     .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
                     .collect::<Vec<_>>(),
             }))
+        }
+        "btb_oracleKeyChanges" => {
+            let all = dkg::key_changes(st.store()).map_err(app)?;
+            Ok(Value::Array(
+                all.iter()
+                    .map(|c| {
+                        json!({
+                            "epoch": c.epoch,
+                            "height": c.height,
+                            "degraded_epoch": c.degraded_epoch,
+                            "degraded_height": c.degraded_height,
+                            "old_group_key": hex::encode(&c.old_group),
+                            "new_group_key": hex::encode(&c.new_group),
+                        })
+                    })
+                    .collect(),
+            ))
         }
         "btb_oracleDkg" => {
             let mut out = Vec::new();

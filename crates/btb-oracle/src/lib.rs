@@ -6,6 +6,7 @@
 //!   trusted-dealer bootstrap.
 //! * [`dkg_crypto`]: encryption of DKG shares to consensus keys, and publicly checkable
 //!   decryption proofs for complaints.
+//! * [`frost`]: threshold Schnorr keys for other chains (FROST over secp256k1/BIP-340 and Ed25519).
 //! * [`beacon`]: the per-height beacon value and seed.
 //! * [`price`]: signed price observations and the stake-weighted median.
 //!
@@ -15,6 +16,7 @@ pub mod beacon;
 pub mod bls;
 pub mod dkg;
 pub mod dkg_crypto;
+pub mod frost;
 pub mod price;
 pub mod report;
 pub mod threshold;
