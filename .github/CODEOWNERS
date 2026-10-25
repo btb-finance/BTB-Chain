@@ -1,17 +1,3 @@
-# These owners will be the default owners for everything in the repo.
-* @btb-finance/core-team
-
-# Roadmap and design documentation
-/ROADMAP.md @btb-finance/core-team
-/docs/ @btb-finance/docs-team
-*.md @btb-finance/docs-team
-
-# Tokenomics and cross-chain design (security-sensitive)
-/docs/TOKENOMICS.md @btb-finance/core-team @btb-finance/security-team
-/docs/CROSS_CHAIN.md @btb-finance/core-team @btb-finance/security-team
-
-# CI/CD
-/.github/workflows/ @btb-finance/devops-team
-
-# Security
-/SECURITY.md @btb-finance/security-team
+# Maintainers who review pull requests. Anyone can open a PR;
+# new maintainers are added here as they become regular contributors.
+* @iownducks

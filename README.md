@@ -94,9 +94,20 @@ Full details: [ROADMAP.md](ROADMAP.md).
 - [Cross-chain](docs/CROSS_CHAIN.md) — chain signatures and native-asset vaults
 - [Roadmap](ROADMAP.md)
 
-## Contributing
+## Build with us
 
-BTB Chain is at the design stage, so design feedback is the most valuable contribution right now. See [CONTRIBUTING.md](CONTRIBUTING.md).
+**BTB Chain is built in the open, by everyone: developers, researchers, writers, and the AI tools they work with.** No invitation needed.
+
+- **New here?** Read [CONTRIBUTING.md](CONTRIBUTING.md) and make your first contribution in five steps.
+- **Have an idea or a doubt about the design?** Open a [design proposal](https://github.com/btb-finance/btb-chain/issues/new/choose); every voice counts.
+- **Want to write code?** Phase 1 (language + RISC-V VM) is next; pick an unchecked item in the [roadmap](ROADMAP.md).
+- **Using AI to help?** Welcome. See [Building with AI](CONTRIBUTING.md#building-with-ai).
+
+Be kind and constructive; see the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+Open source under the [MIT License](LICENSE).
 
 ## Security
 

@@ -1,63 +1,30 @@
 # Branch Protection Rules
 
-Configure the following branch protection rules in GitHub repository settings:
+Recommended settings for an open project: anyone can contribute through pull requests, while `main` stays safe.
 
-## Main Branch Protection
-
-### Branch name pattern: `main`
+## Main branch: `main`
 
 - [x] Require a pull request before merging
-  - [x] Require approvals (2 minimum)
+  - [x] Require approvals: **1**
   - [x] Dismiss stale pull request approvals when new commits are pushed
-  - [x] Require review from Code Owners
-
 - [x] Require status checks to pass before merging
-  - [x] Require branches to be up to date before merging
-  - Required status checks:
-    - Documentation checks
-    - CI workflow (once Rust code lands in Phase 1)
-
+  - Documentation checks
+  - CI workflow (once Rust code lands in Phase 1)
 - [x] Require conversation resolution before merging
+- [x] Allow force pushes: disabled
+- [x] Allow deletions: disabled
+- [ ] Require signed commits: optional (encouraged, but not required, so newcomers aren't blocked)
 
-- [x] Require signed commits
+## Repository settings that keep contributing easy
 
-- [x] Require linear history
+- **Issues:** enabled, blank issues allowed
+- **Discussions:** enabled, for questions and open-ended ideas
+- **Labels:** create `good first issue`, `help wanted`, `design-proposal`, `phase-1` to `phase-6`
+- **Forking:** allowed (default for public repositories)
+- **Actions on fork PRs:** require approval for first-time contributors (default)
 
-- [x] Include administrators
+## How to apply
 
-### Additional Settings
-
-- [x] Allow force pushes: Disabled
-- [x] Allow deletions: Disabled
-
-## Release Branch Protection
-
-### Branch name pattern: `release/*`
-
-- [x] Require a pull request before merging
-  - [x] Require approvals (2 minimum)
-  - [x] Require review from Code Owners
-
-- [x] Require status checks to pass before merging
-  - All checks from main branch
-
-- [x] Require signed commits
-
-## Development Branch Protection
-
-### Branch name pattern: `develop`
-
-- [x] Require a pull request before merging
-  - [x] Require 1 approval
-  - [x] Require review from Code Owners
-
-- [x] Require status checks to pass before merging
-  - Basic CI checks
-
-# Implementation Steps
-
-1. Go to Repository Settings
-2. Navigate to Branches
-3. Add rule for each branch pattern
-4. Configure settings as specified above
-5. Save changes
+1. Go to Repository Settings → Branches → Add rule for `main`
+2. Configure as above and save
+3. Settings → General → Features: enable Issues and Discussions

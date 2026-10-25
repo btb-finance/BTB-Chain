@@ -2,8 +2,6 @@ name: Feature Request
 description: Suggest an idea for this project
 title: "[Feature]: "
 labels: ["enhancement"]
-assignees:
-  - btb-finance/core-team
 body:
   - type: markdown
     attributes:
@@ -15,11 +13,12 @@ body:
       label: Feature Type
       description: What type of feature are you proposing?
       options:
-        - Chain Configuration
-        - Smart Contract
-        - Token Bridge
-        - User Interface
-        - Developer Tools
+        - Contract Language / VM
+        - State / Database
+        - Consensus / Networking
+        - Tokenomics / Fees
+        - Cross-chain
+        - Developer Tools / SDK
         - Documentation
         - Other
     validations:

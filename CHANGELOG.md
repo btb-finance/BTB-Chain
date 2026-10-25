@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.0] - 2026-10-25
 
+### Community
+- Open to everyone: new contributing guide with a five-step first contribution, "Building with AI" rules, Code of Conduct and MIT LICENSE file
+- Lighter review rules (one approval, signed commits optional), blank issues allowed, simplified PR template
+
 ### Changed
 - BTB Chain is now an independent Layer 1: "the Convex of blockchain", a decentralized cloud with database-native state, queries and live subscriptions, cron jobs, on-chain hosting and native tokens
 - New roadmap (ROADMAP.md): six phases from language + VM through mainnet
