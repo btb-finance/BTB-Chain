@@ -29,6 +29,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
 | `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |
 | `docs/SCALING.md` | How each layer scales; node roles and how each earns; storage proofs |
+| `docs/NODE.md` | The validator node: run a local 4-validator testnet, RPC API, crash safety |
 | `docs/GLOSSARY.md` | Alphabetical definitions of key terms used across the docs |
 | `docs/PRIOR_ART.md` | What BTB takes from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain, Chainlink |
 | `docs/VM_DECISION.md` | Build on PolkaVM / CKB-VM or keep our own `btb-vm`: comparison and recommendation |

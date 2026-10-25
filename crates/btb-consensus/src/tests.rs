@@ -1282,3 +1282,137 @@ fn soak_many_seeds() {
         true,
     );
 }
+
+// ------------------------------------------------------------------ epochs
+
+fn epoch_replica(fx: &Fixture, i: usize, end: Height) -> Replica {
+    let cfg = Config {
+        end_height: end,
+        ..fx.cfg.clone()
+    };
+    Replica::new(cfg, fx.ctx.set.clone(), fx.keys[i].clone(), None).unwrap()
+}
+
+#[test]
+fn epoch_end_must_be_above_the_anchor() {
+    let fx = Fixture::new(4);
+    let cfg = Config {
+        epoch: 1,
+        end_height: 10,
+        ..fx.cfg.clone()
+    };
+    let anchor = Some(Anchor {
+        height: 10,
+        id: [3; 32],
+    });
+    let r = Replica::new_epoch(cfg, fx.ctx.set.clone(), fx.keys[0].clone(), None, anchor);
+    assert_eq!(r.err(), Some(Error::InvalidEpoch));
+}
+
+#[test]
+fn tail_blocks_must_be_empty_and_are_never_committed() {
+    let fx = Fixture::new(4);
+    // The epoch ends at height 1: block 1 is its last, block 2 only certifies it.
+    let mut r = epoch_replica(&fx, 3, 1);
+    let b1 = fx.block(1, 1, fx.ctx.genesis_qc(), 1, b"x");
+    let id1 = b1.id();
+    assert_eq!(
+        votes(&r.on_message(Message::Propose(fx.proposal(b1, None)))).len(),
+        1
+    );
+    let qc1 = fx.qc(1, id1, &[0, 1, 2]);
+    // A tail block with a payload is refused outright.
+    let bad = fx.block(2, 2, qc1.clone(), 2, b"data");
+    assert!(votes(&r.on_message(Message::Propose(fx.proposal(bad, None)))).is_empty());
+    assert!(!r.epoch_ended());
+    let b2 = fx.block(2, 2, qc1, 2, b"");
+    let id2 = b2.id();
+    assert_eq!(
+        votes(&r.on_message(Message::Propose(fx.proposal(b2, None)))).len(),
+        1
+    );
+    // QC for the tail block commits block 1 and ends the epoch.
+    let acts = r.on_message(Message::Vote(fx.vote(0, 2, id2)));
+    let acts2 = [acts, r.on_message(Message::Vote(fx.vote(1, 2, id2)))].concat();
+    let commits: Vec<_> = acts2
+        .iter()
+        .filter_map(|a| match a {
+            Action::Commit(b) => Some(b.height),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commits, vec![1]);
+    assert!(r.epoch_ended());
+    assert_eq!(r.committed_height(), 1);
+    // Ended: no timeouts, no proposals, no votes, nothing queued.
+    assert!(r.on_timeout(10_000).is_empty());
+    assert!(r.propose(b"p".to_vec()).is_empty());
+    let b3 = fx.block(3, 3, fx.qc(2, id2, &[0, 1, 2]), 3, b"");
+    assert!(r
+        .on_message(Message::Propose(fx.proposal(b3, None)))
+        .is_empty());
+}
+
+#[test]
+fn leader_proposes_empty_tail_blocks() {
+    let fx = Fixture::new(4);
+    // Replica 2 leads round 2 (RoundRobin); its parent (height 1) is the epoch's last block.
+    let mut r = epoch_replica(&fx, 2, 1);
+    let b1 = fx.block(1, 1, fx.ctx.genesis_qc(), 1, b"x");
+    let id1 = b1.id();
+    r.propose(b"queued".to_vec());
+    r.on_message(Message::Propose(fx.proposal(b1, None)));
+    let mut acts = Vec::new();
+    for v in [0, 1, 3] {
+        acts.extend(r.on_message(Message::Vote(fx.vote(v, 1, id1))));
+    }
+    let prop = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Broadcast(Message::Propose(p)) => Some(p.clone()),
+            _ => None,
+        })
+        .expect("leader of round 2 proposes");
+    assert_eq!(prop.block.height, 2);
+    assert!(prop.block.payload.is_empty());
+}
+
+#[test]
+fn ended_replica_answers_laggards_but_ignores_everything_else() {
+    let fx = Fixture::new(4);
+    let mut r = epoch_replica(&fx, 3, 1);
+    let b1 = fx.block(1, 1, fx.ctx.genesis_qc(), 1, b"x");
+    let id1 = b1.id();
+    r.on_message(Message::Propose(fx.proposal(b1, None)));
+    let b2 = fx.block(2, 2, fx.qc(1, id1, &[0, 1, 2]), 2, b"");
+    let id2 = b2.id();
+    r.on_message(Message::Propose(fx.proposal(b2, None)));
+    for v in [0, 1, 2] {
+        r.on_message(Message::Vote(fx.vote(v, 2, id2)));
+    }
+    assert!(r.epoch_ended());
+    // A laggard's (signed) timeout is answered with the newest QC.
+    let t = Timeout {
+        round: 1,
+        high_qc: fx.ctx.genesis_qc(),
+        voter: 0,
+        sig: fx.sign(0, &fx.ctx.timeout_bytes(1, 0)),
+        seen_proposal: None,
+    };
+    let acts = r.on_message(Message::Timeout(t.clone()));
+    assert!(acts.iter().any(
+        |a| matches!(a, Action::Send { to: 0, msg: Message::Catchup { qc, .. } } if qc.round == 2)
+    ));
+    // A forged timeout gets no answer.
+    let mut forged = t;
+    forged.sig.0[0] ^= 1;
+    assert!(r.on_message(Message::Timeout(forged)).is_empty());
+    // And it serves blocks.
+    let acts = r.on_message(Message::SyncRequest {
+        from: 0,
+        block_id: id2,
+    });
+    assert!(acts
+        .iter()
+        .any(|a| matches!(a, Action::Send { msg: Message::SyncResponse { blocks }, .. } if blocks.len() == 2)));
+}

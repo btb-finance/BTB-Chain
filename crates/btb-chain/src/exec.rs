@@ -12,6 +12,7 @@
 //! and pays for the gas it used.
 
 use crate::block::{tx_root, Block};
+use crate::staking::{self, Fail, StakeError};
 use crate::state::{
     contract_key, cron_key, meta_head_key, money, nonce_key, read_u64, register_manifest,
     ChainConfig, ChainState, ContractRecord, Head, StateError, TAG_CRON,
@@ -73,6 +74,8 @@ pub enum Revert {
     AddressTaken,
     /// Storage, table or deposit fault (for example the contract cannot pay its deposit).
     Fault(String),
+    /// A staking transaction was refused (nothing changed).
+    Stake(StakeError),
     Vm(String),
 }
 
@@ -143,7 +146,7 @@ impl From<btb_runtime::merkle::MerkleError> for BlockError {
 pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
     let fee = tx.gas_limit().checked_mul(cfg.gas_price)?;
     match &tx.body.kind {
-        TxKind::Transfer { amount, .. } => fee.checked_add(*amount),
+        TxKind::Transfer { amount, .. } | TxKind::Stake { amount, .. } => fee.checked_add(*amount),
         _ => Some(fee),
     }
 }
@@ -201,7 +204,20 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::BadSignature);
             }
         }
-        TxKind::Transfer { .. } => {
+        TxKind::Transfer { .. } | TxKind::Stake { .. } | TxKind::Unstake { .. } => {
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::RegisterValidator { network_addr, .. } => {
+            if network_addr.len() > staking::MAX_NETWORK_ADDR {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::SubmitEvidence { .. } => {
             if !tx.verify_signature() {
                 return Err(Invalid::BadSignature);
             }
@@ -358,6 +374,28 @@ impl<S: KvStore> Ctx<'_, S> {
         })
     }
 
+    /// Run a staking operation. A refused one changes nothing (each operation checks
+    /// everything before it writes) and is a revert: nonce used, fee charged.
+    fn staking_done(
+        &mut self,
+        gas: u64,
+        run: impl FnOnce(&mut Self) -> Result<Vec<u8>, Fail>,
+    ) -> Result<Done, StateError> {
+        match run(self) {
+            Ok(output) => Ok(Done {
+                gas_used: gas,
+                output,
+                result: Ok(()),
+            }),
+            Err(Fail::Tx(e)) => Ok(Done {
+                gas_used: gas,
+                output: Vec::new(),
+                result: Err(Revert::Stake(e)),
+            }),
+            Err(Fail::State(e)) => Err(e),
+        }
+    }
+
     fn exec_deploy(
         &mut self,
         sender: &Address,
@@ -497,6 +535,37 @@ impl<S: KvStore> Ctx<'_, S> {
             TxKind::Transfer { to, amount } => self.exec_transfer(&sender, to, *amount)?,
             TxKind::Deploy { code, manifest } => {
                 self.exec_deploy(&sender, tx.body.nonce, code, manifest, tx.intrinsic_gas())?
+            }
+            TxKind::Stake { validator, amount } => self.staking_done(tx.intrinsic_gas(), |c| {
+                staking::stake(&mut c.overlay, &sender, validator, *amount)?;
+                Ok(Vec::new())
+            })?,
+            TxKind::Unstake { amount } => self.staking_done(tx.intrinsic_gas(), |c| {
+                let (cfg, height) = (c.cfg.staking, c.height);
+                staking::unstake(&mut c.overlay, &cfg, &sender, *amount, height)?;
+                Ok(Vec::new())
+            })?,
+            TxKind::RegisterValidator {
+                consensus_key,
+                network_addr,
+            } => self.staking_done(tx.intrinsic_gas(), |c| {
+                staking::register_validator(&mut c.overlay, &sender, consensus_key, network_addr)?;
+                Ok(Vec::new())
+            })?,
+            TxKind::SubmitEvidence { epoch, evidence } => {
+                self.staking_done(tx.intrinsic_gas(), |c| {
+                    let (cfg, chain, height) = (c.cfg.staking, c.cfg.chain_id, c.height);
+                    let o = staking::submit_evidence(
+                        &mut c.overlay,
+                        &cfg,
+                        chain,
+                        &sender,
+                        height,
+                        *epoch,
+                        evidence,
+                    )?;
+                    Ok(o.slashed.to_le_bytes().to_vec())
+                })?
             }
             TxKind::Call {
                 contract,
@@ -723,10 +792,12 @@ impl Executor {
             height: h.height,
         };
         let mut receipts = Vec::with_capacity(block.txs.len());
+        staking::begin_block(&mut ctx.overlay, h.height)?;
         for tx in &block.txs {
             receipts.push(ctx.apply_tx(tx)?);
         }
         ctx.run_crons(&mut receipts)?;
+        staking::end_block(&mut ctx.overlay, &cfg.staking, h.height, h.hash())?;
         let new_head = Head {
             height: h.height,
             hash: h.hash(),

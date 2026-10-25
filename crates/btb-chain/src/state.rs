@@ -11,9 +11,11 @@
 //! | `0x24` cron | `24 due:u64be C function` | `every_blocks`, `u64` LE |
 //! | `0x25` meta | `25 01` / `25 02` | config / head `(height, hash, timestamp)` |
 //!
-//! Native balances are the runtime's `0x05` entries (accounts, contracts and the fee pools
-//! share them); storage deposits are its `0x09` entries.
+//! Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
+//! entries (accounts, contracts, the fee pools and the slash vault share them); storage
+//! deposits are its `0x09` entries; bonded stake is `0x26` and unbonding stake `0x27`.
 
+use crate::staking::{self, GenesisValidator, StakingConfig};
 use crate::tx::{Address, Hash, IndexSpec, Manifest};
 use crate::{sha256, TOTAL_SUPPLY};
 use btb_codec::{Decode, DecodeError, Encode, Reader};
@@ -78,6 +80,8 @@ pub struct ChainConfig {
     pub vm_memory: u32,
     /// Gas limit for local queries (`Executor::query`).
     pub query_gas: u64,
+    /// Validator staking, epochs, slashing.
+    pub staking: StakingConfig,
 }
 
 impl ChainConfig {
@@ -93,6 +97,7 @@ impl ChainConfig {
             max_crons_per_block: 256,
             vm_memory: 1 << 20,
             query_gas: 50_000_000,
+            staking: StakingConfig::default(),
         }
     }
 
@@ -114,6 +119,7 @@ impl ChainConfig {
         if (self.vm_memory as u64) < 2 * btb_vm::contract::MIN_STACK {
             return Err("vm_memory too small".into());
         }
+        self.staking.validate()?;
         Ok(())
     }
 
@@ -130,7 +136,10 @@ impl ChainConfig {
             u64::from(self.max_crons_per_block),
             u64::from(self.vm_memory),
             self.query_gas,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.staking.fields())
+        {
             v.encode_to(&mut o);
         }
         o
@@ -150,6 +159,7 @@ impl ChainConfig {
             max_crons_per_block: n()? as u32,
             vm_memory: n()? as u32,
             query_gas: n()?,
+            staking: StakingConfig::from_fields([n()?, n()?, n()?, n()?, n()?, n()?]),
         };
         Ok(cfg)
     }
@@ -198,6 +208,11 @@ impl From<MerkleError> for GenesisError {
 impl GenesisConfig {
     /// Hash that identifies the genesis block: chain parameters and sorted allocations.
     pub fn hash(&self) -> Hash {
+        self.hash_with_validators(&[])
+    }
+
+    /// `hash()`, also committing to the genesis validators (identical when there are none).
+    pub fn hash_with_validators(&self, validators: &[GenesisValidator]) -> Hash {
         let mut allocs = self.allocations.clone();
         allocs.sort();
         let mut b = self.config.encode();
@@ -205,6 +220,14 @@ impl GenesisConfig {
         for (a, v) in &allocs {
             b.extend_from_slice(a);
             v.encode_to(&mut b);
+        }
+        let mut vals: Vec<&GenesisValidator> = validators.iter().collect();
+        vals.sort_by_key(|v| v.operator);
+        for v in vals {
+            b.extend_from_slice(&v.operator);
+            b.extend_from_slice(&v.consensus_key);
+            v.network_addr.encode_to(&mut b);
+            v.stake.encode_to(&mut b);
         }
         sha256(&[b"btb.genesis.v1", &b])
     }
@@ -317,9 +340,13 @@ pub(crate) fn sum_tag(kv: &impl KvStore, tag: u8) -> Result<u128, KvError> {
     }
 }
 
-/// Everything that is "money": balances (accounts, contracts, fee pools) plus storage deposits.
+/// Everything that is "money": balances (accounts, contracts, fee pools, the slash vault),
+/// storage deposits, bonded stake and unbonding stake.
 pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
-    Ok(sum_tag(kv, layout::TAG_BALANCE)? + sum_tag(kv, layout::TAG_DEPOSIT)?)
+    Ok(sum_tag(kv, layout::TAG_BALANCE)?
+        + sum_tag(kv, layout::TAG_DEPOSIT)?
+        + sum_tag(kv, staking::TAG_STAKE)?
+        + sum_tag(kv, staking::TAG_UNBOND)?)
 }
 
 /// Register a manifest's indexes into `tables` for `contract`.
@@ -372,7 +399,18 @@ pub struct ChainState<S: KvStore = MemKv> {
 impl<S: KvStore> ChainState<S> {
     /// Create the chain in an empty store: write the allocations, config and head, and commit
     /// the genesis Merkle root (version 0).
-    pub fn from_genesis(mut kv: S, genesis: &GenesisConfig) -> Result<Self, GenesisError> {
+    pub fn from_genesis(kv: S, genesis: &GenesisConfig) -> Result<Self, GenesisError> {
+        Self::from_genesis_with_validators(kv, genesis, &[])
+    }
+
+    /// `from_genesis` with the epoch-0 validators. Each validator's stake is bonded out of its
+    /// operator's allocation (the allocations still sum to `TOTAL_SUPPLY`). The genesis hash
+    /// commits to the validators.
+    pub fn from_genesis_with_validators(
+        mut kv: S,
+        genesis: &GenesisConfig,
+        validators: &[GenesisValidator],
+    ) -> Result<Self, GenesisError> {
         genesis.config.validate().map_err(GenesisError::Config)?;
         let mut sum = 0u128;
         let mut seen = BTreeSet::new();
@@ -390,14 +428,37 @@ impl<S: KvStore> ChainState<S> {
         }
         let mut batch = btb_runtime::WriteBatch::new();
         for (a, v) in &genesis.allocations {
-            if *v > 0 {
-                batch.put(layout::balance_key(a), v.to_le_bytes().to_vec());
+            let staked: u128 = validators
+                .iter()
+                .filter(|g| g.operator == *a)
+                .map(|g| u128::from(g.stake))
+                .sum();
+            let left = u128::from(*v).checked_sub(staked).ok_or_else(|| {
+                GenesisError::Config("genesis validator stakes more than its allocation".into())
+            })?;
+            if left > 0 {
+                batch.put(layout::balance_key(a), (left as u64).to_le_bytes().to_vec());
             }
         }
+        for g in validators {
+            if !genesis.allocations.iter().any(|(a, _)| *a == g.operator) {
+                return Err(GenesisError::Config(
+                    "genesis validator has no allocation".into(),
+                ));
+            }
+        }
+        let genesis_hash = genesis.hash_with_validators(validators);
+        staking::genesis_ops(
+            &genesis.config.staking,
+            validators,
+            genesis_hash,
+            &mut batch,
+        )
+        .map_err(GenesisError::Config)?;
         batch.put(meta_config_key(), genesis.config.encode());
         let head = Head {
             height: 0,
-            hash: genesis.hash(),
+            hash: genesis_hash,
             timestamp: genesis.timestamp,
         };
         batch.put(meta_head_key(), head.encode());

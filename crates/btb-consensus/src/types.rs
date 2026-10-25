@@ -51,6 +51,8 @@ pub enum Error {
     InvalidPublicKey,
     StakeOverflow,
     NotAValidator,
+    /// `end_height` is not above the anchor height.
+    InvalidEpoch,
 }
 
 impl fmt::Display for Error {
@@ -149,21 +151,39 @@ impl ValidatorSet {
 }
 
 /// Chain context: validator set plus the genesis id that domain-separates every signature.
+///
+/// `genesis` commits to (chain id, epoch, validator set) and nothing else, so a chain that
+/// knows the set of an epoch can rebuild the context and verify `Evidence` from that epoch
+/// (`Context::for_epoch`). `root` is the id of the block the epoch builds on (the round-0
+/// certificate certifies it); it is not part of any signed byte string.
 #[derive(Clone, Debug)]
 pub struct Context {
     pub set: ValidatorSet,
     pub genesis: Hash,
+    pub root: Hash,
 }
 
 impl Context {
+    /// The context of epoch 0, rooted at its own genesis id.
     pub fn new(chain_id: &[u8], set: ValidatorSet) -> Self {
+        Self::for_epoch(chain_id, 0, set, None)
+    }
+
+    /// The context of `epoch`. `root` defaults to the genesis id (epoch 0); later epochs pass
+    /// an id every validator of the epoch derives identically from the finalized chain.
+    pub fn for_epoch(chain_id: &[u8], epoch: u64, set: ValidatorSet, root: Option<Hash>) -> Self {
         let genesis = sha256(&[
-            b"BTB/genesis/v1",
+            b"BTB/genesis/v2",
             &(chain_id.len() as u64).to_le_bytes(),
             chain_id,
+            &epoch.to_le_bytes(),
             &set.digest(),
         ]);
-        Self { set, genesis }
+        Self {
+            set,
+            genesis,
+            root: root.unwrap_or(genesis),
+        }
     }
 
     pub fn vote_bytes(&self, round: Round, block_id: &Hash) -> Vec<u8> {
@@ -200,7 +220,7 @@ impl Context {
     pub fn genesis_qc(&self) -> QuorumCert {
         QuorumCert {
             round: 0,
-            block_id: self.genesis,
+            block_id: self.root,
             votes: Vec::new(),
         }
     }
@@ -208,7 +228,7 @@ impl Context {
     /// Full structural and cryptographic check of a quorum certificate.
     pub fn verify_qc(&self, qc: &QuorumCert) -> bool {
         if qc.round == 0 {
-            return qc.block_id == self.genesis && qc.votes.is_empty();
+            return qc.block_id == self.root && qc.votes.is_empty();
         }
         if qc.round > MAX_ROUND {
             return false;

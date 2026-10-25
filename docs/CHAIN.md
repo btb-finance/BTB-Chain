@@ -1,6 +1,6 @@
 # Chain execution layer
 
-`crates/btb-chain` is the deterministic execution layer a consensus engine drives: transactions, genesis, blocks, fees, crons and a mempool, on top of `btb-vm` (contracts), `btb-runtime` (state, Merkle root) and `btb-codec` (encoding). It has no networking, no clock and no randomness. Consensus decides the order of blocks; this crate decides what a block does.
+`crates/btb-chain` is the deterministic execution layer a consensus engine drives: transactions, genesis, blocks, fees, crons, a mempool and validator staking, on top of `btb-vm` (contracts), `btb-runtime` (state, Merkle root) and `btb-codec` (encoding). It has no networking, no clock and no randomness. Consensus decides the order of blocks; this crate decides what a block does.
 
 ```rust
 let mut state = ChainState::from_genesis(kv, &genesis)?;     // or ChainState::open(kv)
@@ -19,7 +19,7 @@ An account is a 32-byte address: `SHA256("btb.account.v1" || ed25519_public_key)
 
 ## Transactions
 
-Three kinds, all encoded with `btb-codec` (little-endian, length-prefixed):
+Seven kinds, all encoded with `btb-codec` (little-endian, length-prefixed):
 
 ```
 tx       = body || public_key[32] || signature[64]
@@ -27,6 +27,12 @@ body     = chain_id:u64 || nonce:u64 || tag:u8 || fields
 Deploy   (0): code:bytes || manifest
 Call     (1): contract[32] || kind:u8 || function:string || args:bytes || gas_limit:u64 || max_fee:u64
 Transfer (2): to[32] || amount:u64
+Stake    (3): validator_key[32] || amount:u64
+Unstake  (4): amount:u64
+RegisterValidator (5): consensus_key[32] || network_addr:bytes
+SubmitEvidence    (6): epoch:u64 || evidence
+evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2        (DoubleVote)
+         | 1 || proposer:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleProposal)
 manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes:[string]
 ```
 
@@ -58,6 +64,9 @@ Gas is the VM's gas plus an intrinsic part charged before the VM runs:
 | --- | --- |
 | Transfer | `TRANSFER_GAS` = 2,000 |
 | Deploy | `DEPLOY_BASE_GAS` 50,000 + `DEPLOY_BYTE_GAS` 100 per byte of code (always charged in full, also if the deploy reverts) |
+| Stake / Unstake | `STAKE_GAS` / `UNSTAKE_GAS` 10,000 |
+| RegisterValidator | `REGISTER_VALIDATOR_GAS` 20,000 |
+| SubmitEvidence | `EVIDENCE_GAS` 100,000 (two signature checks; charged also when the evidence is refused) |
 | Call | `CALL_BASE_GAS` 2,000 + `CALL_BYTE_GAS` 2 per byte of function name and arguments, plus the VM gas of the call, up to `gas_limit` |
 
 Stored contract code is paid for by deploy gas, not by a storage deposit (a deposit for code is future work). State a contract writes locks the usual storage deposit from the **contract's** balance (fund a contract with a `Transfer` before calling it).
@@ -69,13 +78,48 @@ Stored contract code is paid for by deploy gas, not by a storage deposit (a depo
 | User transaction (deploy, call, transfer) | 80% (the rounding remainder) | 20% (`RELAY_SHARE_BPS` = 2,000) |
 | Cron run | 100% | none |
 
-This implements the "80/20 proposed" mutation split of [TOKENOMICS.md](TOKENOMICS.md) as accounting only. Nothing pays out of the pools yet: who the executor and the relay host are, and how a pool is distributed (epochs, stake weights), belongs to the validator-set work of Phase 4 and 5. The pools just accumulate.
+This implements the "80/20 proposed" mutation split of [TOKENOMICS.md](TOKENOMICS.md) as accounting only. The **validator pool is paid out at every epoch end** to the epoch's validators, pro rata by stake (see [Staking, epochs and slashing](#staking-epochs-and-slashing)). The relay pool still just accumulates: who the relay hosts are belongs to Phase 5.
+
+## Staking, epochs and slashing
+
+Validators are accounts that bond BTB. The chain turns that stake into a validator set per **epoch** and exposes it to the node, which drives `btb-consensus` with it ([CONSENSUS.md](CONSENSUS.md#epochs-and-validator-set-changes)). Economics (rewards, slash destination) are in [TOKENOMICS.md](TOKENOMICS.md#validator-staking-and-slashing). Code: `crates/btb-chain/src/staking.rs`.
+
+**Parameters** (`ChainConfig::staking`, fixed at genesis and part of the genesis hash; defaults for the testnet):
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `epoch_len` | 600 blocks | Epoch `e` is blocks `e*E + 1 ..= (e+1)*E` (10 minutes at 1 s) |
+| `max_validators` | 100 | `N`: seats in a set |
+| `min_stake` | 100,000 BTB | Bonded stake needed to get a seat |
+| `unbonding_blocks` | 1,209,600 (14 days at 1 s) | Unbonding period and evidence window; at least one epoch |
+| `slash_bps` | 500 (5%) | Share of bonded plus unbonding stake slashed for double signing |
+| `reporter_reward_bps` | 1,000 (10%) | Share of the slashed amount paid to the reporter |
+
+**Transactions.** An *operator* is an ordinary account. `RegisterValidator` records the operator's Ed25519 **consensus key** (a valid, non-weak point, unique across validators) and a network address (up to 256 opaque bytes, for example a multiaddr); sending it again updates both. `Stake { validator, amount }` bonds `amount` from the sender's balance; `validator` must be the sender's own public key (the field exists so that delegation can be added without a format change; today anything else is refused as `NotOperator`). `Unstake { amount }` moves bonded stake into unbonding. A refused staking transaction is a *revert* (`Revert::Stake(StakeError)`): it changes nothing, uses the nonce and pays the gas, so spam costs money.
+
+**Stake states.** Bonded stake (`0x26`) counts toward a seat from the next epoch on. Unbonding stake (`0x27`, indexed by maturity in `0x2C`) belongs to nobody for voting, is **still slashable**, and is released into the balance at the start of block `maturity`. `maturity = end of the epoch in which Unstake ran + unbonding_blocks`; aligning to the epoch end means stake unbonded at any point of an epoch outlives the evidence window of that epoch and of every earlier one. Several unstakes in one epoch share one entry.
+
+**Epochs.** The set of epoch 0 is the genesis set. At the **last block of epoch `e`** (height `(e+1)*E`), after the transactions and crons, the executor (1) pays out the validator pool (below), (2) selects the set of epoch `e + 1`: every registered, non-jailed operator with bonded stake >= `min_stake`, ordered by stake descending and **ties by operator address ascending**, the first `N` of them (if nobody qualifies the previous set stays, so consensus never has an empty set), (3) stores it as an `EpochRecord { epoch, start_height, anchor, validators }` where `anchor` is the header hash of that last block, and (4) prunes records whose evidence window closed. The order of `validators` is the consensus validator index. Stake changes during an epoch never alter that epoch's set.
+
+**Node API** (`ChainState`): `current_epoch()` (epoch of the next block), `epoch_record(epoch)`, `consensus_set(epoch)` (a `btb_consensus::ValidatorSet` in index order), `consensus_context(epoch)`, `consensus_chain_id()` (use as `btb_consensus::Config::chain_id`; the chain id the evidence rules use), `validator(operator)`, `staked`, `unbonding`, `unbonding_entries`, `selected_set()` (what the next epoch would get right now), `slash_vault_balance()`, `slashed_in_epoch(epoch, operator)`. After executing a committed block that is a multiple of `epoch_len`, the node reads `epoch_record(next)` and starts `Replica::new_epoch(...)` with `Config { epoch, end_height: (epoch+1)*epoch_len, chain_id: consensus_chain_id(), .. }`, the set from `consensus_set`, and `Anchor { height: record.start_height, id: record.anchor }`.
+
+**Slashing.** `SubmitEvidence { epoch, evidence }` carries a `btb_consensus::Evidence` (`DoubleVote` or `DoubleProposal`). It is accepted when all of these hold, checked in this order, and refused with the named `StakeError` otherwise:
+
+1. the set of `epoch` is stored (`UnknownEpoch`: not started yet, or pruned);
+2. `height < (epoch+1)*E + unbonding_blocks` (`Expired`);
+3. the offender index is a seat in that set (`UnknownValidator`);
+4. `Evidence::verify` succeeds against the context rebuilt from that epoch's set, the chain id and the epoch (`BadEvidence`: wrong or flipped signature, same block twice, wrong round, wrong epoch or chain, a vote signature passed off as a proposal signature);
+5. the offender was not already slashed for that epoch (`Duplicate`): **one slash per operator per epoch**, whatever the kind or round of the evidence, so repeating an offence or resubmitting a report cannot compound.
+
+Then, in one step: `slash_bps` of the offender's bonded stake and of **each unbonding entry** is removed (stake already released is out of reach, which is why the window ends when the oldest unbonding stake that could have backed the offence matures); `reporter_reward_bps` of the total goes to the transaction sender (to the vault if the sender is the offender, so self-reporting does not pay); the rest goes to the slash vault; the operator is **jailed** (permanently: no new stake, no re-registration, never selected again; it may still unstake). The offender keeps its seat for the rest of the running epoch, since the set is fixed; it is gone from the next set. The receipt's `output` is the slashed amount (`u64` LE).
+
+**Rewards.** At the epoch end the whole validator pool balance is distributed to the epoch's seats that are not jailed, pro rata by their stake in the set (`pool * stake / total`, floor). The rounding remainder is less than one unit per validator; it is given one unit each to the first validators in set order, so the payouts sum to **exactly** the pool. Payouts are credited to the operators' balances; nothing is minted. If every seat is jailed the pool carries over.
 
 ## Genesis and the supply invariant
 
 `GenesisConfig { config, timestamp, allocations }` lists every balance. The allocations must sum to **exactly** `TOTAL_SUPPLY` with no address twice, or `from_genesis` fails. This is the only place BTB is created. The final allocation (reserve pool, grants, vesting) is still open in TOKENOMICS.md; the config just takes whatever list is decided.
 
-After every block the executor sums all balances (accounts, contracts, both fee pools) and all storage deposits and requires `balances + deposits == TOTAL_SUPPLY`. If not, `execute_block` returns `BlockError::SupplyInvariant` and writes nothing. Nothing in the crate mints: transfers, fees and deposits only move existing units. User tokens (`Token.create`, host calls 16 to 23) are separate and are not part of this sum. The check scans all balances, O(accounts) per block; `Executor::check_supply` can switch it off for benchmarks.
+After every block the executor sums all balances (accounts, contracts, the fee pools and the slash vault), all storage deposits, all bonded stake and all unbonding stake, and requires the sum to equal `TOTAL_SUPPLY`. If not, `execute_block` returns `BlockError::SupplyInvariant` and writes nothing. Nothing in the crate mints: transfers, fees, deposits, staking, rewards and slashing only move existing units. User tokens (`Token.create`, host calls 16 to 23) are separate and are not part of this sum. The check scans all balances, O(accounts) per block; `Executor::check_supply` can switch it off for benchmarks.
 
 ## Blocks
 
@@ -88,6 +132,8 @@ hash   = SHA256("btb.block.v1" || height || parent_hash || timestamp || state_ro
 - `timestamp` is chosen by the proposer (Unix milliseconds). Execution checks only that it is not earlier than the parent's. Contracts never see it, and crons run by height, so it cannot change what a block does.
 - `tx_root` is a hash over the transaction ids.
 - `Block::encode` / `Block::decode` give the wire form.
+
+`GenesisConfig` itself stays as it was; the epoch-0 validators go through `ChainState::from_genesis_with_validators(kv, &genesis, &[GenesisValidator { operator, consensus_key, network_addr, stake }])`. Each validator's stake is bonded out of its operator's allocation (which must hold it), so the allocations still sum to `TOTAL_SUPPLY`; the genesis hash commits to the validators (`GenesisConfig::hash_with_validators`; with none it equals `hash()`).
 
 `execute_block` returns `Err` without changing state for: `BadHeight`, `BadParent`, `BadStateRoot`, `BadTxRoot`, `TimestampBeforeParent`, `TooManyTxs` (`max_block_txs`), `BlockGasLimit` (sum of `gas_limit`s above `block_gas_limit`), and `SupplyInvariant`.
 
@@ -127,7 +173,8 @@ No floats, clocks, threads or hash-map iteration order reach state: balances and
 ## Not done yet
 
 - Parallel (Block-STM style) execution and the fast path.
-- A fee market (a per-gas bid), payout of the fee pools, staking and slashing.
+- A fee market (a per-gas bid) and payout of the relay pool.
+- Delegation (stake behind someone else's validator), un-jailing, reward weighting by proposals and uptime, and slashing for downtime.
 - A storage deposit for contract code and for user-token records.
 - Randomness beacon, price feeds and other oracle inputs to execution.
 - Conversion of the CLI deploy bundle into a `Deploy` transaction.

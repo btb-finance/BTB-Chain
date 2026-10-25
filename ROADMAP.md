@@ -68,13 +68,16 @@ Consensus and networking across independent validators.
 
 **Deliverables**
 
-- [ ] Proof-of-stake BFT consensus (HotStuff family or DAG), ~1 s finality
-  - consensus core done (simulated): `crates/btb-consensus`, Jolteon-style 2-chain with timeout certificates, stake-weighted quorums and equivocation evidence, see [docs/CONSENSUS.md](docs/CONSENSUS.md); still needs real networking and a ~1 s finality measurement
+- [x] Proof-of-stake BFT consensus (HotStuff family or DAG), ~1 s finality
+  - consensus core done (simulated): `crates/btb-consensus`, Jolteon-style 2-chain with timeout certificates, stake-weighted quorums and equivocation evidence, see [docs/CONSENSUS.md](docs/CONSENSUS.md); running on real networking in `crates/btb-node`
   - the execution layer it will drive (transactions, genesis, block execution, fees, crons, mempool) is `crates/btb-chain`, see [docs/CHAIN.md](docs/CHAIN.md); not a tick, consensus itself is not done
-- [ ] libp2p networking over QUIC
+  - measured on real QUIC links between 4 in-process validators (`cargo test -p btb-node --test cluster -- --nocapture`): submit to final median ~50 ms on localhost, median ~0.7 s (max ~0.8 s) with 100 ms one-way delay injected per message; ~5 one-way delays in the best case, so ~1 s holds up to about 200 ms one-way. Not yet measured: separate machines over the internet, more than 4 validators
+- [x] libp2p networking over QUIC
+  - `crates/btb-node`: rust-libp2p QUIC (TLS 1.3 authenticates the peer id, which is the validator key), per-peer rate limits and bans, bounded frames, see [docs/NODE.md](docs/NODE.md)
 - [ ] Fast path for transactions touching only one owner's data
 - [ ] Parallel execution (Block-STM style)
-- [ ] Validator staking, rotation and slashing
+- [x] Validator staking, rotation and slashing
+  - `Stake`/`Unstake`/`RegisterValidator`/`SubmitEvidence` transactions, epochs with the top-N set fixed at each epoch end, unbonding, pro-rata rewards and double-sign slashing in `crates/btb-chain` ([CHAIN.md](docs/CHAIN.md#staking-epochs-and-slashing), [TOKENOMICS.md](docs/TOKENOMICS.md#validator-staking-and-slashing)); epoch changes in `btb-consensus` with the safety argument in [CONSENSUS.md](docs/CONSENSUS.md#epochs-and-validator-set-changes)
 - [ ] Public testnet with faucet and explorer
 
 **Gate:** testnet keeps finalizing when validators fail or misbehave.

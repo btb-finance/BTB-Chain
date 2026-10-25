@@ -8,10 +8,14 @@ mod storage;
 mod types;
 
 #[cfg(test)]
+mod epoch_sim;
+#[cfg(test)]
+mod hooks_tests;
+#[cfg(test)]
 mod sim;
 #[cfg(test)]
 mod tests;
 
-pub use replica::{Config, LeaderPolicy, Replica, Stats};
+pub use replica::{Anchor, Config, LeaderPolicy, PayloadCheck, Replica, Stats};
 pub use storage::{MemoryStorage, SafetyState, SafetyStorage};
 pub use types::*;

@@ -37,6 +37,20 @@ pub struct Config {
     pub retain_rounds: u64,
     /// Bound on payloads queued through `propose`.
     pub max_queued_payloads: usize,
+    /// Epoch number (domain-separates signatures). 0 for the first epoch.
+    pub epoch: u64,
+    /// Height of the last block of this epoch; 0 = the epoch never ends. See `docs/CONSENSUS.md`.
+    pub end_height: Height,
+}
+
+/// Where an epoch starts: the finalized chain it extends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// Height of the last block of the previous epoch.
+    pub height: Height,
+    /// A 32-byte id every validator of the new epoch derives identically from the finalized
+    /// chain (for example the chain header hash of block `height`).
+    pub id: Hash,
 }
 
 impl Default for Config {
@@ -51,6 +65,8 @@ impl Default for Config {
             sync_retry: 10,
             retain_rounds: 1_000,
             max_queued_payloads: 1_024,
+            epoch: 0,
+            end_height: 0,
         }
     }
 }
@@ -130,7 +146,16 @@ pub struct Replica {
     payloads: VecDeque<Vec<u8>>,
     outbox: Vec<Action>,
     stats: Stats,
+    /// The epoch's last block is committed: no more voting, proposing or timeouts.
+    ended: bool,
+    /// Embedder hook: a proposal whose block fails this check is not voted for.
+    payload_check: Option<PayloadCheck>,
+    /// Do not propose an empty block on one's own initiative; wait for `propose`.
+    hold_empty: bool,
 }
+
+/// See `Replica::set_payload_check`.
+pub type PayloadCheck = Box<dyn Fn(&Block) -> bool>;
 
 impl Replica {
     /// Create a replica. `key` must belong to a validator in `set`. If `storage` holds
@@ -141,10 +166,29 @@ impl Replica {
         key: SigningKey,
         storage: Option<Box<dyn SafetyStorage>>,
     ) -> Result<Self, Error> {
+        Self::new_epoch(config, set, key, storage, None)
+    }
+
+    /// Create the replica of one epoch. `anchor` is the finalized chain the epoch extends
+    /// (`None` for the first epoch, which starts at genesis). The epoch is the instance's whole
+    /// world: a fresh round counter, its own set and signature domain, and it stops when the
+    /// block at `config.end_height` is committed (`epoch_ended`). `storage` must be this
+    /// epoch's own.
+    pub fn new_epoch(
+        config: Config,
+        set: ValidatorSet,
+        key: SigningKey,
+        storage: Option<Box<dyn SafetyStorage>>,
+        anchor: Option<Anchor>,
+    ) -> Result<Self, Error> {
         let me = set
             .index_of(&key.verifying_key().to_bytes())
             .ok_or(Error::NotAValidator)?;
-        let ctx = Context::new(&config.chain_id, set);
+        let anchor_height = anchor.map_or(0, |a| a.height);
+        if config.end_height != 0 && config.end_height <= anchor_height {
+            return Err(Error::InvalidEpoch);
+        }
+        let ctx = Context::for_epoch(&config.chain_id, config.epoch, set, anchor.map(|a| a.id));
         let genesis_qc = ctx.genesis_qc();
         let safety = storage
             .as_ref()
@@ -154,13 +198,13 @@ impl Replica {
                 locked_round: 0,
                 last_proposed_round: 0,
                 high_qc: genesis_qc.clone(),
-                committed_height: 0,
+                committed_height: anchor_height,
                 committed_round: 0,
-                committed_id: ctx.genesis,
+                committed_id: ctx.root,
             });
         let genesis_block = Block {
             round: 0,
-            height: 0,
+            height: anchor_height,
             parent: [0; 32],
             justify: genesis_qc.clone(),
             proposer: 0,
@@ -168,13 +212,13 @@ impl Replica {
             payload: Vec::new(),
         };
         let mut blocks = BTreeMap::new();
-        blocks.insert(ctx.genesis, genesis_block);
+        blocks.insert(ctx.root, genesis_block);
         let round = (safety.high_qc.round + 1)
             .max(safety.last_voted_round)
             .max(safety.last_proposed_round)
             .max(1);
         let mut qcs = BTreeMap::new();
-        qcs.insert(ctx.genesis, genesis_qc);
+        qcs.insert(ctx.root, genesis_qc);
         let schedule = match config.leader_policy {
             LeaderPolicy::RoundRobin => (0..ctx.set.len() as u32).collect(),
             LeaderPolicy::StakeWeighted => weighted_schedule(&ctx.set),
@@ -205,11 +249,15 @@ impl Replica {
             payloads: VecDeque::new(),
             outbox: Vec::new(),
             stats: Stats::default(),
+            ended: false,
+            payload_check: None,
+            hold_empty: false,
             cfg: config,
             storage,
             now: 0,
         };
         r.round_deadline = r.cfg.base_timeout;
+        r.ended = r.cfg.end_height != 0 && r.safety.committed_height >= r.cfg.end_height;
         Ok(r)
     }
 
@@ -239,6 +287,16 @@ impl Replica {
     pub fn genesis_id(&self) -> Hash {
         self.ctx.genesis
     }
+    /// The epoch this replica serves.
+    pub fn epoch(&self) -> u64 {
+        self.cfg.epoch
+    }
+    /// Whether the last block of the epoch (`Config::end_height`) is committed. From then on
+    /// the replica only answers sync requests and timeouts of laggards; the embedder starts
+    /// the next epoch with `Replica::new_epoch`.
+    pub fn epoch_ended(&self) -> bool {
+        self.ended
+    }
     pub fn pending_blocks(&self) -> usize {
         self.pending.len()
     }
@@ -247,11 +305,32 @@ impl Replica {
         self.schedule[(round % self.schedule.len() as u64) as usize]
     }
 
+    // ---------------------------------------------------------------- embedder hooks
+
+    /// Install an application check run on every proposal's block just before voting (after
+    /// the protocol checks pass). A block it rejects is dropped without a vote, so the round
+    /// times out if the leader is faulty. Honest replicas must all use the same rule, or they
+    /// may fail to form quorums (safety is unaffected: not voting is always safe).
+    pub fn set_payload_check(&mut self, check: PayloadCheck) {
+        self.payload_check = Some(check);
+    }
+
+    /// When set, a leader with no queued payload does not propose by itself; the embedder
+    /// calls `propose` (an empty payload is allowed) when it wants a block. Use it to pace
+    /// blocks instead of producing empty ones as fast as the network allows. The embedder must
+    /// then keep proposing often enough that rounds do not time out.
+    pub fn set_hold_empty_proposals(&mut self, hold: bool) {
+        self.hold_empty = hold;
+    }
+
     // ---------------------------------------------------------------- inputs
 
     /// Kick off a freshly created (or restarted) replica; the leader of the first round proposes.
     pub fn start(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.ended {
+            return out;
+        }
         self.pump(&mut out);
         out.append(&mut self.outbox);
         out
@@ -261,6 +340,9 @@ impl Replica {
     /// not proposed yet this round, it proposes immediately. Oversized payloads are dropped.
     pub fn propose(&mut self, payload: Vec<u8>) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.ended {
+            return out;
+        }
         if payload.len() <= self.cfg.max_payload_bytes
             && self.payloads.len() < self.cfg.max_queued_payloads
         {
@@ -276,6 +358,9 @@ impl Replica {
     pub fn on_timeout(&mut self, now: Tick) -> Vec<Action> {
         let mut out = Vec::new();
         self.now = self.now.max(now);
+        if self.ended {
+            return out;
+        }
         if self.now >= self.round_deadline {
             // Timeout (or retransmission of it) for the current round.
             let r = self.round;
@@ -292,6 +377,10 @@ impl Replica {
     /// Process one message from the network. Never panics; invalid input is dropped.
     pub fn on_message(&mut self, msg: Message) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.ended {
+            self.serve_ended(msg, &mut out);
+            return out;
+        }
         match msg {
             Message::Propose(p) => self.on_proposal(p, false, &mut out),
             Message::Vote(v) => self.on_vote(v, false, &mut out),
@@ -318,6 +407,45 @@ impl Replica {
         self.pump(&mut out);
         out.append(&mut self.outbox);
         out
+    }
+
+    // ---------------------------------------------------------------- epoch end
+
+    /// After the epoch's last block is committed: help laggards finish the epoch (answer block
+    /// requests, and answer a verified timeout with the newest certificates) and nothing else.
+    fn serve_ended(&mut self, msg: Message, out: &mut Vec<Action>) {
+        match msg {
+            Message::SyncRequest { from, block_id } => self.on_sync_request(from, block_id, out),
+            Message::Timeout(t) => {
+                let ok = (t.voter as usize) < self.ctx.set.len()
+                    && t.voter != self.me
+                    && t.round != 0
+                    && t.round <= MAX_ROUND
+                    && self.ctx.verify_sig(
+                        t.voter,
+                        &self.ctx.timeout_bytes(t.round, t.high_qc.round),
+                        &t.sig,
+                    );
+                let gap = (self.cfg.base_timeout / 2).max(1);
+                let due = self
+                    .catchup_sent
+                    .get(&t.voter)
+                    .is_none_or(|last| self.now >= last.saturating_add(gap));
+                if ok && due {
+                    self.catchup_sent.insert(t.voter, self.now);
+                    out.push(Action::Send {
+                        to: t.voter,
+                        msg: Message::Catchup {
+                            qc: self.safety.high_qc.clone(),
+                            tc: self.last_tc.clone(),
+                        },
+                    });
+                } else if !ok {
+                    self.reject();
+                }
+            }
+            _ => {}
+        }
     }
 
     // ---------------------------------------------------------------- helpers
@@ -519,6 +647,8 @@ impl Replica {
             || b.justify.round >= b.round
             || (b.proposer as usize) >= self.ctx.set.len()
             || b.height == 0
+            // Blocks past the epoch's last height only exist to certify it; they carry nothing.
+            || (self.cfg.end_height != 0 && b.height > self.cfg.end_height && !b.payload.is_empty())
         {
             return self.reject();
         }
@@ -615,7 +745,7 @@ impl Replica {
     /// The voting rule. See docs/CONSENSUS.md.
     fn try_vote(&mut self, p: &Proposal, id: Hash, out: &mut Vec<Action>) {
         let b = &p.block;
-        if b.round != self.round || b.round <= self.safety.last_voted_round {
+        if self.ended || b.round != self.round || b.round <= self.safety.last_voted_round {
             return;
         }
         // Lock: never vote for a block that does not extend a QC at least as high as our lock.
@@ -628,6 +758,12 @@ impl Replica {
                 .is_some_and(|tc| tc.round + 1 == b.round && b.justify.round >= tc.high_qc.round);
         if !sequential {
             return;
+        }
+        // Application check on the payload (embedder hook): never vote for what it rejects.
+        if let Some(check) = &self.payload_check {
+            if !check(b) {
+                return self.reject();
+            }
         }
         // Write-ahead: persist before the vote can leave this function.
         self.safety.last_voted_round = b.round;
@@ -857,12 +993,19 @@ impl Replica {
             chain.push((cur, b.clone()));
             cur = b.parent;
         }
+        let end = self.cfg.end_height;
         for (id, b) in chain.into_iter().rev() {
+            if end != 0 && b.height > end {
+                break; // epoch tail: certified only to finalize the last block of the epoch
+            }
             self.safety.committed_height = b.height;
             self.safety.committed_round = b.round;
             self.safety.committed_id = id;
             self.stats.commits += 1;
             out.push(Action::Commit(b));
+        }
+        if end != 0 && self.safety.committed_height >= end {
+            self.ended = true;
         }
         self.persist();
         self.prune();
@@ -884,7 +1027,8 @@ impl Replica {
 
     fn pump(&mut self, out: &mut Vec<Action>) {
         let r = self.round;
-        if self.leader(r) != self.me
+        if self.ended
+            || self.leader(r) != self.me
             || self.safety.last_proposed_round >= r
             || self.safety.last_voted_round >= r
         {
@@ -906,7 +1050,17 @@ impl Replica {
                 _ => return,
             }
         };
-        let payload = self.payloads.pop_front().unwrap_or_default();
+        let end = self.cfg.end_height;
+        let payload = if end != 0 && height > end {
+            Vec::new()
+        } else {
+            match self.payloads.pop_front() {
+                Some(p) => p,
+                // The embedder paces blocks: wait for `propose` instead of sending an empty one.
+                None if self.hold_empty => return,
+                None => Vec::new(),
+            }
+        };
         let block = Block {
             round: r,
             height,
@@ -1024,7 +1178,7 @@ impl Replica {
         self.last_served.insert(from, (self.now, block_id));
         let mut blocks = Vec::new();
         let mut cur = block_id;
-        while blocks.len() < MAX_SYNC_BLOCKS && cur != self.ctx.genesis {
+        while blocks.len() < MAX_SYNC_BLOCKS && cur != self.ctx.root {
             let Some(b) = self.blocks.get(&cur) else {
                 break;
             };

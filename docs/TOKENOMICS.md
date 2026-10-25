@@ -56,6 +56,17 @@ Anyone can create their own fungible token with the native token module (`Token.
 - **Holders** are queryable by anyone (`token_holders`), paged in ascending address order; accounts with a zero balance are not holders.
 - **Cost.** Creation and each call are paid in gas like any call. Token records are not yet part of the storage deposit; a deposit per token and holder entry is future work before open networks.
 
+## Validator staking and slashing
+
+Validators are chosen by stake, not appointed. Operators bond BTB (`Stake`), the top `N` above a minimum form the validator set of the next **epoch**, and the set is fixed for that epoch. Mechanics and parameters are in [CHAIN.md](CHAIN.md#staking-epochs-and-slashing); the economic rules are:
+
+- **No new BTB, ever.** Staking, rewards and slashing only move existing units between balances, bonded stake, unbonding stake, the validator fee pool and the slash vault. The supply invariant (`balances + deposits + bonded + unbonding == 1,000,000,000 BTB`) is checked after every block.
+- **Unbonding.** `Unstake` moves stake into unbonding, which is released at the end of the epoch in which it was requested plus the unbonding period (testnet default: 14 days). Unbonding stake earns nothing, has no vote, and stays slashable.
+- **Rewards.** Mutation and cron fees land in the validator pool (80% of a user transaction's fee, all of a cron's; the other 20% goes to the relay pool). At the end of each epoch the whole pool is paid to that epoch's validators, pro rata by stake. A validator jailed during the epoch gets nothing; its share goes to the others. The rounding remainder (less than one unit per validator) goes one unit each to the first validators in the set, so payouts sum exactly to the pool. This is accounting only: while fees are small, rewards are small, which is what the [early security budget](#early-security-budget) reserve is for.
+- **Slashing.** Provable double signing (two votes, or two proposals, for one round, the two kinds of consensus `Evidence`) slashes **5%** of the offender's bonded stake and of each unbonding entry, once per epoch, if the evidence arrives within the unbonding window of the epoch it is about. The offender is jailed for good.
+- **Where slashed BTB goes.** 10% of the slashed amount is paid to whoever submitted the evidence (nothing if the offender reports itself). The other 90% goes to the **slash vault**, a reserved address nobody holds a key for: it is locked, not burned, so the supply invariant is unchanged and no one can profit from, or be paid by, the vault. It is deliberately *not* redistributed to the other validators, so that nobody gains from provoking or framing an equivocation, and *not* minted away or destroyed, so the fixed supply stays exactly 1,000,000,000. Unlocking the vault (for example into a community fund) would need an explicit protocol change.
+- **Why a fixed percentage.** Double signing is the one fault that can break safety, so it is punished even if it did no harm; a small fraction of the stake is enough to make it unprofitable once stake is worth more than a single block's rewards, and a fixed rate keeps the rule simple. A graduated rate (higher when many validators offend together) and downtime penalties are future work.
+
 ## Early security budget
 
 With no minting, validators earn only from fees. While usage is low, fees may not attract enough honest validators. A reserve pool carved from the genesis supply (10–20% proposed) can pay decreasing validator rewards over the first years without breaking the 1B cap.
@@ -65,6 +76,7 @@ With no minting, validators earn only from fees. While usage is low, fees may no
 To be decided. Open items:
 
 - [ ] Validator reserve pool size and release schedule
+- [ ] Final staking parameters (epoch length, validator count, minimum stake, unbonding period, slash rate) after testnet data
 - [ ] Ecosystem / developer grants
 - [ ] Team and early contributors (with vesting)
 - [ ] Public distribution

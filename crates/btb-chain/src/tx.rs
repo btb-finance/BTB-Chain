@@ -9,6 +9,12 @@
 //! Call     (tag 1): contract[32] || kind:u8 || function:string || args:bytes
 //!                   || gas_limit:u64 || max_fee:u64
 //! Transfer (tag 2): to[32] || amount:u64
+//! Stake    (tag 3): validator_key[32] || amount:u64
+//! Unstake  (tag 4): amount:u64
+//! RegisterValidator (tag 5): consensus_key[32] || network_addr:bytes
+//! SubmitEvidence    (tag 6): epoch:u64 || evidence
+//! evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleVote)
+//!          | 1 || proposer:u32 || round:u64 || (id[32] || sig[64]) x2  (DoubleProposal)
 //! manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes:[string]
 //! ```
 //!
@@ -21,6 +27,7 @@
 //! `SHA256("btb.account.v1" || public_key)`.
 
 use btb_codec::{Decode, DecodeError, Encode, Reader};
+use btb_consensus::{Evidence, Sig};
 use btb_vm::FunctionKind;
 pub use ed25519_dalek::SigningKey;
 use ed25519_dalek::{Signature, Signer, VerifyingKey};
@@ -167,6 +174,73 @@ pub enum TxKind {
         to: Address,
         amount: u64,
     },
+    /// Bond `amount` of the sender's balance behind the validator `validator` (an account
+    /// public key; today it must be the sender's own key, delegation is not supported).
+    Stake {
+        validator: [u8; 32],
+        amount: u64,
+    },
+    /// Start unbonding `amount` of the sender's bonded stake.
+    Unstake {
+        amount: u64,
+    },
+    /// Register or update the sender's consensus key and network address.
+    RegisterValidator {
+        consensus_key: [u8; 32],
+        network_addr: Vec<u8>,
+    },
+    /// Prove double signing in `epoch` (see `btb_consensus::Evidence`).
+    SubmitEvidence {
+        epoch: u64,
+        evidence: Evidence,
+    },
+}
+
+fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
+    let (tag, who, round, a, b) = match e {
+        Evidence::DoubleVote { voter, round, a, b } => (0u8, *voter, *round, a, b),
+        Evidence::DoubleProposal {
+            proposer,
+            round,
+            a,
+            b,
+        } => (1u8, *proposer, *round, a, b),
+    };
+    tag.encode_to(out);
+    who.encode_to(out);
+    round.encode_to(out);
+    for (id, sig) in [a, b] {
+        id.encode_to(out);
+        sig.0.encode_to(out);
+    }
+}
+
+fn decode_evidence(r: &mut Reader<'_>) -> Result<Evidence, TxError> {
+    let tag = u8::decode_from(r)?;
+    let who = u32::decode_from(r)?;
+    let round = u64::decode_from(r)?;
+    let mut pair = || -> Result<([u8; 32], Sig), DecodeError> {
+        Ok((
+            <[u8; 32]>::decode_from(r)?,
+            Sig(<[u8; 64]>::decode_from(r)?),
+        ))
+    };
+    let (a, b) = (pair()?, pair()?);
+    match tag {
+        0 => Ok(Evidence::DoubleVote {
+            voter: who,
+            round,
+            a,
+            b,
+        }),
+        1 => Ok(Evidence::DoubleProposal {
+            proposer: who,
+            round,
+            a,
+            b,
+        }),
+        t => Err(TxError::BadTag(t)),
+    }
 }
 
 fn kind_byte(k: FunctionKind) -> u8 {
@@ -227,6 +301,28 @@ impl Encode for TxBody {
                 to.encode_to(out);
                 amount.encode_to(out);
             }
+            TxKind::Stake { validator, amount } => {
+                3u8.encode_to(out);
+                validator.encode_to(out);
+                amount.encode_to(out);
+            }
+            TxKind::Unstake { amount } => {
+                4u8.encode_to(out);
+                amount.encode_to(out);
+            }
+            TxKind::RegisterValidator {
+                consensus_key,
+                network_addr,
+            } => {
+                5u8.encode_to(out);
+                consensus_key.encode_to(out);
+                network_addr.encode_to(out);
+            }
+            TxKind::SubmitEvidence { epoch, evidence } => {
+                6u8.encode_to(out);
+                epoch.encode_to(out);
+                encode_evidence(evidence, out);
+            }
         }
     }
 }
@@ -251,6 +347,21 @@ impl TxBody {
             2 => TxKind::Transfer {
                 to: <[u8; 32]>::decode_from(r)?,
                 amount: u64::decode_from(r)?,
+            },
+            3 => TxKind::Stake {
+                validator: <[u8; 32]>::decode_from(r)?,
+                amount: u64::decode_from(r)?,
+            },
+            4 => TxKind::Unstake {
+                amount: u64::decode_from(r)?,
+            },
+            5 => TxKind::RegisterValidator {
+                consensus_key: <[u8; 32]>::decode_from(r)?,
+                network_addr: Vec::decode_from(r)?,
+            },
+            6 => TxKind::SubmitEvidence {
+                epoch: u64::decode_from(r)?,
+                evidence: decode_evidence(r)?,
             },
             t => return Err(TxError::BadTag(t)),
         };
@@ -349,6 +460,10 @@ impl Transaction {
         use crate::*;
         match &self.body.kind {
             TxKind::Transfer { .. } => TRANSFER_GAS,
+            TxKind::Stake { .. } => STAKE_GAS,
+            TxKind::Unstake { .. } => UNSTAKE_GAS,
+            TxKind::RegisterValidator { .. } => REGISTER_VALIDATOR_GAS,
+            TxKind::SubmitEvidence { .. } => EVIDENCE_GAS,
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }

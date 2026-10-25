@@ -1,0 +1,139 @@
+//! `btb-node run --config node.json` | `btb-node init-testnet --validators N --dir DIR` |
+//! `btb-node peer-id --key FILE`. See docs/NODE.md.
+use btb_node::config::{init_testnet, load_key, NodeParams};
+use btb_node::{open_chain, Node};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+const USAGE: &str = "usage:\n\
+  btb-node run --config node.json [--rpc 127.0.0.1:PORT] [--data DIR]\n\
+  btb-node init-testnet --validators N --dir DIR [--chain-id N] [--base-port P] [--rpc-base-port P]\n\
+  btb-node peer-id --key validator.key\n\
+\n\
+  --data DIR   keep consensus safety state there; chain state in RocksDB when built with\n\
+               --features rocksdb (otherwise a data dir is refused: chain state would be lost)";
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("btb-node: {e}\n{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn flags(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with("--") {
+            return Err(format!("unexpected argument {a}"));
+        }
+        out.push((
+            a.clone(),
+            it.next().ok_or(format!("{a} needs a value"))?.clone(),
+        ));
+    }
+    Ok(out)
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some((cmd, rest)) = args.split_first() else {
+        return Err(String::new());
+    };
+    let fl = flags(rest)?;
+    let get = |k: &str| fl.iter().find(|(f, _)| f == k).map(|(_, v)| v.clone());
+    let num = |k: &str, d: u64| -> Result<u64, String> {
+        get(k).map_or(Ok(d), |v| {
+            v.parse().map_err(|_| format!("{k} needs a number"))
+        })
+    };
+    match cmd.as_str() {
+        "init-testnet" => {
+            let n = num("--validators", 4)? as usize;
+            let dir = PathBuf::from(get("--dir").ok_or("--dir is required")?);
+            let dirs = init_testnet(
+                n,
+                &dir,
+                num("--chain-id", 7)?,
+                num("--base-port", 9000)? as u16,
+                num("--rpc-base-port", 8545)? as u16,
+            )?;
+            println!(
+                "wrote genesis, faucet key and {} node directories under {}",
+                dirs.len(),
+                dir.display()
+            );
+            for d in dirs {
+                println!("  btb-node run --config {}/node.json", d.display());
+            }
+            Ok(())
+        }
+        "peer-id" => {
+            let key = load_key(&PathBuf::from(get("--key").ok_or("--key is required")?))?;
+            let id = btb_node::net::peer_id_of(&key.verifying_key().to_bytes()).ok_or("bad key")?;
+            println!("{id}");
+            Ok(())
+        }
+        "run" => {
+            let mut p = NodeParams::load(&PathBuf::from(
+                get("--config").ok_or("--config is required")?,
+            ))?;
+            if let Some(r) = get("--rpc") {
+                p.rpc = Some(r.parse().map_err(|e| format!("--rpc: {e}"))?);
+            }
+            if let Some(d) = get("--data") {
+                p.data_dir = Some(PathBuf::from(d));
+            }
+            start(p)
+        }
+        _ => Err(format!("unknown command {cmd}")),
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+fn start(p: NodeParams) -> Result<(), String> {
+    match p.data_dir.clone() {
+        Some(d) => {
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            let kv =
+                btb_runtime::rocks::RocksKv::open(d.join("chain")).map_err(|e| e.to_string())?;
+            let state = open_chain(kv, &p.genesis)?;
+            serve(p, state)
+        }
+        None => {
+            let state = open_chain(btb_runtime::MemKv::new(), &p.genesis)?;
+            serve(p, state)
+        }
+    }
+}
+
+#[cfg(not(feature = "rocksdb"))]
+fn start(p: NodeParams) -> Result<(), String> {
+    if p.data_dir.is_some() {
+        return Err("a data directory needs a build with --features rocksdb \
+                    (without it chain state would be lost on restart while the safety state \
+                    survives); remove data_dir to run in memory"
+            .into());
+    }
+    let state = open_chain(btb_runtime::MemKv::new(), &p.genesis)?;
+    serve(p, state)
+}
+
+fn serve<S: btb_runtime::KvStore + Send + 'static>(
+    p: NodeParams,
+    state: btb_chain::ChainState<S>,
+) -> Result<(), String> {
+    let listen = p.listen.clone();
+    let node = Node::start(p, state)?;
+    println!(
+        "btb-node: validator started, p2p {listen}, rpc {:?}",
+        node.rpc_addr()
+    );
+    node.run_until_stopped();
+    println!("btb-node: stopping");
+    node.shutdown();
+    Ok(())
+}

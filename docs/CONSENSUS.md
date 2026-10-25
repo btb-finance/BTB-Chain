@@ -2,7 +2,7 @@
 
 BTB Chain orders blocks with a **Jolteon-style 2-chain HotStuff** protocol (pipelined HotStuff-2 family): proof-of-stake, stake-weighted quorums, a timeout-certificate pacemaker, and no forks once a block is final. The `btb-consensus` crate is the **consensus core only**: a deterministic state machine with no networking, no clock, no execution and no disk. The node (Phase 4) wires it to libp2p, a real timer and the executor in `btb-chain`.
 
-Status: core implemented and tested in a deterministic simulator. Still open for Phase 4: real networking, measuring ~1 s finality on real links, signature aggregation, validator-set changes between epochs, and slashing logic that consumes the evidence records.
+Status: core implemented and tested in a deterministic simulator. Epoch changes (validator-set rotation) are implemented and simulated; see [Epochs](#epochs-and-validator-set-changes). Still open for Phase 4: real networking, measuring ~1 s finality on real links, and signature aggregation. The staking and slashing logic that consumes the evidence lives in `btb-chain` ([CHAIN.md](CHAIN.md#staking-epochs-and-slashing)).
 
 ## What it guarantees
 
@@ -101,6 +101,31 @@ Where the other rules matter: rule 3 (TC and consecutive-round conditions) is ab
 
 *Liveness sketch.* After the network becomes synchronous: timeouts and retransmissions make all honest replicas converge on the same round (f+1 amplification, TCs, `Catchup`), and exponential backoff makes the round timer exceed the network delay. In a round with an honest leader every honest replica has the same high QC (it was delivered inside the TC), all accept the proposal, vote, and a QC forms. Two consecutive honest-led rounds commit a block (the votes are broadcast, so the QC of the second block forms without a third honest leader). If fewer than half of the schedule's seats are faulty, such a pair exists in every cycle.
 
+## Epochs and validator-set changes
+
+The validator set is fixed inside an **epoch** and changes only at an epoch boundary. An epoch is a *fresh consensus instance*, not a reconfiguration of a running one:
+
+- `Config::epoch` and `Config::end_height` say which epoch a `Replica` serves and the height of its last block (the chain uses `end_height = (epoch + 1) * epoch_len`). `Replica::new_epoch(config, set, key, storage, anchor)` creates the instance; `Replica::new` is epoch 0 with no end.
+- `Anchor { height, id }` is the finalized chain the epoch extends: the height of the previous epoch's last block and a 32-byte `id` that **every validator of the new epoch derives identically from the finalized chain** (btb-chain uses the header hash of that block, `EpochRecord::anchor`). It is the block the round-0 certificate certifies, so the first block of the epoch has `parent = anchor.id` and height `anchor.height + 1`. Because it comes from the chain and not from consensus internals, a node that joins at the boundary needs nothing from the old epoch's consensus.
+- Rounds restart at 1 in each epoch. All signatures are bound to `genesis = H(chain id, epoch, validator set digest)` (`Context::for_epoch`), so a vote, proposal or timeout from one epoch (or one set) is invalid in any other. The anchor is deliberately *not* in that hash: a chain that knows an epoch's set can rebuild the context and verify `Evidence` from that epoch without knowing any consensus block id.
+- **Last block of an epoch.** With the 2-chain rule the block `L` at `end_height` is committed when a QC exists for a child `L'` in the next round. So blocks above `end_height` ("tail" blocks) are allowed in the epoch's instance, but only to certify `L`: their payload must be empty (voters reject a tail block with a payload, a leader proposes an empty one) and **they are never committed**. When `L` is committed the replica emits `Action::Commit(L)` and `epoch_ended()` becomes true; commits above `end_height` are dropped.
+- **After the end.** An ended replica never votes, proposes or times out again. It keeps answering `SyncRequest` and answers a validly signed `Timeout` with `Catchup` (its newest QC), so a validator that lagged behind can still finish the epoch: it receives QC(`L'`), requests the tail blocks, commits `L` and ends too. The node keeps the ended instance around for a while (a few epochs of unbonding is plenty in practice; state sync is the fallback).
+- **Switching.** The node executes `L` in `btb-chain`, which fixes the next set (`ChainState::epoch_record(epoch + 1)`: validators in consensus order, `start_height`, `anchor`), and starts `Replica::new_epoch` for the nodes in it with a new `SafetyStorage`. Nodes that left simply drop their replica; nodes that joined start from the same anchor. Messages carry no epoch tag on the wire; the node routes by the epoch of the instance (an envelope), and a message sent to the wrong epoch fails signature checks and is dropped.
+
+### Why epoch changes are safe
+
+*Within an epoch* nothing changes: the safety theorem above holds for the epoch's instance with its own set, as long as the faulty stake of that set is below 1/3. Safety across the boundary needs three more facts.
+
+1. **The last block of epoch `k` is unique.** By the theorem, all honest replicas of epoch `k` that commit height `end_height` commit the same block `L`. Tail blocks are never committed, so no other block at `end_height + 1` or above can be final in epoch `k`.
+2. **The new epoch extends exactly `L`.** The next set and the anchor are functions of the *executed* chain up to `L` (`btb-chain`), which is deterministic. Every validator of epoch `k + 1` therefore starts from the same `(set, anchor)`; a validator that starts from a different chain computes a different anchor, a different `genesis` and so a different signature domain, and its messages are ignored. There is no moment at which two honest validators run the same epoch with different sets.
+3. **No cross-epoch signature reuse.** The domain separation above means that votes of epoch `k` cannot be replayed into epoch `k + 1` to form a QC (even for the same validators), and a QC cannot be assembled from signers of two different sets. Each instance therefore sees only its own quorums: Lemma 1 and Lemma 2 apply per instance, and chain order across epochs is by height.
+
+Together: the finalized chain is the concatenation, for each epoch, of the blocks that epoch's instance commits (heights `anchor.height + 1 ..= end_height`), each starting from the previous epoch's `L`. Two honest nodes cannot disagree about a height in the same epoch (the theorem), and the epochs are chained through the unique `L`.
+
+*Liveness at the boundary.* Epoch `k` needs two consecutive honest-led rounds after `L` is certified, the ordinary liveness condition (the tail block is an empty proposal). Epoch `k + 1` starts as soon as `2/3+` of *its* stake has executed `L`; validators that are slow to execute or sync `L` count as faulty for that epoch, so the usual bound (< 1/3 of the new set's stake faulty or offline at the start) applies. Laggards of epoch `k` catch up through the ended replicas as described above.
+
+*What this does not give you.* A validator that leaves a set can still sign for the epochs it was in. It is accountable for exactly as long as the evidence window (the unbonding period) lasts, because its stake stays locked and slashable; after that, signatures of old epochs are a long-range attack vector and new nodes must sync from a recent trusted checkpoint (weak subjectivity), as in any proof-of-stake chain.
+
 ## Equivocation evidence
 
 | Evidence | What is proven | Produced when |
@@ -108,7 +133,7 @@ Where the other rules matter: rule 3 (TC and consecutive-round conditions) is ab
 | `DoubleVote { voter, round, a, b }` | The voter signed votes for two different blocks in one round | Two votes by one validator for different blocks are seen, directly or inside a verified QC |
 | `DoubleProposal { proposer, round, a, b }` | The proposer signed two different block ids for one round | Two proposals are received, or votes/timeouts carry two different proposer signatures for the round |
 
-`Evidence::verify(&Context)` checks both signatures against the offender's key from the validator set and that the ids differ; it needs no other state, so a slashing module can verify it on-chain. Evidence is deduplicated per `(kind, offender, round)`, broadcast once when first found, and re-verified by every receiver (forged evidence is rejected). Invalid signatures are *not* evidence (anyone can forge a bad signature), they are simply dropped.
+`Evidence::verify(&Context)` checks both signatures against the offender's key from the validator set and that the ids differ; it needs no other state, so a slashing module can verify it on-chain. `btb-chain` does exactly that: a `SubmitEvidence { epoch, evidence }` transaction rebuilds the context of `epoch` from the stored validator set (`Context::for_epoch(chain id, epoch, set, None)`) and slashes the offender (see [TOKENOMICS.md](TOKENOMICS.md#validator-staking-and-slashing)). Evidence is deduplicated per `(kind, offender, round)`, broadcast once when first found, and re-verified by every receiver (forged evidence is rejected). Invalid signatures are *not* evidence (anyone can forge a bad signature), they are simply dropped.
 
 ## Resource bounds
 
@@ -120,10 +145,12 @@ Messages are rejected before any expensive work where possible: membership and r
 
 `cargo test -p btb-consensus` runs unit tests for every rejection path and scenario tests (crash up to `f`, equivocating leader, double voter, bad signatures and garbage, minority partition, even split and heal, crash with restart) plus a seeded property test over randomised scenarios (safety, liveness after the network heals, catch-up, sound evidence, no honest validator ever accused). `cargo test -p btb-consensus --release -- --ignored --nocapture` runs the long soak over thousands of seeds.
 
+`crates/btb-consensus/src/epoch_sim.rs` simulates epoch changes: sets that change completely over three epochs (nodes joining and leaving), unequal stakes with `StakeWeighted` leaders, an offline new member below 1/3, a validator that is offline across a boundary and must catch up through the ended replicas, a leaver that disappears right after the boundary, and a lossy network before GST over many seeds. On every commit it checks gap-free heights across epochs, that each epoch's first block extends the anchor, that nothing above an epoch's last height is committed, and that no two replicas ever disagree at a height. Unit tests cover tail blocks, ended replicas and signature separation between epochs.
+
 ## Not done yet
 
 - Real networking (libp2p/QUIC), real timers, and the ~1 s finality measurement on real links (the simulator reports latency in ticks only).
 - BLS signature aggregation (QCs are lists of Ed25519 signatures today).
-- Validator-set changes at epoch boundaries and the slashing/staking logic that consumes `Evidence`.
+- A commit proof that lets a node joining from far behind verify the last block of an old epoch without replaying it (today: sync the executed chain, or use an ended replica's `Catchup` and sync).
 - Block and payload persistence, state sync from snapshots, and a vote-collection mode that avoids the `O(n^2)` vote broadcast.
 - Byzantine-leader payload checks beyond size and hash (the executor validates transactions).

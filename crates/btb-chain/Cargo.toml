@@ -9,6 +9,7 @@ license.workspace = true
 btb-codec = { path = "../btb-codec" }
 btb-vm = { path = "../btb-vm" }
 btb-runtime = { path = "../btb-runtime" }
+btb-consensus = { path = "../btb-consensus" }
 # BSD-3-Clause. Same feature set as btb-consensus so the lockfile stays shared.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 sha2 = "0.11.1"
