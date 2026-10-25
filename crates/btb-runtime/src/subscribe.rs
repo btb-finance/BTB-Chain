@@ -17,24 +17,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub type SubId = u64;
 
-/// 128-bit non-cryptographic fingerprint of a result, used only to tell "changed" from
-/// "unchanged" locally. Two FNV-1a passes with different offsets, plus the length.
+/// SHA-256 fingerprint of a result, used to tell "changed" from "unchanged".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResultHash(u64, u64, u64);
+pub struct ResultHash([u8; 32]);
 
 impl ResultHash {
     pub fn of(data: &[u8]) -> Self {
-        let pass = |mut h: u64| {
-            for b in data {
-                h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            h
-        };
-        Self(
-            pass(0xcbf2_9ce4_8422_2325),
-            pass(0x9e37_79b9_7f4a_7c15),
-            data.len() as u64,
-        )
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(data).into())
     }
 }
 

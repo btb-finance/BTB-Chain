@@ -180,6 +180,16 @@ impl<'a, S: KvStore> Overlay<'a, S> {
         self.reads.borrow().clone()
     }
 
+    /// Pending writes in key order (`None` = delete), not recorded in the read set.
+    pub fn pending(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
+        self.pending.iter()
+    }
+
+    /// Value of `key` in the base store, ignoring pending writes and the read set.
+    pub fn base_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.base.get(key)
+    }
+
     /// The pending writes and the read set.
     pub fn into_parts(self) -> (WriteBatch, ReadSet) {
         let reads = self.reads.take();

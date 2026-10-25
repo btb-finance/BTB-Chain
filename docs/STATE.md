@@ -11,6 +11,8 @@ How `btb-runtime` stores everything in one ordered key-value keyspace. Source of
 | `0x03` counter | `03 A len table` | next row id (`u64` LE) |
 | `0x04` index | `04 A len table len index enc(value) id:u64` | empty |
 | `0x05` balance | `05 A` | `u64` LE |
+| `0x08` usage | `08 A` | metered bytes the contract stores (`u64` LE) |
+| `0x09` deposit | `09 A` | BTB locked for those bytes (`u64` LE) |
 | `0x06` merkle node | `06 node_hash` | node encoding (see State commitment) |
 | `0x07` merkle root | `07 version:u64` | 32-byte root |
 
@@ -27,6 +29,15 @@ An index must always yield the same type; the type is not stored.
 ## Writes and atomicity
 
 An insert, update or delete is one `WriteBatch` holding the row, the counter and every index change. Index extractors run before anything is written. A contract call runs against an overlay and commits one batch only if it finishes without a fault, so a trapped call changes nothing.
+
+## Storage deposits
+
+Metered bytes are `key.len() + value.len()` of every storage (`0x01`), row (`0x02`) and index (`0x04`) entry of the contract. Counters, balances and the usage/deposit records are not metered. When a call finishes, `RuntimeHost` compares each written key with its committed value, sums the growth and shrinkage, and settles the net delta:
+
+- Growth locks `delta * DEPOSIT_PER_BYTE` (`layout::DEPOSIT_PER_BYTE`, 10 base units) from the **contract's own balance** into its deposit record, as TOKENOMICS says "the contract locks a deposit". The contract must hold the BTB; an app funds it by transferring to the contract.
+- Shrinkage refunds the proportional share of the deposit (`deposit * freed / usage`) to the **contract's balance**. Since the contract paid, it is also repaid.
+- If the balance is too low the call returns `Fault::InsufficientDeposit` and no batch is produced, so nothing changes. Overflow gives `Fault::DepositOverflow`.
+- Nothing is minted or burned: balance plus deposit of a contract stays constant across storage changes.
 
 ## Queries
 
@@ -50,7 +61,7 @@ By id, by index equality or range, with a filter, a limit and cursor pagination 
 
 ## Subscriptions
 
-`SubscriptionManager` stores each subscription (contract, function, args, read set, a fingerprint of the last result). For a committed `WriteBatch`, `affected` returns the subscriptions whose read set contains any written key (a put and a delete both count; a new key inside a scanned range counts too). Points live in a `BTreeMap`; ranges in a list sorted by start with a prefix maximum of ends. A batch of w keys costs about O(w log n + matches) when ranges are narrow, O(w * r) in the worst case of many overlapping wide ranges. `process_commit` re-runs each affected query through a caller closure (no ELF needed here), refreshes its read set, and reports it only if the result differs. The fingerprint is a local 128-bit non-cryptographic hash; it is not consensus data.
+`SubscriptionManager` stores each subscription (contract, function, args, read set, a SHA-256 fingerprint of the last result). For a committed `WriteBatch`, `affected` returns the subscriptions whose read set contains any written key (a put and a delete both count; a new key inside a scanned range counts too). Points live in a `BTreeMap`; ranges in a list sorted by start with a prefix maximum of ends. A batch of w keys costs about O(w log n + matches) when ranges are narrow, O(w * r) in the worst case of many overlapping wide ranges. `process_commit` re-runs each affected query through a caller closure (no ELF needed here), refreshes its read set, and reports it only if the result differs. The fingerprint is local, not consensus data.
 
 ## Optimistic transactions
 
@@ -58,4 +69,4 @@ A mutation runs against a snapshot (`Occ::snapshot`, the commit sequence number)
 
 ## Not yet
 
-RocksDB backend (behind a cargo feature), Jellyfish Merkle commitment, storage deposits.
+Jellyfish Merkle commitment. (A RocksDB `KvStore` exists behind the `rocksdb` feature: `crates/btb-runtime/src/rocks.rs`.)

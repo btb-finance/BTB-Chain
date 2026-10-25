@@ -378,7 +378,7 @@ fn overlay_isolates_and_merges() {
 #[test]
 fn host_is_atomic_and_reports_faults() {
     let (t, mut kv) = (tables(), MemKv::new());
-    kv.put(&layout::balance_key(&C), &100u64.to_le_bytes())
+    kv.put(&layout::balance_key(&C), &1_000_000u64.to_le_bytes())
         .unwrap();
     let before = kv.clone();
 
@@ -388,9 +388,9 @@ fn host_is_atomic_and_reports_faults() {
     assert!(h.table_update(T, 0, &row(2, "b")));
     assert_eq!(h.table_get(T, 0), Some(row(2, "b")));
     assert_eq!(h.table_scan(T, 0, 10), [0]);
-    assert!(h.token_transfer(&[9; 32], 40));
-    assert!(!h.token_transfer(&[9; 32], 61));
-    assert_eq!(h.token_balance(&[9; 32]), 40);
+    assert!(h.token_transfer(&[9; 32], 400_000));
+    assert!(!h.token_transfer(&[9; 32], 600_001));
+    assert_eq!(h.token_balance(&[9; 32]), 400_000);
     assert_eq!((h.caller(), h.block_height()), ([1; 32], 5));
     let batch = h.finish().unwrap();
     assert_eq!(kv, before); // nothing committed yet

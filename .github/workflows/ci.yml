@@ -58,3 +58,28 @@ jobs:
               echo "::endgroup::"
             fi
           done
+
+  rocksdb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component clippy
+          rustup default 1.97.0
+
+      - name: Install clang and libclang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          key: rocksdb
+
+      - name: Clippy (rocksdb feature)
+        run: cargo clippy -p btb-runtime --features rocksdb --all-targets -- -D warnings
+
+      - name: Test (rocksdb feature)
+        run: cargo test -p btb-runtime --features rocksdb

@@ -17,6 +17,13 @@ use btb_vm::host::{Address, Host};
 pub enum Fault {
     Kv(KvError),
     Table(TableError),
+    /// The contract's balance cannot cover the storage deposit of the call's growth.
+    InsufficientDeposit {
+        needed: u64,
+        available: u64,
+    },
+    /// Usage, deposit or balance arithmetic overflowed.
+    DepositOverflow,
 }
 
 pub struct RuntimeHost<'a, S: KvStore> {
@@ -51,19 +58,92 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
 
     /// The writes of the call, to be committed with `KvStore::commit`; or the first fault.
     pub fn finish(self) -> Result<WriteBatch, Fault> {
-        match self.fault {
-            Some(f) => Err(f),
-            None => Ok(self.kv.into_batch()),
-        }
+        self.finish_tracked().map(|(b, _)| b)
     }
 
     /// Like `finish`, also returning everything the call read (for subscriptions and
     /// optimistic transactions).
-    pub fn finish_tracked(self) -> Result<(WriteBatch, ReadSet), Fault> {
-        match self.fault {
-            Some(f) => Err(f),
-            None => Ok(self.kv.into_parts()),
+    pub fn finish_tracked(mut self) -> Result<(WriteBatch, ReadSet), Fault> {
+        if let Some(f) = self.fault.take() {
+            return Err(f);
         }
+        if !self.read_only {
+            self.settle_deposit()?;
+        }
+        Ok(self.kv.into_parts())
+    }
+
+    /// Storage deposit: compare the contract's metered bytes before and after the call. Growth
+    /// locks `delta * DEPOSIT_PER_BYTE` from the contract's balance into its deposit record;
+    /// shrinkage returns that amount to the balance. Fails (no state change, the batch is
+    /// never produced) if the balance is too low.
+    fn settle_deposit(&mut self) -> Result<(), Fault> {
+        let c = self.contract;
+        let (mut grown, mut freed) = (0u64, 0u64);
+        let mut changes = Vec::new();
+        for (k, v) in self.kv.pending() {
+            if layout::is_metered(k) && layout::key_contract(k) == Some(&c[..]) {
+                changes.push((k.clone(), v.as_ref().map_or(0, |v| k.len() + v.len())));
+            }
+        }
+        for (k, new) in changes {
+            let old = match self.kv.base_get(&k) {
+                Ok(v) => v.map_or(0, |v| k.len() + v.len()),
+                Err(e) => return Err(Fault::Kv(e)),
+            };
+            let (new, old) = (new as u64, old as u64);
+            if new >= old {
+                grown = grown.checked_add(new - old).ok_or(Fault::DepositOverflow)?;
+            } else {
+                freed = freed.checked_add(old - new).ok_or(Fault::DepositOverflow)?;
+            }
+        }
+        if grown == freed {
+            return Ok(());
+        }
+        let read = |h: &mut Self, key: Vec<u8>| -> Result<u64, Fault> {
+            let r = h.kv.get(&key).map_err(Fault::Kv)?;
+            Ok(r.and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or(0, u64::from_le_bytes))
+        };
+        let usage = read(self, layout::usage_key(&c))?;
+        let deposit = read(self, layout::deposit_key(&c))?;
+        let balance = self.balance(&c);
+        let new_usage = usage
+            .checked_add(grown)
+            .and_then(|u| u.checked_sub(freed))
+            .ok_or(Fault::DepositOverflow)?;
+        let (new_deposit, new_balance) = if grown > freed {
+            let need = (grown - freed)
+                .checked_mul(layout::DEPOSIT_PER_BYTE)
+                .ok_or(Fault::DepositOverflow)?;
+            let nb = balance
+                .checked_sub(need)
+                .ok_or(Fault::InsufficientDeposit {
+                    needed: need,
+                    available: balance,
+                })?;
+            (deposit + need, nb)
+        } else {
+            // Proportional share of the deposit, capped at what is locked.
+            let back = if usage == 0 {
+                0
+            } else {
+                (u128::from(deposit) * u128::from(freed - grown) / u128::from(usage)) as u64
+            };
+            (
+                deposit - back,
+                balance.checked_add(back).ok_or(Fault::DepositOverflow)?,
+            )
+        };
+        for (k, v) in [
+            (layout::usage_key(&c), new_usage),
+            (layout::deposit_key(&c), new_deposit),
+            (layout::balance_key(&c), new_balance),
+        ] {
+            self.kv.put(&k, &v.to_le_bytes()).map_err(Fault::Kv)?;
+        }
+        Ok(())
     }
 
     /// The read set so far.

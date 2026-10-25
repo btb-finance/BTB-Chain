@@ -8,3 +8,9 @@ license.workspace = true
 [dependencies]
 btb-vm = { path = "../btb-vm" }
 sha2 = "0.11.1"
+# Apache-2.0 wrapper; librocksdb-sys is MIT/Apache-2.0/BSD-3-Clause. Needs clang/libclang to build.
+rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime"], optional = true }
+
+[features]
+default = []
+rocksdb = ["dep:rocksdb"]

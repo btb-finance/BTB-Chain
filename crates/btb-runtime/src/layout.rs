@@ -11,6 +11,8 @@
 //! | `0x03` counter | `03 A len(table) table` | next row id, `u64` LE |
 //! | `0x04` index | `04 A len(table) table len(index) index enc(value) id:u64be` | empty |
 //! | `0x05` balance | `05 A` | `u64` LE |
+//! | `0x08` usage | `08 A` | bytes of state the contract stores, `u64` LE |
+//! | `0x09` deposit | `09 A` | BTB locked for that state, `u64` LE |
 //!
 //! Scanning `02 A len(table) table` yields rows in id order; scanning an index prefix yields
 //! row ids ordered by (index value, id). The row id is always the last 8 bytes of a row or
@@ -40,6 +42,37 @@ pub const TAG_ROW: u8 = 2;
 pub const TAG_COUNTER: u8 = 3;
 pub const TAG_INDEX: u8 = 4;
 pub const TAG_BALANCE: u8 = 5;
+pub const TAG_USAGE: u8 = 8;
+pub const TAG_DEPOSIT: u8 = 9;
+
+/// BTB (smallest unit) a contract locks per stored byte. A stored entry counts
+/// `key.len() + value.len()` bytes for storage keys (`0x01`), table rows (`0x02`) and index
+/// entries (`0x04`). Row id counters, balances and the usage/deposit records are not metered.
+/// The deposit is refunded to the contract's balance as the bytes are freed, so the total
+/// supply never changes.
+pub const DEPOSIT_PER_BYTE: u64 = 10;
+
+/// Whether a key (of any contract) holds metered state.
+pub fn is_metered(key: &[u8]) -> bool {
+    matches!(key.first(), Some(&(TAG_STORAGE | TAG_ROW | TAG_INDEX)))
+}
+
+/// The contract address embedded in a metered key.
+pub fn key_contract(key: &[u8]) -> Option<&[u8]> {
+    key.get(1..33)
+}
+
+pub fn usage_key(addr: &Address) -> Vec<u8> {
+    let mut k = vec![TAG_USAGE];
+    k.extend_from_slice(addr);
+    k
+}
+
+pub fn deposit_key(addr: &Address) -> Vec<u8> {
+    let mut k = vec![TAG_DEPOSIT];
+    k.extend_from_slice(addr);
+    k
+}
 
 /// A typed, order-preserving index value.
 #[derive(Debug, Clone, PartialEq, Eq)]

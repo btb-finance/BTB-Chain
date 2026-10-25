@@ -37,6 +37,9 @@ fn run(
 fn counter_persists_in_memkv() {
     let c = Contract::from_elf(&common::build_example("counter")).unwrap();
     let mut kv = MemKv::new();
+    // The contract pays a storage deposit per byte, so it needs a balance.
+    kv.put(&layout::balance_key(&CONTRACT), &1_000_000u64.to_le_bytes())
+        .unwrap();
     for (n, want) in [(5u64, 5u64), (7, 12)] {
         let out = run(&c, &mut kv, FunctionKind::Mutation, "increment", &(n,), 42).unwrap();
         assert_eq!(u64::decode(&out), Ok(want));

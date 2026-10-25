@@ -11,6 +11,8 @@ pub mod merkle;
 pub mod occ;
 pub mod query;
 pub mod readset;
+#[cfg(feature = "rocksdb")]
+pub mod rocks;
 pub mod subscribe;
 pub mod tables;
 

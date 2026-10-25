@@ -1,7 +1,10 @@
 //! A subscription on `examples/counter`'s `get` fires when `increment` commits.
 
 use btb_codec::{Decode, Encode};
-use btb_runtime::{MemKv, Occ, ReadSet, RuntimeHost, SubscriptionManager, Tables, WriteBatch};
+use btb_runtime::KvStore;
+use btb_runtime::{
+    layout, MemKv, Occ, ReadSet, RuntimeHost, SubscriptionManager, Tables, WriteBatch,
+};
 use btb_vm::{Contract, FunctionKind};
 
 mod common;
@@ -28,7 +31,11 @@ fn call(
 #[test]
 fn increment_fires_get_subscription() {
     let c = Contract::from_elf(&common::build_example("counter")).unwrap();
-    let mut occ = Occ::new(MemKv::new());
+    // The contract pays a storage deposit per byte, so it needs a balance.
+    let mut kv = MemKv::new();
+    kv.put(&layout::balance_key(&CONTRACT), &1_000_000u64.to_le_bytes())
+        .unwrap();
+    let mut occ = Occ::new(kv);
     let mut subs = SubscriptionManager::new();
 
     let (out, _, reads) = call(&c, occ.store(), FunctionKind::Query, "get", &[]);
