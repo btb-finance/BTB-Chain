@@ -94,3 +94,63 @@ impl Host for MemHost {
             .collect()
     }
 }
+
+/// Build a minimal ELF64 RISC-V ET_EXEC for tests: one PT_LOAD segment holding `code` at
+/// `0x1000` (entry = `0x1000`) and a global `STT_FUNC` symbol per `(name, offset into code)`.
+pub fn build_elf(code: &[u8], symbols: &[(&str, u64)]) -> Vec<u8> {
+    const VADDR: u64 = 0x1000;
+    let mut f = vec![0u8; 64];
+    f[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    f[4] = 2;
+    f[5] = 1;
+    f[6] = 1;
+    f[16..18].copy_from_slice(&2u16.to_le_bytes());
+    f[18..20].copy_from_slice(&243u16.to_le_bytes());
+    f[20..24].copy_from_slice(&1u32.to_le_bytes());
+    f[24..32].copy_from_slice(&VADDR.to_le_bytes());
+    f[32..40].copy_from_slice(&64u64.to_le_bytes());
+    f[54..56].copy_from_slice(&56u16.to_le_bytes());
+    f[56..58].copy_from_slice(&1u16.to_le_bytes());
+    f[58..60].copy_from_slice(&64u16.to_le_bytes());
+    f[60..62].copy_from_slice(&3u16.to_le_bytes());
+    let mut ph = vec![0u8; 56];
+    ph[0..4].copy_from_slice(&1u32.to_le_bytes());
+    ph[8..16].copy_from_slice(&176u64.to_le_bytes());
+    ph[16..24].copy_from_slice(&VADDR.to_le_bytes());
+    ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    f.extend(ph);
+    f.extend([0u8; 56]);
+    f.extend(code);
+    let mut strtab = vec![0u8];
+    let mut sym = vec![0u8; 24];
+    for (name, off) in symbols {
+        let mut s = vec![0u8; 24];
+        s[0..4].copy_from_slice(&(strtab.len() as u32).to_le_bytes());
+        s[4] = 0x12; // global func
+        s[6..8].copy_from_slice(&1u16.to_le_bytes());
+        s[8..16].copy_from_slice(&(VADDR + off).to_le_bytes());
+        sym.extend(s);
+        strtab.extend(name.as_bytes());
+        strtab.push(0);
+    }
+    let sym_off = f.len() as u64;
+    f.extend(&sym);
+    let str_off = f.len() as u64;
+    f.extend(&strtab);
+    let shoff = f.len() as u64;
+    f[40..48].copy_from_slice(&shoff.to_le_bytes());
+    f.extend([0u8; 64]);
+    for (ty, link, off, len) in [
+        (2u32, 2u32, sym_off, sym.len()),
+        (3, 0, str_off, strtab.len()),
+    ] {
+        let mut sh = vec![0u8; 64];
+        sh[4..8].copy_from_slice(&ty.to_le_bytes());
+        sh[24..32].copy_from_slice(&off.to_le_bytes());
+        sh[32..40].copy_from_slice(&(len as u64).to_le_bytes());
+        sh[40..44].copy_from_slice(&link.to_le_bytes());
+        f.extend(sh);
+    }
+    f
+}

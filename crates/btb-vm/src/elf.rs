@@ -51,6 +51,8 @@ pub enum ElfError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
     pub entry: u64,
+    /// End (exclusive) of the highest PT_LOAD segment in memory; 0 if none.
+    pub image_end: u64,
     /// Exported functions (global `STT_FUNC`, defined): name -> address.
     pub exports: BTreeMap<String, u64>,
 }
@@ -78,10 +80,16 @@ fn u64_at(d: &[u8], o: usize) -> Result<u64, ElfError> {
     Ok(u64::from_le_bytes(a))
 }
 
-/// Parse global function symbols from the symbol table, if any.
+/// Parse global function symbols from the symbol table, if any. A name defined twice keeps the
+/// last address; use `export_list` to see duplicates.
 pub fn exports(data: &[u8]) -> Result<BTreeMap<String, u64>, ElfError> {
+    Ok(export_list(data)?.into_iter().collect())
+}
+
+/// Like `exports`, but in symbol-table order and keeping duplicate names.
+pub fn export_list(data: &[u8]) -> Result<Vec<(String, u64)>, ElfError> {
     let h = header(data)?;
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for i in 0..h.shnum {
         let sh = slice(
             data,
@@ -119,7 +127,7 @@ pub fn exports(data: &[u8]) -> Result<BTreeMap<String, u64>, ElfError> {
                 .position(|&b| b == 0)
                 .ok_or(ElfError::BadSymbols)?;
             let name = std::str::from_utf8(&rest[..len]).map_err(|_| ElfError::BadSymbols)?;
-            out.insert(name.to_string(), u64_at(s, 8)?);
+            out.push((name.to_string(), u64_at(s, 8)?));
         }
     }
     Ok(out)
@@ -225,6 +233,7 @@ pub fn load(vm: &mut Vm, data: &[u8]) -> Result<Loaded, ElfError> {
     vm.set_reg(2, mem_len & !15);
     Ok(Loaded {
         entry: h.entry,
+        image_end: segs.last().map_or(0, |s| s.0 + s.1),
         exports,
     })
 }

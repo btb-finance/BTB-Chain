@@ -1,0 +1,8 @@
+[package]
+name = "btb-codec"
+description = "Canonical, deterministic binary encoding for BTB Chain arguments and results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

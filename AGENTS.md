@@ -17,6 +17,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `ROADMAP.md` | Six phases, deliverables as checkboxes, gates between phases |
 | `docs/ARCHITECTURE.md` | Network, consensus, state model, tech stack |
 | `docs/LANGUAGE.md` | Contract languages, Rust SDK, project layout |
+| `docs/ENCODING.md` | Canonical binary encoding of arguments and results (all languages) |
 | `docs/TOKENOMICS.md` | Fixed 1B BTB supply, fees, payment channels |
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
 | `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |
@@ -30,6 +31,7 @@ Planned code layout (from Phase 1):
 ```
 crates/
 ├── btb-vm/        # RISC-V rv64im interpreter, gas metering, host-call ABI
+├── btb-codec/     # canonical argument/result encoding (no_std)
 ├── btb-sdk/       # Rust contract SDK (no_std) and macros
 ├── btb-runtime/   # tables, indexes, queries, subscriptions, scheduler
 ├── btb-node/      # consensus, networking, hosting gateway

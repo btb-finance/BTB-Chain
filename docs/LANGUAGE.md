@@ -125,10 +125,12 @@ Because every app follows the same layout and the same four function kinds (quer
 ```
 Rust / C / Zig / … source
   → standard compiler (rustc, clang, zig) targeting RISC-V rv64im
-  → ELF binary with BTB entry points (one per query / mutation / cron)
+  → ELF binary with BTB entry points (one per query / mutation / cron / action)
   → btb deploy: binary + schema uploaded to the chain
   → BTB VM: verified, metered, recompiled to x86 / ARM on validators
 ```
+
+Entry points are exported ELF function symbols named `btb_query_<name>`, `btb_mutation_<name>`, `btb_cron_<name>` and `btb_action_<name>`, where `<name>` is 1 to 64 characters of `[a-z0-9_]`. A name may appear once per kind, and a contract needs at least one entry point. The VM calls an entry with `a0` = pointer to the input bytes, `a1` = input length, and a return address that halts cleanly; output is whatever the function passes to `return_data` (empty on a plain return). Queries always run read-only: any state-changing host call traps. Randomness is not available to entry points yet.
 
 No custom compiler is needed for Rust, C or Zig: their existing RISC-V backends do the work. The optional BTB DSL would add its own frontend on top of the same pipeline later.
 
@@ -164,3 +166,5 @@ Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a
 | 14 | `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count` (up to out_cap/8 ascending u64 LE ids >= start_id) | 250 + 1/table byte + 10/id returned |
 
 Queries run in read-only mode: calls 2, 3, 7, 10, 12 and 13 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Indexes, randomness, cross-chain and action calls are added later with their own numbers and gas costs.
+
+Argument and result bytes use the canonical encoding specified in [ENCODING.md](ENCODING.md).

@@ -13,7 +13,7 @@ A RISC-V VM that runs Rust contracts locally, with gas metering. No blockchain y
 **Deliverables**
 
 - [x] RISC-V rv64im interpreter (recompiler later) with per-instruction gas metering
-- [ ] ELF loader and contract entry-point convention (one export per query / mutation / cron)
+- [x] ELF loader and contract entry-point convention (one export per query / mutation / cron / action)
 - [x] Host-call ABI for storage, tables, tokens and context (`caller()`, block height), with a gas cost per call
 - [ ] `btb-sdk` Rust crate (no_std) with `#[btb::table]`, `#[query]`, `#[mutation]`, `#[cron]` macros
 - [ ] Argument and result encoding shared by all languages
