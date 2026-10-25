@@ -58,7 +58,7 @@ pub mod __private {
 /// Everything a contract usually needs.
 pub mod prelude {
     pub use crate::btb;
-    pub use crate::host::{abort, block_height, caller, token_balance, token_transfer};
+    pub use crate::host::{abort, block_height, caller, token_balance, token_transfer, Key};
     pub use crate::table::Table;
     pub use alloc::string::String;
     pub use alloc::vec::Vec;

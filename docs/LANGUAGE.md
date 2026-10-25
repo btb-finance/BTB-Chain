@@ -54,7 +54,7 @@ Running `btb dev` compiles the `btb/` folder, starts a local chain, hot-reloads 
 
 ## What works today (Phase 1)
 
-The SDK is the `btb-sdk` crate (`no_std`, plus `alloc`). The working examples are `examples/counter`, `examples/token` (fungible token in contract storage) and `examples/dex` (constant-product AMM, 0.3% fee), built for `riscv64imac-unknown-none-elf` and run in `btb-vm` by `crates/btb-tests`.
+The SDK is the `btb-sdk` crate (`no_std`, plus `alloc`). The working examples are `examples/counter`, `examples/token` (fungible token in contract storage) and `examples/dex` (constant-product AMM, 0.3% fee) and `examples/todo` (a per-user list read through an index, the Phase 2 demo), built for `riscv64imac-unknown-none-elf` and run in `btb-vm` by `crates/btb-tests`.
 
 ```rust
 use btb_sdk::btb;
@@ -186,8 +186,13 @@ Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a
 | 12 | `table_update(table_ptr, table_len, id, row_ptr, row_len) -> 0 ok \| 1 missing` | 500 + 4/(table+row) byte |
 | 13 | `table_delete(table_ptr, table_len, id) -> 0 ok \| 1 missing` | 300 + 1/table byte |
 | 14 | `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count` (up to out_cap/8 ascending u64 LE ids >= start_id) | 250 + 1/table byte + 10/id returned |
+| 15 | `table_index_scan(req_ptr, req_len, out_ptr, out_cap) -> total_len` (read-only; allowed in queries; request and result layout in `abi::TABLE_INDEX_SCAN`) | 400 + 1/request byte + 40/id returned + 1/cursor byte returned |
 
-Queries run in read-only mode: calls 2, 3, 7, 10, 12 and 13 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Indexes, randomness, cross-chain and action calls are added later with their own numbers and gas costs.
+Queries run in read-only mode: calls 2, 3, 7, 10, 12 and 13 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Randomness, cross-chain and action calls are added later with their own numbers and gas costs.
+
+`table_index_scan` (call 15) scans one secondary index of a table between two bounds (`unbounded`, `included` or `excluded`; typed values `u64`, `i64`, `u128`, `bytes`, `string`), ascending or descending, with a `limit` (capped at 256) and an opaque resume cursor, and returns row ids ordered by (value, id). The contract loads rows with `table_get`. It returns the full result length and copies only if it fits in `out_cap`, so retry with a bigger buffer. A malformed request traps. In Rust: `Table::index_eq("owner", Key::Bytes(&addr.0), limit, &cursor)` or `host::table_index_scan`. The scan is recorded in the call's read set as a key range, so a subscribed query re-runs exactly when an entry in that range changes.
+
+**Declaring indexes (temporary).** Contracts cannot declare indexes yet. For now the host registers them per table (`btb_runtime::Tables::register`; `btb-dev` takes `--index Table:index:addr@offset`). A table with no registered index returns no results. A declaration in the contract itself (and in its deploy manifest) replaces this later; see [DEV_SERVER.md](DEV_SERVER.md).
 
 Argument and result bytes use the canonical encoding specified in [ENCODING.md](ENCODING.md).
 

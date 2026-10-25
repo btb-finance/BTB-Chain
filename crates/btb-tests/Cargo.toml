@@ -11,3 +11,4 @@ btb-vm = { path = "../btb-vm" }
 btb-codec = { path = "../btb-codec" }
 btb-sdk = { path = "../btb-sdk" }
 btb-runtime = { path = "../btb-runtime" }
+btb-dev = { path = "../btb-dev" }

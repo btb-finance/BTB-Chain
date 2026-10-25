@@ -23,6 +23,7 @@ pub mod num {
     pub const TABLE_UPDATE: u64 = 12;
     pub const TABLE_DELETE: u64 = 13;
     pub const TABLE_SCAN: u64 = 14;
+    pub const TABLE_INDEX_SCAN: u64 = 15;
     pub const NOT_FOUND: u64 = u64::MAX;
 }
 
@@ -174,4 +175,128 @@ pub fn table_scan(table: &[u8], start_id: u64, max: usize) -> Vec<u64> {
             u64::from_le_bytes(a)
         })
         .collect()
+}
+
+/// A typed index value, ordered like the runtime's order-preserving encoding.
+#[derive(Clone, Copy, Debug)]
+pub enum Key<'a> {
+    U64(u64),
+    I64(i64),
+    U128(u128),
+    Bytes(&'a [u8]),
+    Str(&'a str),
+}
+
+/// One end of an index range.
+#[derive(Clone, Copy, Debug)]
+pub enum Bound<'a> {
+    Unbounded,
+    Included(Key<'a>),
+    Excluded(Key<'a>),
+}
+
+/// A page of an index scan: row ids in (index value, id) order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexPage {
+    pub ids: Vec<u64>,
+    /// Pass back as `cursor` to get the next page; `None` when there are no more rows.
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+fn put_bound(out: &mut Vec<u8>, b: Bound<'_>) {
+    let (kind, key) = match b {
+        Bound::Unbounded => return out.push(0),
+        Bound::Included(k) => (1, k),
+        Bound::Excluded(k) => (2, k),
+    };
+    out.push(kind);
+    match key {
+        Key::U64(v) => {
+            out.push(0);
+            put_bytes(out, &v.to_le_bytes());
+        }
+        Key::I64(v) => {
+            out.push(1);
+            put_bytes(out, &v.to_le_bytes());
+        }
+        Key::U128(v) => {
+            out.push(2);
+            put_bytes(out, &v.to_le_bytes());
+        }
+        Key::Bytes(v) => {
+            out.push(3);
+            put_bytes(out, v);
+        }
+        Key::Str(v) => {
+            out.push(4);
+            put_bytes(out, v.as_bytes());
+        }
+    }
+}
+
+/// Scan the secondary index `index` of `table` between `lo` and `hi`, at most `limit` ids
+/// (the VM caps it at 256). Declared indexes are registered on the host side for now (see
+/// docs/DEV_SERVER.md). Allowed in queries.
+pub fn table_index_scan(
+    table: &[u8],
+    index: &str,
+    lo: Bound<'_>,
+    hi: Bound<'_>,
+    descending: bool,
+    limit: u32,
+    cursor: &[u8],
+) -> IndexPage {
+    let mut req = Vec::new();
+    put_bytes(&mut req, table);
+    put_bytes(&mut req, index.as_bytes());
+    put_bound(&mut req, lo);
+    put_bound(&mut req, hi);
+    req.push(u8::from(descending));
+    req.extend_from_slice(&limit.min(256).to_le_bytes());
+    put_bytes(&mut req, cursor);
+    let want = 8 + 8 * limit.min(256) as usize + 256;
+    let mut out = vec![0u8; want];
+    let mut total = ecall(
+        num::TABLE_INDEX_SCAN,
+        p(&req),
+        l(&req),
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+    ) as usize;
+    if total > out.len() {
+        out = vec![0u8; total];
+        // State cannot change between the two calls inside one function execution.
+        total = ecall(
+            num::TABLE_INDEX_SCAN,
+            p(&req),
+            l(&req),
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+            0,
+        ) as usize;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes([out[o], out[o + 1], out[o + 2], out[o + 3]]);
+    let (count, clen) = (u32_at(0) as usize, u32_at(4) as usize);
+    if total != 8 + count * 8 + clen {
+        abort("bad index scan result");
+    }
+    let ids = out[8..8 + count * 8]
+        .chunks_exact(8)
+        .map(|c| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(c);
+            u64::from_le_bytes(a)
+        })
+        .collect();
+    let cur = &out[8 + count * 8..total];
+    IndexPage {
+        ids,
+        next_cursor: (!cur.is_empty()).then(|| cur.to_vec()),
+    }
 }

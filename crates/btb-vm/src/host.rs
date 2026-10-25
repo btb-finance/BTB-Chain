@@ -45,6 +45,21 @@ pub mod abi {
     /// `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count`. Writes up to
     /// out_cap/8 ascending row ids >= start_id as u64 LE. Page by passing last id + 1.
     pub const TABLE_SCAN: u64 = 14;
+    /// `table_index_scan(req_ptr, req_len, out_ptr, out_cap) -> total_len`. Read-only; allowed in
+    /// queries. Scans one secondary index of a table between two bounds and returns row ids.
+    /// Request (all integers LE): `u32 table_len, table, u32 index_len, index (UTF-8),
+    /// bound lo, bound hi, u8 flags (bit 0 = descending), u32 limit, u32 cursor_len, cursor`.
+    /// A bound is `u8 kind (0 unbounded, 1 included, 2 excluded)` and, unless unbounded,
+    /// `u8 value_tag (0 u64, 1 i64, 2 u128, 3 bytes, 4 string), u32 len, bytes` (integers use
+    /// their little-endian width as `len`). Result: `u32 count, u32 cursor_len, count x u64 LE
+    /// row ids ordered by (value, id), cursor`. A non-empty cursor means more rows exist; pass it
+    /// back to resume. The call returns the full result length; the result is copied only if it
+    /// fits in `out_cap`, so retry with a bigger buffer. A malformed request traps. `limit` is
+    /// capped at `MAX_INDEX_SCAN_LIMIT`.
+    pub const TABLE_INDEX_SCAN: u64 = 15;
+
+    /// Largest `limit` honoured by `table_index_scan`.
+    pub const MAX_INDEX_SCAN_LIMIT: u32 = 256;
 
     /// Returned by `storage_read` and `table_get` when the key is missing.
     pub const NOT_FOUND: u64 = u64::MAX;
@@ -58,6 +73,116 @@ pub mod abi {
 
 /// A 32-byte account address.
 pub type Address = [u8; 32];
+
+/// A typed index value in an index scan request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexKey {
+    U64(u64),
+    I64(i64),
+    U128(u128),
+    Bytes(Vec<u8>),
+    Str(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexBound {
+    Unbounded,
+    Included(IndexKey),
+    Excluded(IndexKey),
+}
+
+/// A decoded `table_index_scan` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexScan {
+    pub table: Vec<u8>,
+    pub index: String,
+    pub lo: IndexBound,
+    pub hi: IndexBound,
+    pub descending: bool,
+    /// Already capped at `abi::MAX_INDEX_SCAN_LIMIT`.
+    pub limit: u32,
+    /// Empty to start from the beginning.
+    pub cursor: Vec<u8>,
+}
+
+/// Result of an index scan: ids in (value, id) order and a resume cursor (empty = no more).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexScanPage {
+    pub ids: Vec<u64>,
+    pub next_cursor: Vec<u8>,
+}
+
+/// Cursor for decoding a guest-supplied request without panicking.
+struct Rd<'a>(&'a [u8]);
+
+impl<'a> Rd<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if n > self.0.len() {
+            return None;
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Some(a)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+    fn bound(&mut self) -> Option<IndexBound> {
+        let kind = self.u8()?;
+        if kind == 0 {
+            return Some(IndexBound::Unbounded);
+        }
+        let tag = self.u8()?;
+        let b = self.bytes()?;
+        let key = match (tag, b.len()) {
+            (0, 8) => IndexKey::U64(u64::from_le_bytes(b.try_into().ok()?)),
+            (1, 8) => IndexKey::I64(i64::from_le_bytes(b.try_into().ok()?)),
+            (2, 16) => IndexKey::U128(u128::from_le_bytes(b.try_into().ok()?)),
+            (3, _) => IndexKey::Bytes(b.to_vec()),
+            (4, _) => IndexKey::Str(String::from_utf8(b.to_vec()).ok()?),
+            _ => return None,
+        };
+        match kind {
+            1 => Some(IndexBound::Included(key)),
+            2 => Some(IndexBound::Excluded(key)),
+            _ => None,
+        }
+    }
+}
+
+/// Decode a `table_index_scan` request; `None` if malformed (including trailing bytes).
+pub fn parse_index_scan(req: &[u8]) -> Option<IndexScan> {
+    let mut r = Rd(req);
+    let table = r.bytes()?.to_vec();
+    let index = String::from_utf8(r.bytes()?.to_vec()).ok()?;
+    let lo = r.bound()?;
+    let hi = r.bound()?;
+    let flags = r.u8()?;
+    if flags > 1 {
+        return None;
+    }
+    let limit = r.u32()?.min(abi::MAX_INDEX_SCAN_LIMIT);
+    let cursor = r.bytes()?.to_vec();
+    if !r.0.is_empty() {
+        return None;
+    }
+    Some(IndexScan {
+        table,
+        index,
+        lo,
+        hi,
+        descending: flags == 1,
+        limit,
+        cursor,
+    })
+}
 
 /// What the embedder (node runtime) provides to a running contract.
 pub trait Host {
@@ -82,6 +207,11 @@ pub trait Host {
     fn table_delete(&mut self, table: &[u8], id: u64) -> bool;
     /// Up to `max` ascending row ids >= `start_id`.
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64>;
+    /// Scan a secondary index. The default has no indexes and returns nothing; hosts with
+    /// index storage (`btb-runtime`) override it.
+    fn table_index_scan(&mut self, _scan: &IndexScan) -> IndexScanPage {
+        IndexScanPage::default()
+    }
 }
 
 fn cost(base: u64, per_byte: u64, bytes: u64) -> u64 {
@@ -236,6 +366,33 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                     .collect();
                 vm.write_mem(a3, &out)?;
                 n
+            }
+            abi::TABLE_INDEX_SCAN => {
+                vm.charge_gas(cost(gas::HOST_TABLE_INDEX_SCAN, gas::TABLE_READ_BYTE, a1))?;
+                let req = buf(vm, a0, a1)?;
+                // Validate the output window before doing anything.
+                buf(vm, a2, a3)?;
+                let Some(scan) = parse_index_scan(&req) else {
+                    return Err(Trap::Abort("malformed table_index_scan request".into()));
+                };
+                let page = host.table_index_scan(&scan);
+                // The scan work is done either way, so it is always charged.
+                vm.charge_gas(
+                    (page.ids.len() as u64)
+                        .saturating_mul(gas::TABLE_INDEX_SCAN_ID)
+                        .saturating_add((page.next_cursor.len() as u64) * gas::TABLE_READ_BYTE),
+                )?;
+                let mut out = Vec::with_capacity(8 + page.ids.len() * 8 + page.next_cursor.len());
+                out.extend_from_slice(&(page.ids.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(page.next_cursor.len() as u32).to_le_bytes());
+                for id in &page.ids {
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+                out.extend_from_slice(&page.next_cursor);
+                if out.len() as u64 <= a3 {
+                    vm.write_mem(a2, &out)?;
+                }
+                out.len() as u64
             }
             abi::RETURN_DATA => {
                 vm.charge_gas(cost(gas::HOST_RETURN_DATA, gas::RETURN_BYTE, a1))?;

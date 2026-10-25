@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Host call 15 `table_index_scan` (read-only, 400 gas + 1/request byte + 40/id + 1/cursor byte): contracts query a secondary index by range with order, limit and cursor; SDK `Table::index_eq`, `include/btb.h` constant
+- `crates/btb-dev`: single-node dev server (HTTP, Server-Sent Events for live queries) and `examples/todo` with a web page; automated Phase 2 gate test
+
 ## [2.0.0] - 2026-10-25
 
 ### Community

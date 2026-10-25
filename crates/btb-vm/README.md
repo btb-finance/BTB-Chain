@@ -34,8 +34,9 @@ Number in a7, args in a0..a5, result in a0. Gas (on top of the 1-gas ECALL) is c
 | 12 | `table_update(table_ptr, table_len, id, row_ptr, row_len) -> 0 ok \| 1 missing` | 500 + 4/(table+row) byte |
 | 13 | `table_delete(table_ptr, table_len, id) -> 0 ok \| 1 missing` | 300 + 1/table byte |
 | 14 | `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count` (up to out_cap/8 ascending u64 LE ids >= start_id) | 250 + 1/table byte + 10/id returned |
+| 15 | `table_index_scan(req_ptr, req_len, out_ptr, out_cap) -> total_len` (read-only; allowed in queries; request and result layout in `abi::TABLE_INDEX_SCAN`) | 400 + 1/request byte + 40/id returned + 1/cursor byte returned |
 
-`storage_read` copies at most `out_cap` bytes but returns the full length. Calls 2, 3 and 7 trap with `WriteInQuery` when `Host::read_only()` is true (queries). Calls 10, 12 and 13 also trap with `WriteInQuery`. Rows are opaque bytes (encoding comes later); `table_get` has `storage_read` copy semantics. Paginate `table_scan` by passing the last id + 1. Indexes are out of scope for now.
+`storage_read` copies at most `out_cap` bytes but returns the full length. Calls 2, 3 and 7 trap with `WriteInQuery` when `Host::read_only()` is true (queries). Calls 10, 12 and 13 also trap with `WriteInQuery`. Rows are opaque bytes (encoding comes later); `table_get` has `storage_read` copy semantics. Paginate `table_scan` by passing the last id + 1. Call 15 reads secondary indexes; hosts without index storage (`MemHost`) return no results for it (`MemHost` has no schemas), and `btb-runtime` implements it.
 
 ```
 cargo test -p btb-vm

@@ -1,0 +1,575 @@
+//! Single-node dev server for BTB contracts (DEV ONLY).
+//!
+//! Loads a contract ELF, keeps state in a `KvStore`, and serves it over plain HTTP:
+//!
+//! - `POST /mutation/<name>`: run a mutation (optimistic transaction), commit, then re-run every
+//!   subscribed query whose read set was touched and push changed results.
+//! - `GET /query/<name>`: run a query once.
+//! - `GET /subscribe/<name>`: Server-Sent Events; one event with the current result, then one
+//!   more whenever a commit changes the result (`SubscriptionManager`).
+//! - `GET /`: the todo demo page.
+//!
+//! Arguments: `?args=<hex of btb-codec bytes>`, or a POST body that is either that hex or (with
+//! `Content-Type: application/json`) a flat JSON array, see `demo`. Results are hex, or JSON with
+//! `?format=json`. The caller is the `X-BTB-Caller` header or `?caller=` (EventSource cannot set
+//! headers): 64 hex characters are the address, any other text is hashed with SHA-256. There is
+//! no authentication; never expose this server.
+
+mod demo;
+
+use btb_runtime::{
+    layout, IndexDef, IndexValue, KvStore, Occ, OccError, ReadSet, RuntimeHost, SubId,
+    SubscriptionManager, Tables, WriteBatch,
+};
+use btb_vm::{CallError, Contract, FunctionKind, Trap};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// The one contract a dev server hosts.
+pub const CONTRACT: [u8; 32] = [0xDE; 32];
+/// Gas limit per call and VM memory.
+const GAS: u64 = 50_000_000;
+const MEM: usize = 1 << 20;
+/// BTB the dev contract starts with, to pay storage deposits.
+const DEV_BALANCE: u64 = 1_000_000_000_000;
+const MAX_BODY: usize = 1 << 20;
+const MAX_RETRIES: u32 = 3;
+const TODO_HTML: &str = include_str!("../../../examples/todo/web/index.html");
+
+/// TEMPORARY schema declaration, `Table:index:kind@offset`: index `index` of `Table` is the
+/// value at byte `offset` of the row, `addr` (32 bytes, as `IndexValue::Bytes`) or `u64`
+/// (8 bytes LE). Contracts will declare indexes themselves later (docs/DEV_SERVER.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexSpec {
+    pub table: String,
+    pub index: String,
+    pub addr: bool,
+    pub offset: usize,
+}
+
+impl IndexSpec {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad = || format!("bad --index {s:?}, expected Table:index:addr@offset or :u64@offset");
+        let mut p = s.split(':');
+        let (table, index, rest) = (p.next(), p.next(), p.next());
+        let (Some(table), Some(index), Some(rest), None) = (table, index, rest, p.next()) else {
+            return Err(bad());
+        };
+        let (kind, off) = rest.split_once('@').ok_or_else(bad)?;
+        let addr = match kind {
+            "addr" => true,
+            "u64" => false,
+            _ => return Err(bad()),
+        };
+        Ok(Self {
+            table: table.into(),
+            index: index.into(),
+            addr,
+            offset: off.parse().map_err(|_| bad())?,
+        })
+    }
+
+    fn def(&self) -> IndexDef {
+        let (addr, off) = (self.addr, self.offset);
+        IndexDef::new(&self.index, move |row| {
+            let n = if addr { 32 } else { 8 };
+            let b = row
+                .get(off..off + n)
+                .ok_or_else(|| "row too short for index".to_string())?;
+            Ok(Some(if addr {
+                IndexValue::Bytes(b.to_vec())
+            } else {
+                IndexValue::U64(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+            }))
+        })
+    }
+}
+
+struct Client {
+    caller: [u8; 32],
+    tx: Sender<Vec<u8>>,
+}
+
+struct State<S: KvStore> {
+    occ: Occ<S>,
+    subs: SubscriptionManager,
+    clients: BTreeMap<SubId, Client>,
+    height: u64,
+}
+
+struct Shared<S: KvStore> {
+    contract: Contract,
+    tables: Tables,
+    state: Mutex<State<S>>,
+    stop: AtomicBool,
+}
+
+pub struct Server {
+    addr: SocketAddr,
+    stop: Arc<dyn Fn() + Send + Sync>,
+    thread: JoinHandle<()>,
+}
+
+impl Server {
+    /// Start serving on `bind` (port 0 picks a free port).
+    pub fn start<S: KvStore + Send + 'static>(
+        elf: &[u8],
+        bind: impl ToSocketAddrs,
+        mut store: S,
+        indexes: Vec<IndexSpec>,
+    ) -> Result<Server, String> {
+        let contract = Contract::from_elf(elf).map_err(|e| format!("bad contract: {e:?}"))?;
+        let mut tables = Tables::new();
+        let mut by_table: BTreeMap<&str, Vec<IndexDef>> = BTreeMap::new();
+        for i in &indexes {
+            by_table.entry(&i.table).or_default().push(i.def());
+        }
+        for (t, defs) in by_table {
+            tables
+                .register(CONTRACT, t.as_bytes(), defs)
+                .map_err(|e| e.to_string())?;
+        }
+        let bal = layout::balance_key(&CONTRACT);
+        if store.get(&bal).map_err(|e| e.to_string())?.is_none() {
+            store
+                .put(&bal, &DEV_BALANCE.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        let listener = TcpListener::bind(bind).map_err(|e| format!("bind: {e}"))?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let shared = Arc::new(Shared {
+            contract,
+            tables,
+            state: Mutex::new(State {
+                occ: Occ::new(store),
+                subs: SubscriptionManager::new(),
+                clients: BTreeMap::new(),
+                height: 1,
+            }),
+            stop: AtomicBool::new(false),
+        });
+        let sh = shared.clone();
+        let thread = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if sh.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(conn) = conn {
+                    let sh = sh.clone();
+                    std::thread::spawn(move || {
+                        let _ = handle(&sh, conn);
+                    });
+                }
+            }
+        });
+        let stop = Arc::new(move || {
+            shared.stop.store(true, Ordering::SeqCst);
+            // Wake the blocked accept.
+            let _ = TcpStream::connect(addr);
+        });
+        Ok(Server { addr, stop, thread })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Stop accepting; open event streams end within a second.
+    pub fn shutdown(self) {
+        (self.stop)();
+        let _ = self.thread.join();
+    }
+
+    /// Block until the server stops (forever, for the binary).
+    pub fn join(self) {
+        let _ = self.thread.join();
+    }
+}
+
+fn caller_of(s: &str) -> [u8; 32] {
+    match demo::unhex(s) {
+        Some(b) if b.len() == 32 => b.try_into().expect("32 bytes"),
+        _ => Sha256::digest(s.as_bytes()).into(),
+    }
+}
+
+struct Request {
+    method: String,
+    path: String,
+    query: BTreeMap<String, String>,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut o, mut i) = (Vec::new(), 0);
+    while i < b.len() {
+        match b[i] {
+            b'%' if s.get(i + 1..i + 3).and_then(demo::unhex).is_some() => {
+                o.push(demo::unhex(&s[i + 1..i + 3]).expect("checked")[0]);
+                i += 3;
+                continue;
+            }
+            b'+' => o.push(b' '),
+            c => o.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&o).into_owned()
+}
+
+fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
+    conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let mut r = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
+    let mut line = String::new();
+    r.by_ref()
+        .take(8192)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    let mut it = line.split_whitespace();
+    let (method, target) = (
+        it.next().ok_or("empty request")?.to_string(),
+        it.next().ok_or("no target")?.to_string(),
+    );
+    let mut headers = BTreeMap::new();
+    for _ in 0..100 {
+        let mut h = String::new();
+        r.by_ref()
+            .take(8192)
+            .read_line(&mut h)
+            .map_err(|e| e.to_string())?;
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    let len: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if len > MAX_BODY {
+        return Err("body too large".into());
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).map_err(|e| e.to_string())?;
+    let (path, qs) = target.split_once('?').unwrap_or((&target, ""));
+    let query = qs
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (pct_decode(k), pct_decode(v))
+        })
+        .collect();
+    Ok(Request {
+        method,
+        path: pct_decode(path),
+        query,
+        headers,
+        body,
+    })
+}
+
+fn respond(conn: &mut TcpStream, status: &str, ctype: &str, body: &str) -> std::io::Result<()> {
+    write!(
+        conn,
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn err_json(conn: &mut TcpStream, status: &str, msg: &str) -> std::io::Result<()> {
+    respond(
+        conn,
+        status,
+        "application/json",
+        &format!("{{\"error\":{}}}", demo::json_str(msg)),
+    )
+}
+
+fn call_error(e: &CallError) -> (&'static str, String) {
+    match e {
+        CallError::NoSuchEntry { .. } => ("404 Not Found", "no such function".into()),
+        CallError::Trap {
+            trap: Trap::Abort(m),
+            ..
+        } => ("400 Bad Request", format!("aborted: {m}")),
+        other => ("400 Bad Request", format!("{other:?}")),
+    }
+}
+
+/// Run `function` as `kind`; returns the output and what it read and wrote.
+fn run<S: KvStore>(
+    sh: &Shared<S>,
+    store: &S,
+    kind: FunctionKind,
+    function: &str,
+    args: &[u8],
+    caller: [u8; 32],
+    height: u64,
+) -> Result<(Vec<u8>, WriteBatch, ReadSet), (&'static str, String)> {
+    let mut host = RuntimeHost::new(store, &sh.tables, CONTRACT, caller, height);
+    let out = sh
+        .contract
+        .call(kind, function, args, &mut host, GAS, MEM)
+        .map_err(|e| call_error(&e))?;
+    let (batch, reads) = host
+        .finish_tracked()
+        .map_err(|f| ("500 Internal Server Error", format!("{f:?}")))?;
+    Ok((out.output, batch, reads))
+}
+
+fn render(function: &str, out: &[u8], json: bool) -> Vec<u8> {
+    if json {
+        demo::result_json(function, out).into_bytes()
+    } else {
+        demo::hex(out).into_bytes()
+    }
+}
+
+fn handle<S: KvStore + Send + 'static>(
+    sh: &Arc<Shared<S>>,
+    mut conn: TcpStream,
+) -> std::io::Result<()> {
+    let req = match read_request(&mut conn) {
+        Ok(r) => r,
+        Err(e) => return err_json(&mut conn, "400 Bad Request", &e),
+    };
+    if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
+        return respond(&mut conn, "200 OK", "text/html; charset=utf-8", TODO_HTML);
+    }
+    let Some((kind, function)) = req.path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+        return err_json(&mut conn, "404 Not Found", "not found");
+    };
+    let (kind, want_method) = match kind {
+        "mutation" => (FunctionKind::Mutation, "POST"),
+        "query" | "subscribe" => (FunctionKind::Query, "GET"),
+        _ => return err_json(&mut conn, "404 Not Found", "not found"),
+    };
+    if req.method != want_method {
+        return err_json(
+            &mut conn,
+            "405 Method Not Allowed",
+            &format!("use {want_method}"),
+        );
+    }
+    let args = match request_args(&req) {
+        Ok(a) => a,
+        Err(e) => return err_json(&mut conn, "400 Bad Request", &e),
+    };
+    let caller = caller_of(
+        req.headers
+            .get("x-btb-caller")
+            .or_else(|| req.query.get("caller"))
+            .map_or("anonymous", String::as_str),
+    );
+    let json = req.query.get("format").is_some_and(|f| f == "json");
+    let function = function.to_string();
+    match req.path.split('/').nth(1) {
+        Some("mutation") => mutation(sh, &mut conn, &function, &args, caller, json),
+        Some("query") => {
+            let st = sh.state.lock().unwrap();
+            match run(
+                sh,
+                st.occ.store(),
+                kind,
+                &function,
+                &args,
+                caller,
+                st.height,
+            ) {
+                Ok((out, _, _)) => {
+                    drop(st);
+                    let ctype = if json {
+                        "application/json"
+                    } else {
+                        "text/plain"
+                    };
+                    respond(
+                        &mut conn,
+                        "200 OK",
+                        ctype,
+                        &String::from_utf8_lossy(&render(&function, &out, json)),
+                    )
+                }
+                Err((s, m)) => {
+                    drop(st);
+                    err_json(&mut conn, s, &m)
+                }
+            }
+        }
+        _ => subscribe(sh, &mut conn, &function, args, caller, json),
+    }
+}
+
+fn request_args(req: &Request) -> Result<Vec<u8>, String> {
+    let is_json = req
+        .headers
+        .get("content-type")
+        .is_some_and(|c| c.starts_with("application/json"));
+    let body = String::from_utf8_lossy(&req.body);
+    if is_json && !req.body.is_empty() {
+        return demo::args_from_json(&body);
+    }
+    let text = req
+        .query
+        .get("args")
+        .map(String::as_str)
+        .unwrap_or_else(|| body.trim());
+    demo::unhex(text).ok_or_else(|| "args must be hex of btb-codec bytes".to_string())
+}
+
+fn mutation<S: KvStore + Send + 'static>(
+    sh: &Arc<Shared<S>>,
+    conn: &mut TcpStream,
+    function: &str,
+    args: &[u8],
+    caller: [u8; 32],
+    json: bool,
+) -> std::io::Result<()> {
+    let mut guard = sh.state.lock().unwrap();
+    let st = &mut *guard;
+    let height = st.height;
+    let r = st
+        .occ
+        .execute_with_retry::<_, (&'static str, String)>(MAX_RETRIES, |store, _| {
+            let (out, batch, reads) = run(
+                sh,
+                store,
+                FunctionKind::Mutation,
+                function,
+                args,
+                caller,
+                height,
+            )?;
+            Ok((out, batch, reads))
+        });
+    let committed = match r {
+        Ok(c) => c,
+        Err(OccError::Failed((s, m))) => {
+            drop(guard);
+            return err_json(conn, s, &m);
+        }
+        Err(e) => {
+            drop(guard);
+            return err_json(conn, "409 Conflict", &format!("{e:?}"));
+        }
+    };
+    st.height += 1;
+    // Push changed results of affected subscriptions (a subscription runs as its own caller).
+    let mut dead = Vec::new();
+    for id in st.subs.affected(&committed.batch) {
+        let Some(client) = st.clients.get(&id) else {
+            continue;
+        };
+        let (c, height) = (client.caller, st.height);
+        let store = st.occ.store();
+        let change = st.subs.refresh(id, |_, f, a| {
+            run(sh, store, FunctionKind::Query, f, a, c, height).map(|(o, _, r)| (o, r))
+        });
+        match change {
+            Ok(Some(ch)) => {
+                if client.tx.send(ch.result).is_err() {
+                    dead.push(id);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => dead.push(id),
+        }
+    }
+    for id in dead {
+        st.subs.unsubscribe(id);
+        st.clients.remove(&id);
+    }
+    drop(guard);
+    let ctype = if json {
+        "application/json"
+    } else {
+        "text/plain"
+    };
+    respond(
+        conn,
+        "200 OK",
+        ctype,
+        &String::from_utf8_lossy(&render(function, &committed.output, json)),
+    )
+}
+
+fn event(conn: &mut TcpStream, function: &str, out: &[u8], json: bool) -> std::io::Result<()> {
+    let data = String::from_utf8_lossy(&render(function, out, json)).into_owned();
+    write!(conn, "data: {data}\n\n")?;
+    conn.flush()
+}
+
+fn subscribe<S: KvStore + Send + 'static>(
+    sh: &Arc<Shared<S>>,
+    conn: &mut TcpStream,
+    function: &str,
+    args: Vec<u8>,
+    caller: [u8; 32],
+    json: bool,
+) -> std::io::Result<()> {
+    let (tx, rx) = channel();
+    let (id, first) = {
+        let mut guard = sh.state.lock().unwrap();
+        let st = &mut *guard;
+        match run(
+            sh,
+            st.occ.store(),
+            FunctionKind::Query,
+            function,
+            &args,
+            caller,
+            st.height,
+        ) {
+            Ok((out, _, reads)) => {
+                let id = st.subs.subscribe(CONTRACT, function, &args, reads, &out);
+                st.clients.insert(id, Client { caller, tx });
+                (id, out)
+            }
+            Err((s, m)) => {
+                drop(guard);
+                return err_json(conn, s, &m);
+            }
+        }
+    };
+    conn.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    )?;
+    let result = (|| {
+        event(conn, function, &first, json)?;
+        let mut idle = 0;
+        while !sh.stop.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(out) => {
+                    idle = 0;
+                    event(conn, function, &out, json)?;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    idle += 1;
+                    if idle % 60 == 0 {
+                        conn.write_all(b": ping\n\n")?;
+                        conn.flush()?;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    })();
+    let mut st = sh.state.lock().unwrap();
+    st.subs.unsubscribe(id);
+    st.clients.remove(&id);
+    result
+}

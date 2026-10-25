@@ -26,6 +26,7 @@
 #define BTB_TABLE_UPDATE 12
 #define BTB_TABLE_DELETE 13
 #define BTB_TABLE_SCAN 14
+#define BTB_TABLE_INDEX_SCAN 15
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
@@ -124,6 +125,14 @@ static inline uint64_t btb_table_delete(const uint8_t *table, uint64_t table_len
 static inline uint64_t btb_table_scan(const uint8_t *table, uint64_t table_len,
                                       uint64_t start_id, uint8_t *out, uint64_t out_cap) {
   return btb_ecall5(BTB_TABLE_SCAN, BTB_P(table), table_len, start_id, BTB_P(out), out_cap);
+}
+/* Read-only (allowed in queries). req is the request blob described in
+ * crates/btb-vm/src/host.rs (abi::TABLE_INDEX_SCAN). Returns the full result length; the
+ * result (u32 count, u32 cursor_len, count x u64 row ids, cursor; little-endian) is copied
+ * only if it fits in out_cap. */
+static inline uint64_t btb_table_index_scan(const uint8_t *req, uint64_t req_len,
+                                            uint8_t *out, uint64_t out_cap) {
+  return btb_ecall5(BTB_TABLE_INDEX_SCAN, BTB_P(req), req_len, BTB_P(out), out_cap, 0);
 }
 
 #endif /* BTB_H */

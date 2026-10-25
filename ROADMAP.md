@@ -32,12 +32,15 @@ Tables, indexes, queries and live subscriptions on one machine.
 - [ ] Table and index storage on RocksDB
   - In progress: tables, indexes and key layout done on an in-memory `KvStore` (`crates/btb-runtime`); RocksDB backend (`rocksdb` feature) done
 - [x] Jellyfish Merkle tree state commitment (provable state)
-- [ ] Query engine: lookups by primary key and index, filters, pagination
+- [x] Query engine: lookups by primary key and index, filters, pagination
+  - Contracts reach it through host call 15 (`table_index_scan`: index range, order, limit, cursor); row filters are in the Rust API only
 - [x] Read-set tracking and subscription invalidation (re-run queries when their data changes)
 - [x] Optimistic transactions for mutations (retry on conflict)
 - [x] Storage deposits per byte, refunded on delete
 
 **Gate:** query a table by index and watch a UI update live.
+
+Gate demo: `examples/todo` (reads its rows through an index) served by `btb-dev` with a live page; run by `crates/btb-tests/tests/dev_gate.rs` (SSE stream gets a new event after `add` and `toggle`) and a Playwright smoke check. Not yet ticked off as a phase: the RocksDB item above is still open, and contract-declared indexes are temporary host-side registrations (see [docs/DEV_SERVER.md](docs/DEV_SERVER.md)).
 
 ## Phase 3 — Single-node devnet
 

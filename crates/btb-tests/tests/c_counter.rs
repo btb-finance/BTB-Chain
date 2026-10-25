@@ -163,6 +163,7 @@ fn header_call_numbers_match_abi() {
         ("BTB_TABLE_UPDATE", abi::TABLE_UPDATE),
         ("BTB_TABLE_DELETE", abi::TABLE_DELETE),
         ("BTB_TABLE_SCAN", abi::TABLE_SCAN),
+        ("BTB_TABLE_INDEX_SCAN", abi::TABLE_INDEX_SCAN),
         ("BTB_TRANSFER_OK", abi::TRANSFER_OK),
         ("BTB_TRANSFER_INSUFFICIENT", abi::TRANSFER_INSUFFICIENT),
         ("BTB_TABLE_OK", abi::TABLE_OK),

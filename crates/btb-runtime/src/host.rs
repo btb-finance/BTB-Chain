@@ -8,10 +8,12 @@
 //! result, and `finish` then returns the fault instead of a batch.
 
 use crate::kv::{KvError, KvStore, Overlay, WriteBatch};
-use crate::layout;
+use crate::layout::{self, IndexValue};
+use crate::query::{self, Cursor, Order, QueryOptions};
 use crate::readset::ReadSet;
 use crate::tables::{TableError, Tables};
-use btb_vm::host::{Address, Host};
+use btb_vm::host::{Address, Host, IndexBound, IndexKey, IndexScan, IndexScanPage};
+use std::ops::Bound;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
@@ -24,6 +26,24 @@ pub enum Fault {
     },
     /// Usage, deposit or balance arithmetic overflowed.
     DepositOverflow,
+}
+
+fn index_value(k: &IndexKey) -> IndexValue {
+    match k {
+        IndexKey::U64(v) => IndexValue::U64(*v),
+        IndexKey::I64(v) => IndexValue::I64(*v),
+        IndexKey::U128(v) => IndexValue::U128(*v),
+        IndexKey::Bytes(v) => IndexValue::Bytes(v.clone()),
+        IndexKey::Str(v) => IndexValue::Str(v.clone()),
+    }
+}
+
+fn bound(b: &IndexBound) -> Bound<IndexValue> {
+    match b {
+        IndexBound::Unbounded => Bound::Unbounded,
+        IndexBound::Included(k) => Bound::Included(index_value(k)),
+        IndexBound::Excluded(k) => Bound::Excluded(index_value(k)),
+    }
 }
 
 pub struct RuntimeHost<'a, S: KvStore> {
@@ -260,5 +280,37 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
             .iter()
             .filter_map(|(k, _)| layout::id_from_key(k))
             .collect()
+    }
+    fn table_index_scan(&mut self, scan: &IndexScan) -> IndexScanPage {
+        let (lo, hi) = (bound(&scan.lo), bound(&scan.hi));
+        let opts = QueryOptions {
+            order: if scan.descending {
+                Order::Desc
+            } else {
+                Order::Asc
+            },
+            limit: scan.limit as usize,
+            cursor: (!scan.cursor.is_empty()).then(|| Cursor(scan.cursor.clone())),
+            filter: None,
+        };
+        let r = query::by_index_range(
+            &self.kv,
+            &self.contract,
+            &scan.table,
+            &scan.index,
+            lo.as_ref(),
+            hi.as_ref(),
+            &opts,
+        );
+        match r {
+            Ok(page) => IndexScanPage {
+                ids: page.rows.iter().map(|r| r.id).collect(),
+                next_cursor: page.next_cursor.map(|c| c.0).unwrap_or_default(),
+            },
+            Err(e) => {
+                self.note(Fault::Kv(e));
+                IndexScanPage::default()
+            }
+        }
     }
 }

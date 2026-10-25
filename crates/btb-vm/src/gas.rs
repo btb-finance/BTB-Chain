@@ -80,3 +80,8 @@ pub const HOST_TABLE_DELETE: u64 = 300;
 pub const HOST_TABLE_SCAN: u64 = 250;
 pub const TABLE_READ_BYTE: u64 = 1;
 pub const TABLE_SCAN_ID: u64 = 10;
+/// `table_index_scan`: base plus `TABLE_READ_BYTE` per request byte up front, plus
+/// `TABLE_INDEX_SCAN_ID` per id returned and `TABLE_READ_BYTE` per cursor byte returned, charged
+/// before the (optional) copy. Each id costs an index entry read plus a row existence check.
+pub const HOST_TABLE_INDEX_SCAN: u64 = 400;
+pub const TABLE_INDEX_SCAN_ID: u64 = 40;

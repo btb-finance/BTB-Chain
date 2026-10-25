@@ -216,6 +216,7 @@ fn sdk_host_call_numbers_match_the_vm() {
         (num::TABLE_UPDATE, abi::TABLE_UPDATE),
         (num::TABLE_DELETE, abi::TABLE_DELETE),
         (num::TABLE_SCAN, abi::TABLE_SCAN),
+        (num::TABLE_INDEX_SCAN, abi::TABLE_INDEX_SCAN),
         (num::NOT_FOUND, abi::NOT_FOUND),
     ];
     for (a, b) in pairs {

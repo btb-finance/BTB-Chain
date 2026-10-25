@@ -6,7 +6,7 @@ Phase 2 state database for BTB Chain. Depends only on `btb-vm`.
 - `layout`: the deterministic key layout and order-preserving index encodings. See [docs/STATE.md](../../docs/STATE.md).
 - `tables`: `Tables` registry (table name + indexes, each an extractor over raw row bytes) with `insert`/`get`/`update`/`delete`. Each write is one `WriteBatch`; extractors run first, so a failure writes nothing.
 - `query`: `by_id`, `scan_table`, `by_index_eq`, `by_index_range` with filter, limit, ascending/descending and opaque cursor pagination.
-- `host`: `RuntimeHost`, a `btb_vm::Host` over any `KvStore`. Writes go to an overlay; `finish()` returns the `WriteBatch` to commit, or the fault that makes the call invalid.
+- `host`: `RuntimeHost` (also serves host call 15, `table_index_scan`), a `btb_vm::Host` over any `KvStore`. Writes go to an overlay; `finish()` returns the `WriteBatch` to commit, or the fault that makes the call invalid.
 
 - Storage deposits: `RuntimeHost` locks `DEPOSIT_PER_BYTE` per newly stored byte from the contract's balance and refunds on shrink/delete (see docs/STATE.md).
 - `merkle`: Jellyfish-style sparse Merkle tree (16-ary over `SHA-256(key)`, versioned, nodes stored in the `KvStore`): `apply`/`prepare`, `root`, `get_with_proof`, `verify` with inclusion and non-inclusion proofs. Uses `sha2` (MIT/Apache). See [docs/STATE.md](../../docs/STATE.md).

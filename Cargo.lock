@@ -49,6 +49,16 @@ name = "btb-codec"
 version = "0.1.0"
 
 [[package]]
+name = "btb-dev"
+version = "0.1.0"
+dependencies = [
+ "btb-codec",
+ "btb-runtime",
+ "btb-vm",
+ "sha2",
+]
+
+[[package]]
 name = "btb-runtime"
 version = "0.1.0"
 dependencies = [
@@ -79,6 +89,7 @@ name = "btb-tests"
 version = "0.1.0"
 dependencies = [
  "btb-codec",
+ "btb-dev",
  "btb-runtime",
  "btb-sdk",
  "btb-vm",

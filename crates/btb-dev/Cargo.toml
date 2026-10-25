@@ -1,0 +1,22 @@
+[package]
+name = "btb-dev"
+description = "Single-node dev server: runs a contract ELF over the state database with HTTP and live query subscriptions (Server-Sent Events)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "btb-dev"
+path = "src/main.rs"
+
+[dependencies]
+btb-vm = { path = "../btb-vm" }
+btb-runtime = { path = "../btb-runtime" }
+btb-codec = { path = "../btb-codec" }
+sha2 = "0.11.1"
+
+[features]
+default = []
+# Keep state in RocksDB (--data <dir>) instead of memory. Needs clang/libclang to build.
+rocksdb = ["btb-runtime/rocksdb"]

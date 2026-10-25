@@ -30,6 +30,12 @@ An index must always yield the same type; the type is not stored.
 
 An insert, update or delete is one `WriteBatch` holding the row, the counter and every index change. Index extractors run before anything is written. A contract call runs against an overlay and commits one batch only if it finishes without a fault, so a trapped call changes nothing.
 
+## Index scans from contracts
+
+Host call 15, `table_index_scan`, exposes `query::by_index_range` to contracts (see [LANGUAGE.md](LANGUAGE.md)). `RuntimeHost` runs it on its overlay, so rows written earlier in the same call are visible and the scan is tracked: the index key range it covered (cut at the last returned entry when the limit stops it) and a point read for each row it loaded land in the read set. A subscribed query that uses an index therefore re-runs when an entry is added to, removed from or moved within the range, and not for other owners' rows. Gas: 400 + 1 per request byte + 40 per id returned + 1 per cursor byte. An unknown table or index yields an empty page.
+
+Index declarations are **temporary and host-side**: `Tables::register(contract, table, indexes)` with an extractor over the raw row bytes. A contract-side declaration is future work, together with rebuilding entries when a schema changes.
+
 ## Storage deposits
 
 Metered bytes are `key.len() + value.len()` of every storage (`0x01`), row (`0x02`) and index (`0x04`) entry of the contract. Counters, balances and the usage/deposit records are not metered. When a call finishes, `RuntimeHost` compares each written key with its committed value, sums the growth and shrinkage, and settles the net delta:

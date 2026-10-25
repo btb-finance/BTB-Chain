@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTB todo</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --mute: #6b6b6b; --line: #ddd; --accent: #2b59ff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #16181d; --fg: #eee; --mute: #999; --line: #333; --accent: #7a98ff; } }
+  body { background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; margin: 0; padding: 0 16px; }
+  main { max-width: 560px; margin: 32px auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--mute); font-size: .85rem; margin-bottom: 16px; }
+  form { display: flex; gap: 8px; margin-bottom: 16px; }
+  input[type=text] { flex: 1; padding: 8px; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; }
+  button { padding: 8px 14px; font: inherit; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  li.done span { text-decoration: line-through; color: var(--mute); }
+  li button { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; margin-left: auto; }
+  #status { color: var(--mute); font-size: .8rem; margin-top: 12px; }
+  .user { color: var(--mute); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>BTB todo</h1>
+  <div class="sub">Live: the list below is a subscription to the <code>list_mine</code> query. Open this page in two tabs.</div>
+  <div class="user">User (dev identity): <input id="who" type="text" style="max-width:10rem" value="alice"> (changing it reconnects)</div>
+  <form id="f"><input id="text" type="text" placeholder="What needs doing?" maxlength="280" required><button>Add</button></form>
+  <ul id="list"></ul>
+  <div id="status">connecting...</div>
+</main>
+<script>
+  const list = document.getElementById('list');
+  const status = document.getElementById('status');
+  const who = document.getElementById('who');
+  let es = null;
+  const caller = () => encodeURIComponent(who.value.trim() || 'anonymous');
+
+  function render(items) {
+    list.replaceChildren(...items.map(t => {
+      const li = document.createElement('li');
+      li.className = t.done ? 'done' : '';
+      li.dataset.id = t.id;
+      const span = document.createElement('span');
+      span.textContent = t.text;
+      const b = document.createElement('button');
+      b.textContent = t.done ? 'Undo' : 'Done';
+      b.onclick = () => post('toggle', [t.id]);
+      li.append(span, b);
+      return li;
+    }));
+  }
+
+  async function post(name, args) {
+    const r = await fetch('/mutation/' + name + '?format=json&caller=' + caller(), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(args),
+    });
+    if (!r.ok) status.textContent = 'error: ' + ((await r.json()).error || r.status);
+  }
+
+  function connect() {
+    if (es) es.close();
+    es = new EventSource('/subscribe/list_mine?format=json&caller=' + caller());
+    es.onopen = () => { status.textContent = 'live'; };
+    es.onmessage = e => { render(JSON.parse(e.data)); status.textContent = 'live (updated ' + new Date().toLocaleTimeString() + ')'; };
+    es.onerror = () => { status.textContent = 'reconnecting...'; };
+  }
+
+  document.getElementById('f').onsubmit = async e => {
+    e.preventDefault();
+    const input = document.getElementById('text');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    await post('add', [text]);
+  };
+  who.onchange = connect;
+  connect();
+</script>
+</body>
+</html>

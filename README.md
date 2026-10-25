@@ -9,6 +9,8 @@
 
 > **Status: design phase.** This repository holds the BTB Chain specification and roadmap. Phase 1 (RISC-V VM + Rust SDK) is the next milestone. The earlier Arbitrum Orbit L3 design has been retired; it remains available on the `orbit-legacy` branch.
 
+> **Try it:** the Phase 2 demo (`examples/todo` with a live page) runs on the single-node dev server, see [docs/DEV_SERVER.md](docs/DEV_SERVER.md).
+
 ## Why BTB Chain
 
 On most chains, the chain cannot answer basic questions like "who holds this NFT?" or "who created this pool?". Every app needs RPC providers, indexers, cron servers and web hosting bolted on. On BTB Chain, **the chain is the whole backend**:

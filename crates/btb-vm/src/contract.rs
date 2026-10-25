@@ -260,6 +260,9 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
         self.0.table_scan(table, start_id, max)
     }
+    fn table_index_scan(&mut self, scan: &crate::host::IndexScan) -> crate::host::IndexScanPage {
+        self.0.table_index_scan(scan)
+    }
 }
 
 #[cfg(test)]
