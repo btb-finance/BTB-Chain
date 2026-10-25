@@ -65,3 +65,18 @@ pub const RETURN_BYTE: u64 = 1;
 /// `abort`: base plus `ABORT_BYTE` per message byte.
 pub const HOST_ABORT: u64 = 10;
 pub const ABORT_BYTE: u64 = 1;
+/// `table_insert`: base plus `TABLE_WRITE_BYTE` per (table_len + row_len).
+pub const HOST_TABLE_INSERT: u64 = 600;
+/// `table_update`: base plus `TABLE_WRITE_BYTE` per (table_len + row_len).
+pub const HOST_TABLE_UPDATE: u64 = 500;
+pub const TABLE_WRITE_BYTE: u64 = 4;
+/// `table_get`: base plus `TABLE_READ_BYTE` per table-name byte up front, plus the same per row
+/// byte actually copied (min(row_len, out_cap)), charged before the copy.
+pub const HOST_TABLE_GET: u64 = 250;
+/// `table_delete`: base plus `TABLE_READ_BYTE` per table-name byte.
+pub const HOST_TABLE_DELETE: u64 = 300;
+/// `table_scan`: base plus `TABLE_READ_BYTE` per table-name byte up front, plus `TABLE_SCAN_ID`
+/// per id returned (at most out_cap/8), charged before the write.
+pub const HOST_TABLE_SCAN: u64 = 250;
+pub const TABLE_READ_BYTE: u64 = 1;
+pub const TABLE_SCAN_ID: u64 = 10;

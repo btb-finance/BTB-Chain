@@ -218,7 +218,7 @@ fn bad_pointers_trap_without_effect() {
 
 #[test]
 fn unknown_call() {
-    for n in [0, 10, 9999, u64::MAX] {
+    for n in [0, 15, 9999, u64::MAX] {
         let mut vm = vm_with(n, [0; 4], 1000);
         assert_eq!(
             run_with_host(&mut vm, &mut host()),

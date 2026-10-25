@@ -3,8 +3,16 @@
 use crate::host::{Address, Host};
 use std::collections::BTreeMap;
 
+/// One table: rows by id, plus the next id to hand out (never decreases, so ids are not reused).
+#[derive(Debug, Clone, Default)]
+pub struct MemTable {
+    pub next_id: u64,
+    pub rows: BTreeMap<u64, Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemHost {
+    pub tables: BTreeMap<Vec<u8>, MemTable>,
     pub storage: BTreeMap<Vec<u8>, Vec<u8>>,
     pub balances: BTreeMap<Address, u64>,
     pub caller: Address,
@@ -50,5 +58,39 @@ impl Host for MemHost {
         self.balances.insert(self.contract, rest);
         self.balances.insert(*to, new_to);
         true
+    }
+    fn table_insert(&mut self, table: &[u8], row: &[u8]) -> u64 {
+        let t = self.tables.entry(table.to_vec()).or_default();
+        let id = t.next_id;
+        t.next_id = id.saturating_add(1);
+        t.rows.insert(id, row.to_vec());
+        id
+    }
+    fn table_get(&mut self, table: &[u8], id: u64) -> Option<Vec<u8>> {
+        self.tables.get(table)?.rows.get(&id).cloned()
+    }
+    fn table_update(&mut self, table: &[u8], id: u64, row: &[u8]) -> bool {
+        match self.tables.get_mut(table).and_then(|t| t.rows.get_mut(&id)) {
+            Some(r) => {
+                *r = row.to_vec();
+                true
+            }
+            None => false,
+        }
+    }
+    fn table_delete(&mut self, table: &[u8], id: u64) -> bool {
+        self.tables
+            .get_mut(table)
+            .is_some_and(|t| t.rows.remove(&id).is_some())
+    }
+    fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
+        let Some(t) = self.tables.get(table) else {
+            return Vec::new();
+        };
+        t.rows
+            .range(start_id..)
+            .take(usize::try_from(max).unwrap_or(usize::MAX))
+            .map(|(id, _)| *id)
+            .collect()
     }
 }

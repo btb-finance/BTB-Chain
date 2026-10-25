@@ -157,5 +157,10 @@ Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a
 | 7 | `token_transfer(to_ptr, amount) -> 0 ok or 1 insufficient` | 300 |
 | 8 | `return_data(ptr, len)` | 10 + 1/byte |
 | 9 | `abort(ptr, len)` | 10 + 1/byte |
+| 10 | `table_insert(table_ptr, table_len, row_ptr, row_len) -> row id` (monotonic per table, never reused) | 600 + 4/(table+row) byte |
+| 11 | `table_get(table_ptr, table_len, id, out_ptr, out_cap) -> len \| u64::MAX` | 250 + 1/table byte + 1/byte copied |
+| 12 | `table_update(table_ptr, table_len, id, row_ptr, row_len) -> 0 ok \| 1 missing` | 500 + 4/(table+row) byte |
+| 13 | `table_delete(table_ptr, table_len, id) -> 0 ok \| 1 missing` | 300 + 1/table byte |
+| 14 | `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count` (up to out_cap/8 ascending u64 LE ids >= start_id) | 250 + 1/table byte + 10/id returned |
 
-Queries run in read-only mode: calls 2, 3 and 7 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Table, randomness, cross-chain and action calls are added later with their own numbers and gas costs.
+Queries run in read-only mode: calls 2, 3, 7, 10, 12 and 13 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Indexes, randomness, cross-chain and action calls are added later with their own numbers and gas costs.
