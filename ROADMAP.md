@@ -31,10 +31,10 @@ Tables, indexes, queries and live subscriptions on one machine.
 
 - [ ] Table and index storage on RocksDB
   - In progress: tables, indexes and key layout done on an in-memory `KvStore` (`crates/btb-runtime`); the RocksDB backend is still to do
-- [ ] Jellyfish Merkle tree state commitment (provable state)
+- [x] Jellyfish Merkle tree state commitment (provable state)
 - [ ] Query engine: lookups by primary key and index, filters, pagination
-- [ ] Read-set tracking and subscription invalidation (re-run queries when their data changes)
-- [ ] Optimistic transactions for mutations (retry on conflict)
+- [x] Read-set tracking and subscription invalidation (re-run queries when their data changes)
+- [x] Optimistic transactions for mutations (retry on conflict)
 - [ ] Storage deposits per byte, refunded on delete
 
 **Gate:** query a table by index and watch a UI update live.

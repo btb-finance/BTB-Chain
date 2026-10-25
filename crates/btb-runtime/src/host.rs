@@ -9,6 +9,7 @@
 
 use crate::kv::{KvError, KvStore, Overlay, WriteBatch};
 use crate::layout;
+use crate::readset::ReadSet;
 use crate::tables::{TableError, Tables};
 use btb_vm::host::{Address, Host};
 
@@ -54,6 +55,20 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             Some(f) => Err(f),
             None => Ok(self.kv.into_batch()),
         }
+    }
+
+    /// Like `finish`, also returning everything the call read (for subscriptions and
+    /// optimistic transactions).
+    pub fn finish_tracked(self) -> Result<(WriteBatch, ReadSet), Fault> {
+        match self.fault {
+            Some(f) => Err(f),
+            None => Ok(self.kv.into_parts()),
+        }
+    }
+
+    /// The read set so far.
+    pub fn read_set(&self) -> ReadSet {
+        self.kv.read_set()
     }
 
     fn note(&mut self, f: Fault) {

@@ -3,6 +3,8 @@
 //! A RocksDB backend can implement `KvStore` later behind a cargo feature; nothing here
 //! assumes more than ordered keys, point reads and an atomic batch write.
 
+use crate::readset::ReadSet;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
@@ -161,6 +163,7 @@ impl KvStore for MemKv {
 pub struct Overlay<'a, S: KvStore> {
     base: &'a S,
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    reads: RefCell<ReadSet>,
 }
 
 impl<'a, S: KvStore> Overlay<'a, S> {
@@ -168,7 +171,19 @@ impl<'a, S: KvStore> Overlay<'a, S> {
         Self {
             base,
             pending: BTreeMap::new(),
+            reads: RefCell::new(ReadSet::new()),
         }
+    }
+
+    /// Everything read through this overlay so far (point reads and scanned ranges).
+    pub fn read_set(&self) -> ReadSet {
+        self.reads.borrow().clone()
+    }
+
+    /// The pending writes and the read set.
+    pub fn into_parts(self) -> (WriteBatch, ReadSet) {
+        let reads = self.reads.take();
+        (self.into_batch(), reads)
     }
 
     /// The pending writes as a batch (one op per touched key, in key order).
@@ -186,6 +201,7 @@ impl<'a, S: KvStore> Overlay<'a, S> {
 
 impl<S: KvStore> KvStore for Overlay<'_, S> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.reads.borrow_mut().add_point(key);
         match self.pending.get(key) {
             Some(v) => Ok(v.clone()),
             None => self.base.get(key),
@@ -202,6 +218,40 @@ impl<S: KvStore> KvStore for Overlay<'_, S> {
         if end.is_some_and(|e| e <= start) || limit == 0 {
             return Ok(Vec::new());
         }
+        let result = self.scan_inner(start, end, reverse, limit)?;
+        // A scan cut off by its limit only depends on keys up to its last entry.
+        let mut reads = self.reads.borrow_mut();
+        match (result.len() == limit, result.last()) {
+            (true, Some((last, _))) if reverse => reads.add_range(last, end),
+            (true, Some((last, _))) => {
+                let mut after = last.clone();
+                after.push(0);
+                reads.add_range(start, Some(&after));
+            }
+            _ => reads.add_range(start, end),
+        }
+        Ok(result)
+    }
+
+    fn commit(&mut self, batch: WriteBatch) -> Result<(), KvError> {
+        for op in batch.ops {
+            match op {
+                BatchOp::Put(k, v) => self.pending.insert(k, Some(v)),
+                BatchOp::Delete(k) => self.pending.insert(k, None),
+            };
+        }
+        Ok(())
+    }
+}
+
+impl<S: KvStore> Overlay<'_, S> {
+    fn scan_inner(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<Entry>, KvError> {
         let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
         let local: Vec<(&Vec<u8>, &Option<Vec<u8>>)> = self
             .pending
@@ -240,15 +290,5 @@ impl<S: KvStore> KvStore for Overlay<'_, S> {
             }
         }
         Ok(range_scan(merged.iter(), reverse, limit))
-    }
-
-    fn commit(&mut self, batch: WriteBatch) -> Result<(), KvError> {
-        for op in batch.ops {
-            match op {
-                BatchOp::Put(k, v) => self.pending.insert(k, Some(v)),
-                BatchOp::Delete(k) => self.pending.insert(k, None),
-            };
-        }
-        Ok(())
     }
 }

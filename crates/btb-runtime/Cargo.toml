@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 btb-vm = { path = "../btb-vm" }
+sha2 = "0.11.1"
