@@ -17,6 +17,17 @@ BTB contracts run on a metered **RISC-V VM**. Anything that compiles to RISC-V c
 
 Every language talks to the chain through the same **host-call interface** (storage, tables, tokens, context, cross-chain), so features land for all languages at once.
 
+## Four function kinds
+
+| Kind | What it does | Goes through consensus? |
+| --- | --- | --- |
+| `#[btb::query]` | Reads data; cannot change state; frontends can subscribe to it | No (served by hosting nodes) |
+| `#[btb::mutation]` | Reads and writes data in a transaction | Yes |
+| `#[btb::cron]` | A mutation that runs on a schedule | Yes |
+| `#[btb::action]` | Calls the outside world (HTTPS requests), then writes the agreed result | Yes; validators agree on the response (see [Oracles](ORACLES.md)) |
+
+The same split as Convex: queries, mutations, scheduled functions and actions.
+
 ## Design rules (all languages)
 
 - **Deterministic.** No floats, no system time, no randomness outside a chain-provided source. The VM only implements the integer RISC-V instruction set.
@@ -107,7 +118,7 @@ let moon = token::create(TokenSpec {
 
 ## Built for AI agents too
 
-Because every app follows the same layout and the same three function kinds (query, mutation, cron), an AI coding agent can read a BTB project and know exactly where data is defined, what can change state and what runs on a schedule. The repository includes an [AGENTS.md](../AGENTS.md) describing these conventions for any agent working on the codebase.
+Because every app follows the same layout and the same four function kinds (query, mutation, cron, action), an AI coding agent can read a BTB project and know exactly where data is defined, what can change state, what runs on a schedule and what talks to the outside world. The repository includes an [AGENTS.md](../AGENTS.md) describing these conventions for any agent working on the codebase.
 
 ## How it compiles
 

@@ -80,7 +80,7 @@ Everything that makes BTB a decentralized cloud.
 - [ ] Fee split for mutations (executor / relay host)
 - [ ] Erasure-coded blob storage for large files
 - [ ] Native DEX module with batch auctions (front-running protection)
-- [ ] Validator-agreed oracle for outside data
+- [ ] Oracles ([design](docs/ORACLES.md)): threshold-BLS randomness beacon, built-in price feeds, HTTPS actions with transforms, signed reports for other chains
 - [ ] Cross-chain: threshold signatures and native-asset vaults (Ethereum, Bitcoin, Solana)
 
 **Gate:** a full DEX runs end to end on testnet, frontend included.

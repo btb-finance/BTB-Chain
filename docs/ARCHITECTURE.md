@@ -70,7 +70,7 @@ BTB state is a database, not a raw key-value store.
 | Hosting | Frontend files stored by contracts, served over HTTP by hosting nodes. |
 | Blob storage | Large files split across many nodes with erasure coding; only the hash is on-chain. |
 | Storage deposits | BTB locked per byte stored, refunded on delete. Prevents state bloat. |
-| Outside data | Validator-agreed oracle mechanism keeps execution deterministic. |
+| Oracles | Randomness from a threshold-BLS beacon each block; price feeds written to a system table by median of validator reports; HTTPS actions agreed by validators through transform functions. See [ORACLES.md](ORACLES.md). |
 
 ## Front-running protection
 

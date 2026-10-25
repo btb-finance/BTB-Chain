@@ -19,6 +19,7 @@ On most chains, the chain cannot answer basic questions like "who holds this NFT
 - **On-chain hosting** — frontends are served by the network itself.
 - **Native tokens** — creating a token is one built-in call; every wallet, explorer and DEX sees it automatically.
 - **Cross-chain by signature** — BTB contracts can read and write Ethereum, Bitcoin, Solana and more without deploying contracts there.
+- **Oracles built in** — verifiable randomness, live price feeds and web data come from the validators themselves; no separate oracle network needed.
 
 ## At a glance
 
@@ -81,7 +82,7 @@ const price = useQuery(api.pools.price, { pool: 7 }); // live, no polling
 const swap  = useMutation(api.pools.swap);
 ```
 
-The same three function kinds (query, mutation, cron) in every app make BTB projects easy for both humans and AI agents to understand. See [AGENTS.md](AGENTS.md).
+The same four function kinds (query, mutation, cron, action) in every app make BTB projects easy for both humans and AI agents to understand. See [AGENTS.md](AGENTS.md).
 
 ## Roadmap
 
@@ -91,7 +92,7 @@ The same three function kinds (query, mutation, cron) in every app make BTB proj
 | 2 | State database: tables, indexes, queries, subscriptions | Query by index and watch a UI update live |
 | 3 | Single-node devnet: `btb` CLI, TypeScript SDK, dashboard | An outside developer ships a working app and it feels like Convex |
 | 4 | Multi-validator testnet: consensus, networking, parallel execution | Testnet keeps finalizing when validators fail |
-| 5 | Platform: cron, hosting nodes, payment channels, native tokens, DEX, cross-chain | A full DEX runs end to end on testnet, frontend included |
+| 5 | Platform: cron, hosting nodes, payment channels, native tokens, DEX, oracles, cross-chain | A full DEX runs end to end on testnet, frontend included |
 | 6 | Mainnet: audits, fixed 1B BTB genesis, operator onboarding | — |
 
 Full details: [ROADMAP.md](ROADMAP.md).
@@ -102,7 +103,8 @@ Full details: [ROADMAP.md](ROADMAP.md).
 - [Languages](docs/LANGUAGE.md) — Rust SDK, any language via RISC-V, Convex-style project layout
 - [Tokenomics](docs/TOKENOMICS.md) — fixed supply, fees, payment channels
 - [Cross-chain](docs/CROSS_CHAIN.md) — chain signatures and native-asset vaults
-- [Prior art](docs/PRIOR_ART.md) — what BTB learns from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM and THORChain, in detail
+- [Oracles](docs/ORACLES.md) — randomness, price feeds and web data built into the validator set
+- [Prior art](docs/PRIOR_ART.md) — what BTB learns from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain and Chainlink, in detail
 - [AGENTS.md](AGENTS.md) — conventions for AI agents and new contributors
 - [Roadmap](ROADMAP.md)
 

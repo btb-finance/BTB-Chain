@@ -19,7 +19,8 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/LANGUAGE.md` | Contract languages, Rust SDK, project layout |
 | `docs/TOKENOMICS.md` | Fixed 1B BTB supply, fees, payment channels |
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
-| `docs/PRIOR_ART.md` | What BTB takes from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain |
+| `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |
+| `docs/PRIOR_ART.md` | What BTB takes from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain, Chainlink |
 | `CONTRIBUTING.md` | How to contribute, including AI-assisted work |
 
 Planned code layout (from Phase 1):
@@ -35,7 +36,8 @@ crates/
 
 ## Core concepts to keep consistent
 
-- **Three function kinds:** `query` (read-only, no consensus, subscribable), `mutation` (changes state, consensus, gas), `cron` (scheduled mutation). Never let a query write state.
+- **Four function kinds:** `query` (read-only, no consensus, subscribable), `mutation` (changes state, consensus, gas), `cron` (scheduled mutation), `action` (outside HTTPS call whose result validators agree on). Never let a query write state or use randomness.
+- **Randomness:** only from the chain's threshold beacon, only in mutations and crons marked `randomness`, never callable by other contracts.
 - **Determinism:** nothing that affects consensus may use floats, system time, thread scheduling or unseeded randomness. The VM implements only integer RISC-V (rv64im).
 - **Gas:** every instruction and every host call costs gas. New host calls must define their gas cost.
 - **Fixed supply:** 1,000,000,000 BTB, never minted after genesis. No design may introduce inflation.

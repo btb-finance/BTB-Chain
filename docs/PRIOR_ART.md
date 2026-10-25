@@ -12,6 +12,7 @@ The short version:
 | [Sui and Aptos](#sui-and-aptos) | High-throughput Move-based L1s | Owned-object fast path, Block-STM parallel execution, money-safe types |
 | [Nervos CKB and PolkaVM](#nervos-ckb-and-polkavm) | Production RISC-V virtual machines | RISC-V as the contract target, recompilation to native code |
 | [THORChain](#thorchain) | Native cross-chain swap network | Validator-controlled vaults holding real assets on other chains |
+| [Chainlink and randomness beacons](#chainlink-and-randomness-beacons) | Oracle networks for prices, randomness and web data | Price feeds, verifiable randomness and web requests, built into the validator set |
 
 ---
 
@@ -186,6 +187,36 @@ The short version:
 
 ---
 
+## Chainlink and randomness beacons
+
+**What they are.** Blockchains can't see the outside world: a contract can't look up a price, and it can't produce a random number, because every validator must get the same result. *Oracles* fill that gap. Chainlink is the largest oracle network; randomness beacons such as drand, and the built-in beacons of the Internet Computer and Aptos, solve the randomness half.
+
+**How they work.**
+
+- **Chainlink Data Feeds.** Independent node operators each fetch a price from several data sources and report it; the network aggregates the reports (taking the median) and writes the result to a contract on each supported chain. Feeds update when the price moves past a deviation threshold or when a heartbeat interval passes.
+- **Chainlink VRF.** A contract requests a random number; a Chainlink node generates it together with a cryptographic proof that it was computed correctly, and the contract verifies the proof before using it.
+- **Chainlink Functions and Automation.** Functions runs custom code that calls web APIs across many nodes and aggregates the results; Automation triggers contract functions on a schedule or condition.
+- **Randomness beacons.** drand (used by Filecoin and others) is run by a group of organizations that jointly produce a threshold BLS signature every round; the signature is unpredictable until enough members sign, and verifiable by anyone. The Internet Computer and Aptos produce randomness the same way inside their own validator sets, so contracts get it natively, with no outside request.
+- **Low-latency feeds.** Newer designs (Chainlink Data Streams, Pyth) publish signed prices off-chain at high frequency and let apps pull the latest signed value into a transaction only when they need it.
+
+**What BTB takes.**
+
+- Median aggregation over many independent sources, with deviation and heartbeat update rules.
+- Threshold-signature randomness produced by the validators themselves, like ICP and Aptos, so contracts get randomness with no extra request round-trip.
+- Web requests agreed by many nodes, through transform functions (as in ICP's HTTPS outcalls).
+- Signed reports that other chains can verify, so BTB can serve its data beyond its own chain.
+
+**What BTB does differently.**
+
+- **No separate network.** The same validators that run consensus provide prices, randomness and web data. There is no second token or second set of operators to trust, and no per-request fee to an outside network.
+- **Feeds are tables.** Prices live in a system table that apps query and subscribe to like any other data, so a frontend gets live prices with one `useQuery` call.
+- **Automation is already built in** through `@cron` and scheduled functions.
+- **Trade-off:** the oracle is exactly as decentralized as BTB's validator set. A chain with few validators has a weaker oracle; Chainlink spreads the work across operators independent of any one chain.
+
+See [ORACLES.md](ORACLES.md) for BTB's full oracle design.
+
+---
+
 ## Putting it together
 
 BTB Chain's bet is that these ideas, each proven separately, have never been combined into one platform:
@@ -196,5 +227,6 @@ BTB Chain's bet is that these ideas, each proven separately, have never been com
 - **Sui's and Aptos's** fast path, parallel execution and money-safe types
 - **CKB's and PolkaVM's** RISC-V execution, open to any language
 - **THORChain's** native cross-chain vaults
+- **Chainlink's, ICP's and Aptos's** oracle and randomness designs, built into the validator set
 
 all on a fixed supply of 1,000,000,000 BTB, where every request pays the node that serves it.

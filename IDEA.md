@@ -53,6 +53,7 @@ On BTB, **the chain is the backend**:
 - **Free, instant queries and live updates.** Hosting nodes answer reads and push changes to your UI. No RPC subscription.
 - **Cron jobs on-chain.** Contracts schedule their own work. No backend servers.
 - **Frontends hosted on-chain.** Deploy your website with your contracts. No AWS.
+- **Oracles built in.** Random numbers, live prices and web data come straight from BTB's validators, which already run servers and reach agreement. No separate oracle network and no oracle fees per request. ([Oracles](docs/ORACLES.md))
 
 One command deploys everything:
 
