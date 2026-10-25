@@ -12,6 +12,7 @@
 //! and pays for the gas it used.
 
 use crate::block::{tx_root, Block};
+use crate::parallel::{self, ParResult, ParStats};
 use crate::staking::{self, Fail, StakeError};
 use crate::state::{
     contract_key, cron_key, meta_head_key, money, nonce_key, read_u64, register_manifest,
@@ -252,12 +253,20 @@ fn load_contract(
 type RunResult = (u64, Result<(Vec<u8>, WriteBatch), Revert>);
 
 /// Everything one block execution reads and writes before the atomic commit.
-struct Ctx<'a, S: KvStore> {
-    overlay: Overlay<'a, S>,
-    tables: btb_runtime::Tables,
-    cache: &'a mut BTreeMap<Hash, Arc<Contract>>,
-    cfg: ChainConfig,
-    height: u64,
+pub(crate) struct Ctx<'a, S: KvStore> {
+    pub(crate) overlay: Overlay<'a, S>,
+    pub(crate) tables: btb_runtime::Tables,
+    pub(crate) cache: &'a mut BTreeMap<Hash, Arc<Contract>>,
+    pub(crate) cfg: ChainConfig,
+    pub(crate) height: u64,
+    /// Parallel mode: `charge` only debits the payer; the pool credits are summed from the
+    /// receipts and applied once after the transactions (they commute, so the result is the
+    /// same, and no two transactions conflict on the pool balances).
+    pub(crate) defer_fees: bool,
+    /// Parallel mode: register a called contract's tables from its manifest before the call
+    /// (the shared registry cannot be mutated by concurrent deploys).
+    pub(crate) lazy_tables: bool,
+    pub(crate) registered: std::collections::BTreeSet<Address>,
 }
 
 /// What running a transaction body did.
@@ -304,6 +313,9 @@ impl<S: KvStore> Ctx<'_, S> {
             return Ok(());
         }
         self.debit(payer, fee)?;
+        if self.defer_fees {
+            return Ok(());
+        }
         let relay_part = if relay {
             (u128::from(fee) * u128::from(RELAY_SHARE_BPS) / 10_000) as u64
         } else {
@@ -475,6 +487,11 @@ impl<S: KvStore> Ctx<'_, S> {
                 result: Err(Revert::NoSuchContract),
             });
         };
+        if self.lazy_tables && self.registered.insert(*contract) {
+            if let Err(m) = register_manifest(&mut self.tables, *contract, &rec.manifest) {
+                return Err(StateError(format!("stored manifest invalid: {m}")));
+            }
+        }
         let (used, res) = self.run_contract(
             &rec,
             *contract,
@@ -502,7 +519,7 @@ impl<S: KvStore> Ctx<'_, S> {
         })
     }
 
-    fn apply_tx(&mut self, tx: &Transaction) -> Result<Receipt, StateError> {
+    pub(crate) fn apply_tx(&mut self, tx: &Transaction) -> Result<Receipt, StateError> {
         let id = tx.id();
         let sender = tx.sender();
         let origin = Origin::Tx { sender };
@@ -714,23 +731,66 @@ impl<S: KvStore> Ctx<'_, S> {
     }
 }
 
+/// How the transactions of a block are executed. Both modes give byte-identical receipts,
+/// state roots, fees and state; `Sequential` is the reference (the oracle the parallel mode is
+/// tested against). Crons and the epoch / staking end-of-block logic always run sequentially,
+/// after the transactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMode {
+    Sequential,
+    /// Block-STM style speculative execution on `threads` workers (`0` = one per CPU).
+    /// Blocks smaller than `Executor::parallel_min_txs`, and stores that cannot be shared between
+    /// threads (`KvStore::as_sync` is `None`), run sequentially.
+    Parallel {
+        threads: usize,
+    },
+}
+
 /// Applies blocks to a `ChainState`.
 #[derive(Debug, Clone, Copy)]
 pub struct Executor {
     /// Re-sum every balance and deposit after each block (O(accounts)). On by default; it is
     /// the supply invariant check, so only turn it off for benchmarks.
     pub check_supply: bool,
+    pub mode: ExecMode,
+    /// In parallel mode, run statically confined transactions (see `docs/CHAIN.md`) without
+    /// conflict tracking.
+    pub fast_path: bool,
+    /// Blocks with fewer transactions run sequentially even in parallel mode (starting threads
+    /// costs more than it saves). Default 16; the result is the same either way.
+    pub parallel_min_txs: usize,
 }
 
 impl Default for Executor {
     fn default() -> Self {
-        Executor { check_supply: true }
+        Executor {
+            check_supply: true,
+            mode: ExecMode::Parallel { threads: 0 },
+            fast_path: true,
+            parallel_min_txs: 16,
+        }
     }
 }
 
 impl Executor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The reference executor.
+    pub fn sequential() -> Self {
+        Executor {
+            mode: ExecMode::Sequential,
+            ..Self::default()
+        }
+    }
+
+    /// Parallel executor on `threads` workers (`0` = one per CPU).
+    pub fn parallel(threads: usize) -> Self {
+        Executor {
+            mode: ExecMode::Parallel { threads },
+            ..Self::default()
+        }
     }
 
     /// Execute `block` on top of the state's head. Returns one receipt per transaction in
@@ -740,6 +800,17 @@ impl Executor {
         state: &mut ChainState<S>,
         block: &Block,
     ) -> Result<(Vec<Receipt>, Hash), BlockError> {
+        self.execute_block_stats(state, block)
+            .map(|(r, root, _)| (r, root))
+    }
+
+    /// `execute_block`, also reporting what the parallel phase did (`None`: it did not run,
+    /// the block was executed sequentially from the start).
+    pub fn execute_block_stats<S: KvStore>(
+        &self,
+        state: &mut ChainState<S>,
+        block: &Block,
+    ) -> Result<(Vec<Receipt>, Hash, Option<ParStats>), BlockError> {
         let ChainState {
             kv,
             tables,
@@ -790,11 +861,64 @@ impl Executor {
             cache: code_cache,
             cfg,
             height: h.height,
+            defer_fees: false,
+            lazy_tables: false,
+            registered: Default::default(),
         };
         let mut receipts = Vec::with_capacity(block.txs.len());
         staking::begin_block(&mut ctx.overlay, h.height)?;
-        for tx in &block.txs {
-            receipts.push(ctx.apply_tx(tx)?);
+        let mut stats = None;
+        let mut ran_parallel = false;
+        let threads = match self.mode {
+            ExecMode::Parallel { threads } if block.txs.len() >= self.parallel_min_txs.max(2) => {
+                Some(if threads == 0 {
+                    std::thread::available_parallelism().map_or(1, |n| n.get())
+                } else {
+                    threads
+                })
+            }
+            _ => None,
+        };
+        if let (Some(threads), Some(sync_kv)) = (threads, kv.as_sync()) {
+            let pre: Vec<(Vec<u8>, Option<Vec<u8>>)> = ctx
+                .overlay
+                .pending()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            match parallel::run(
+                sync_kv,
+                &pre,
+                &block.txs,
+                cfg,
+                h.height,
+                ctx.cache,
+                threads,
+                self.fast_path,
+            ) {
+                ParResult::Done(out) => {
+                    let out = *out;
+                    ctx.overlay.commit(out.writes)?;
+                    if out.any_fee {
+                        ctx.credit(&relay_pool(), out.relay)?;
+                        ctx.credit(&validator_pool(), out.validator)?;
+                    }
+                    for (addr, manifest) in &out.deploys {
+                        register_manifest(&mut ctx.tables, *addr, manifest)
+                            .map_err(|m| StateError(format!("redeploy registration: {m}")))?;
+                    }
+                    ctx.cache.extend(out.cache);
+                    receipts = out.receipts;
+                    stats = Some(out.stats);
+                    ran_parallel = true;
+                }
+                ParResult::Fallback(s) => stats = Some(s),
+                ParResult::Err(e) => return Err(e),
+            }
+        }
+        if !ran_parallel {
+            for tx in &block.txs {
+                receipts.push(ctx.apply_tx(tx)?);
+            }
         }
         ctx.run_crons(&mut receipts)?;
         staking::end_block(&mut ctx.overlay, &cfg.staking, h.height, h.hash())?;
@@ -830,7 +954,7 @@ impl Executor {
         }
         kv.commit(batch)?;
         *tables = new_tables;
-        Ok((receipts, new_root))
+        Ok((receipts, new_root, stats))
     }
 
     /// Run a query locally against the head state (no consensus, nothing is written). Returns

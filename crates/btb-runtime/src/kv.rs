@@ -72,6 +72,13 @@ pub trait KvStore {
     /// Apply every op atomically.
     fn commit(&mut self, batch: WriteBatch) -> Result<(), KvError>;
 
+    /// This store as a shareable read-only view, if it can be read from several threads at
+    /// once (`MemKv`, `RocksKv`). The parallel block executor needs it; stores that return
+    /// `None` (the default, e.g. `Overlay`) are executed sequentially.
+    fn as_sync(&self) -> Option<&(dyn KvStore + Sync)> {
+        None
+    }
+
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
         let mut b = WriteBatch::new();
         b.put(key.to_vec(), value.to_vec());
@@ -120,6 +127,10 @@ fn range_scan<'a>(
 }
 
 impl KvStore for MemKv {
+    fn as_sync(&self) -> Option<&(dyn KvStore + Sync)> {
+        Some(self)
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         Ok(self.map.get(key).cloned())
     }

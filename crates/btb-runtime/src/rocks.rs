@@ -26,6 +26,10 @@ impl RocksKv {
 }
 
 impl KvStore for RocksKv {
+    fn as_sync(&self) -> Option<&(dyn KvStore + Sync)> {
+        Some(self)
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         self.db.get(key).map_err(err)
     }

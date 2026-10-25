@@ -12,11 +12,18 @@
 use btb_chain::exec::check_static;
 use btb_chain::{ChainConfig, Transaction};
 use btb_codec::{Decode, Encode, Reader};
-use btb_consensus::Message;
+use btb_consensus::{Block, Message, QuorumCert};
 use std::collections::BTreeSet;
 
 pub const KIND_CONSENSUS: u8 = 1;
 pub const KIND_TX: u8 = 2;
+/// Block sync request: `from_height:u64`.
+pub const KIND_SYNC_REQ: u8 = 3;
+/// Block sync response: see `SyncResponse`.
+pub const KIND_SYNC_RESP: u8 = 4;
+
+/// Most consensus blocks in one sync response (committed blocks plus the blocks that prove them).
+pub const MAX_SYNC_CHAIN: usize = 24;
 
 /// Largest frame accepted from a peer. A sync response carries up to 64 blocks of at most
 /// `MAX_PAYLOAD` bytes each.
@@ -48,6 +55,77 @@ pub fn tx_frame(tx: &Transaction) -> Vec<u8> {
 pub enum Inbound {
     Consensus(u64, Box<Message>),
     Tx(Vec<u8>),
+    /// Ask for committed blocks starting at this height.
+    SyncReq(u64),
+    SyncResp(Box<SyncResponse>),
+}
+
+/// Answer to a block sync request: consecutive consensus blocks of one epoch, oldest first,
+/// and optionally a quorum certificate for the last of them. Whether the leading blocks are
+/// committed is proven by the blocks that follow them (see `sync::verify`), never by trust.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncResponse {
+    pub epoch: u64,
+    pub blocks: Vec<Block>,
+    pub qc: Option<QuorumCert>,
+}
+
+impl SyncResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut o = self.epoch.to_le_bytes().to_vec();
+        let blocks = Message::SyncResponse {
+            blocks: self.blocks.clone(),
+        }
+        .encode();
+        o.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        o.extend_from_slice(&blocks);
+        match &self.qc {
+            Some(qc) => {
+                o.push(1);
+                o.extend_from_slice(
+                    &Message::Catchup {
+                        qc: qc.clone(),
+                        tc: None,
+                    }
+                    .encode(),
+                );
+            }
+            None => o.push(0),
+        }
+        o
+    }
+
+    /// Total decoder: `None` for anything truncated, oversize or with trailing bytes.
+    pub fn decode(data: &[u8]) -> Option<SyncResponse> {
+        let epoch = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+        let n = u32::from_le_bytes(data.get(8..12)?.try_into().ok()?) as usize;
+        let rest = data.get(12..)?;
+        let blocks = rest.get(..n)?;
+        let Message::SyncResponse { blocks } = Message::decode(blocks)? else {
+            return None;
+        };
+        if blocks.len() > MAX_SYNC_CHAIN {
+            return None;
+        }
+        let tail = rest.get(n..)?;
+        let qc = match *tail.first()? {
+            0 if tail.len() == 1 => None,
+            1 => match Message::decode(&tail[1..])? {
+                Message::Catchup { qc, tc: None } => Some(qc),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(SyncResponse { epoch, blocks, qc })
+    }
+}
+
+pub fn sync_request_frame(from_height: u64) -> Vec<u8> {
+    frame(KIND_SYNC_REQ, &from_height.to_le_bytes())
+}
+
+pub fn sync_response_frame(r: &SyncResponse) -> Vec<u8> {
+    frame(KIND_SYNC_RESP, &r.encode())
 }
 
 /// `None` for anything malformed (unknown kind, oversize, undecodable message).
@@ -63,6 +141,10 @@ pub fn parse_frame(data: &[u8]) -> Option<Inbound> {
         KIND_TX if data.len() - 1 <= btb_chain::tx::MAX_CODE_BYTES + 4096 => {
             Some(Inbound::Tx(data[1..].to_vec()))
         }
+        KIND_SYNC_REQ if data.len() == 9 => Some(Inbound::SyncReq(u64::from_le_bytes(
+            data[1..9].try_into().ok()?,
+        ))),
+        KIND_SYNC_RESP => SyncResponse::decode(&data[1..]).map(|r| Inbound::SyncResp(Box::new(r))),
         _ => None,
     }
 }
@@ -193,5 +275,53 @@ mod tests {
         junk.extend_from_slice(&[0xff; 64]);
         assert!(parse_frame(&junk).is_none());
         assert!(parse_frame(&vec![KIND_TX; MAX_FRAME + 1]).is_none());
+        // Sync frames: wrong request length, junk and truncated responses.
+        assert!(parse_frame(&[KIND_SYNC_REQ, 1, 2]).is_none());
+        assert!(matches!(
+            parse_frame(&sync_request_frame(5)),
+            Some(Inbound::SyncReq(5))
+        ));
+        assert!(parse_frame(&[KIND_SYNC_RESP]).is_none());
+        assert!(parse_frame(&[KIND_SYNC_RESP; 40]).is_none());
+    }
+
+    #[test]
+    fn sync_response_roundtrip_and_truncation() {
+        use btb_consensus::Sig;
+        let qc = QuorumCert {
+            round: 3,
+            block_id: [4; 32],
+            votes: vec![(0, Sig([1; 64])), (2, Sig([2; 64]))],
+        };
+        let block = Block {
+            round: 3,
+            height: 9,
+            parent: [4; 32],
+            justify: qc.clone(),
+            proposer: 1,
+            payload_hash: Block::hash_payload(&[7, 7]),
+            payload: vec![7, 7],
+        };
+        let r = SyncResponse {
+            epoch: 2,
+            blocks: vec![block.clone(), block],
+            qc: Some(qc),
+        };
+        let bytes = r.encode();
+        assert_eq!(SyncResponse::decode(&bytes), Some(r.clone()));
+        // Every strict prefix is rejected, and so is a trailing byte.
+        for cut in 0..bytes.len() {
+            assert!(SyncResponse::decode(&bytes[..cut]).is_none(), "cut {cut}");
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(SyncResponse::decode(&extra).is_none());
+        // Too many blocks.
+        let big = SyncResponse {
+            epoch: 0,
+            blocks: vec![r.blocks[0].clone(); MAX_SYNC_CHAIN + 1],
+            qc: None,
+        };
+        assert!(SyncResponse::decode(&big.encode()).is_none());
     }
 }

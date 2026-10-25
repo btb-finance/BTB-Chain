@@ -140,11 +140,52 @@ hash   = SHA256("btb.block.v1" || height || parent_hash || timestamp || state_ro
 ## Execution order
 
 1. Header checks.
-2. The transactions, one at a time, in block order, each seeing the effects of the earlier ones (parallel execution is a later step). One overlay holds the block's writes.
-3. The due crons, as system transactions.
+2. The transactions, in block order, each seeing the effects of the earlier ones. `ExecMode::Sequential` runs them one at a time in one overlay (the reference); `ExecMode::Parallel` (the default) runs them speculatively on several threads with the same result, see [Parallel execution](#parallel-execution). One overlay holds the block's writes.
+3. The due crons, as system transactions. Always sequential, after all transactions.
 4. The new head, then the supply check, then the Merkle root, then one atomic commit.
 
 Contract code runs in `btb-vm` with the call's gas limit. A reverted call's writes (storage, tables, deposit moves, token moves) are dropped as a whole.
+
+## Parallel execution
+
+`Executor::new()` runs the transactions of a block in parallel (Block-STM style); `Executor::sequential()` is the plain loop. **The two are byte-identical** in receipts (status, gas, fee, output), state root and every stored byte, for every block, whatever the thread count or timing. The sequential executor is the oracle: `tests/parallel.rs` runs random blocks on it and on 1, 2, 4 and 8 workers (and a second 4-worker run, and one without the fast path) and compares receipts, roots and finally the whole store. `Executor { mode: ExecMode::Parallel { threads }, fast_path, .. }` selects it (`threads = 0`: one per CPU). Blocks smaller than `parallel_min_txs` (default 16; thread start-up costs more than it saves), and stores that cannot be read from several threads (`KvStore::as_sync()` is `None`, e.g. an `Overlay`), run sequentially. `execute_block_stats` also reports what happened (`ParStats`).
+
+**Order of a block, parallel.** 1. `begin_block` (sequential, its writes are index 0 of the multi-version memory). 2. The transactions, in parallel. 3. Pool credits (below). 4. **Crons, `end_block` (epochs, rewards, set rotation), the head, the supply check and the Merkle root stay sequential**, on the merged result: they are few, order-dependent and touch shared staking state.
+
+**Engine** (`src/parallel.rs`):
+
+- *Multi-version memory.* Every speculative write is stored under `(key, tx index, incarnation)`; a transaction reads the latest write of a lower index, else the committed state. Scans merge the same way.
+- *Speculation.* Workers run the unchanged `apply_tx` against that view; each read is logged (point reads with the version seen, scans with their result).
+- *Validation and re-execution.* A transaction is valid if every logged read still returns what it saw. An invalid one has its writes marked `ESTIMATE` and runs again with a new incarnation; a reader that meets an estimate waits for the (lower-index, already claimed) writer instead of reading a value about to change. Transactions above a failed one that read what it wrote are re-executed in the same wave. Waves repeat until a validation pass fails nothing; then every transaction has read exactly what the sequential order gives it, so by induction on the index its outputs are the sequential ones. The commit is the highest-index write per key, in block order, independent of thread timing.
+- *Errors.* A state fault inside a speculative run is just a result that is validated like any other; the lowest-index genuine fault is returned as the block error, as the sequential loop would.
+
+**Fee pools.** Every transaction would credit the validator and relay pool balances and so conflict with all others. Those credits commute, so in parallel mode each transaction only debits its sender, and the sums (computed from the receipts, same 80/20 split) are credited once after the transactions. This is invisible unless something reads or writes a pool balance (a transfer to a pool address, a contract asking for its balance): if any final execution does, the block is re-run sequentially.
+
+**Deploys.** Tables are registered per worker from the stored manifest of the contract being called; the shared registry is updated after the block from the successful deploys, in block order.
+
+### Owner-only fast path (execution level)
+
+A transaction's *account footprint* is known from the transaction alone: `Transfer` touches the sender and the recipient, `Deploy` the sender and the new contract address, `Stake`/`Unstake`/`RegisterValidator` the sender, `SubmitEvidence` the sender and the slash vault, `Call` the sender and the contract. Transactions that share an account are joined into components. A component is **confined** (owner-only) when it contains only `Transfer`s and none of its accounts is a fee pool or the slash vault: everything it reads or writes is the nonce and balance of its own accounts. Confined components are independent of each other and of every other transaction, so each runs on one worker in block order, directly on the committed state, with no multi-version memory, no read tracking for scheduling and no validation. (Plain `Transfer` touches two accounts, so "owner-only" here means "closed over a known set of accounts", not "one account".)
+
+Because a contract call can move tokens to or read the balance of any account, the footprint of a `Call` is only a lower bound. The fast path therefore checks itself after the run: each confined transaction must have read and written only its footprint keys, and no dynamic transaction may have read or written (or scanned over) a confined account. If either fails, or a pool is touched, the block runs sequentially. Fallback depends only on the block and the state, so every node takes the same path and the result is the same anyway.
+
+### Relation to the consensus fast path
+
+[ARCHITECTURE.md](ARCHITECTURE.md) describes a *consensus* fast path: transactions on one user's own data confirm with validator signatures but without global ordering. That is **not built** (future work). This execution-level path only schedules transactions inside an already ordered block; it does not change what consensus orders or when a transaction is final. The same footprint rule is what a consensus-level fast path would need to decide which transactions may skip ordering, and receiving a transfer (recipient is a shared account) would still need care there.
+
+### Measured
+
+`cargo test --release -p btb-chain --test parallel_bench -- --ignored --nocapture` (4 CPUs, MemKv, 4000 txs per block, signature checks included, tx/s):
+
+| workload | sequential | 2 workers | 4 workers |
+| --- | --- | --- | --- |
+| disjoint transfers (low conflict, fast path) | 16.4k | 34.6k (2.1x) | 41.0k (2.5x) |
+| disjoint transfers, fast path off | 16.4k | | 27.5k (1.7x) |
+| 7/8 transfers + 1/8 counter calls (low conflict) | 13.3k | 14.2k (1.07x) | 20.1k (1.5x) |
+| everyone pays one account (high conflict) | 16.2k | 1.0x | 1.0x (runs sequentially) |
+| everyone calls one counter (high conflict) | 5.2k | 0.7x | 1.0x |
+
+High-conflict blocks do not get faster (a dependency chain is sequential) but, thanks to waiting on estimates, do not get much slower either. The multi-version engine re-executes about twice per transaction in the worst case. These are single-machine numbers on a 4-core box, not a tuned result.
 
 ## Cron jobs
 
@@ -168,11 +209,11 @@ Cron receipts follow the transaction receipts; their id is `SHA256("btb.cron.v1"
 
 ## Determinism
 
-No floats, clocks, threads or hash-map iteration order reach state: balances and keys are integers and ordered maps, crons are scheduled by height, and the contract VM is rv64im only. The tests run the same block sequence on two fresh states and require identical receipts, roots and stored bytes, and (with `--features rocksdb`) the same results on RocksDB, including after a reopen.
+No floats, clocks, thread timing or hash-map iteration order reach state (parallel execution uses threads, but its result is fixed by the block order, see above): balances and keys are integers and ordered maps, crons are scheduled by height, and the contract VM is rv64im only. The tests run the same block sequence on two fresh states and require identical receipts, roots and stored bytes, and (with `--features rocksdb`) the same results on RocksDB, including after a reopen.
 
 ## Not done yet
 
-- Parallel (Block-STM style) execution and the fast path.
+- A consensus-level fast path (ordering-free confirmation of owner-only transactions), and parallel crons / end-of-block logic.
 - A fee market (a per-gas bid) and payout of the relay pool.
 - Delegation (stake behind someone else's validator), un-jailing, reward weighting by proposals and uptime, and slashing for downtime.
 - A storage deposit for contract code and for user-token records.

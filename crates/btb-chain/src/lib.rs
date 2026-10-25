@@ -9,13 +9,15 @@
 pub mod block;
 pub mod exec;
 pub mod mempool;
+pub(crate) mod parallel;
 pub mod staking;
 pub mod state;
 pub mod tx;
 
 pub use block::{Block, Header};
-pub use exec::{BlockError, Executor, Invalid, Origin, Receipt, Revert, Status};
+pub use exec::{BlockError, ExecMode, Executor, Invalid, Origin, Receipt, Revert, Status};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
+pub use parallel::ParStats;
 pub use staking::{
     ActiveValidator, EpochRecord, GenesisValidator, SlashOutcome, StakeError, StakingConfig,
     ValidatorInfo,

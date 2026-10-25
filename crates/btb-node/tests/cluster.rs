@@ -117,6 +117,8 @@ struct Cluster {
     timing: Timing,
     delay_ms: u64,
     faucet: Wallet,
+    /// Keep chain state and block history in RocksDB under the node's data dir.
+    disk: bool,
     // Last: nodes must stop before their data directory disappears.
     _dir: tempfile::TempDir,
 }
@@ -134,6 +136,17 @@ impl Drop for Cluster {
 impl Cluster {
     /// `total` validator keys; the first `running` are started as real nodes.
     fn new(total: usize, running: usize, timing: Timing, delay_ms: u64, epoch_len: u64) -> Cluster {
+        Self::new_with(total, running, timing, delay_ms, epoch_len, false)
+    }
+
+    fn new_with(
+        total: usize,
+        running: usize,
+        timing: Timing,
+        delay_ms: u64,
+        epoch_len: u64,
+        disk: bool,
+    ) -> Cluster {
         let keys: Vec<SigningKey> = (0..total).map(|i| key(10 + i as u8)).collect();
         let faucet = Wallet {
             key: key(99),
@@ -169,6 +182,7 @@ impl Cluster {
             timing,
             delay_ms,
             faucet,
+            disk,
         };
         for i in 0..running {
             c.start(i);
@@ -191,6 +205,16 @@ impl Cluster {
         p.data_dir = Some(self._dir.path().join(format!("node{i}")));
         p.timing = self.timing;
         p.test_one_way_delay_ms = self.delay_ms;
+        #[cfg(feature = "rocksdb")]
+        if self.disk {
+            let dir = self._dir.path().join(format!("node{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let kv = btb_runtime::rocks::RocksKv::open(dir.join("chain")).unwrap();
+            let state = open_chain(kv, &self.genesis).unwrap();
+            self.nodes[i] = Some(Node::start(p, state).unwrap());
+            return;
+        }
+        assert!(!self.disk, "disk clusters need --features rocksdb");
         let state = open_chain(self.kvs[i].clone(), &self.genesis).unwrap();
         self.nodes[i] = Some(Node::start(p, state).unwrap());
     }
@@ -738,4 +762,383 @@ fn consensus_instances_rotate_every_epoch() {
     assert_eq!(ep["start_height"], 32);
     assert_eq!(ep["validators"].as_array().unwrap().len(), 4);
     assert_eq!(c.evidence_total(), 0);
+}
+
+fn epoch_of(c: &Cluster, i: usize) -> u64 {
+    c.status(i)["epoch"].as_u64().unwrap()
+}
+
+fn tx_ids_of(v: &Value) -> Vec<String> {
+    v["evidence_submitted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn double_voter_is_reported_slashed_jailed_and_rotated_out() {
+    let _g = serial();
+    let timing = Timing {
+        tick_ms: 10,
+        round_timeout_ms: 400,
+        idle_block_ms: 80,
+    };
+    // Validator 3 is the byzantine one: it votes twice in every round of epoch 0.
+    let mut c = Cluster::new(4, 3, timing, 0, 24);
+    let byz = Byzantine::start(&c, 3);
+    c.wait_connected(3);
+    let byz_key = hex::encode(&c.keys[3].verifying_key().to_bytes());
+
+    c.wait_until("a node to file SubmitEvidence", 30, || {
+        (0..3).any(|i| !tx_ids_of(&c.status(i)).is_empty())
+    });
+    // However many double votes follow, a node files at most one transaction for the offender.
+    std::thread::sleep(Duration::from_millis(800));
+    let mut filed = Vec::new();
+    for i in 0..3 {
+        let ids = tx_ids_of(&c.status(i));
+        assert!(ids.len() <= 1, "node {i} filed {} reports", ids.len());
+        filed.extend(ids);
+    }
+    println!(
+        "evidence transactions filed across 3 honest nodes: {}",
+        filed.len()
+    );
+    // The chain executed them; exactly one was accepted (one slash per operator per epoch).
+    let mut accepted = 0;
+    for id in &filed {
+        let id = hex::decode32(id).unwrap();
+        let r = c.receipt(0, &id);
+        if r["status"] == "success" {
+            accepted += 1;
+        } else {
+            assert_eq!(r["status"], "invalid", "{r}");
+        }
+    }
+    assert_eq!(accepted, 1, "exactly one report is accepted");
+
+    // Epoch 0 had four validators; epoch 1 drops the jailed one.
+    c.wait_until("epoch 1", 90, || epoch_of(&c, 0) >= 1);
+    let e0 = c.node(0).call("btb_getEpoch", json!([0])).unwrap();
+    assert_eq!(e0["validators"].as_array().unwrap().len(), 4);
+    let e1 = c.node(0).call("btb_getEpoch", json!([1])).unwrap();
+    let keys1: Vec<&str> = e1["validators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys1.len(), 3, "{keys1:?}");
+    assert!(
+        !keys1.contains(&byz_key.as_str()),
+        "offender still in epoch 1"
+    );
+
+    // Finality continues in the new set, across another boundary.
+    let bob = account_address(&key(77).verifying_key().to_bytes());
+    let mut k = 0u64;
+    while epoch_of(&c, 0) < 2 || k < 4 {
+        let via = (k % 3) as usize;
+        let id = c.send_transfer(via, bob, 10 + k);
+        assert_eq!(c.receipt(via, &id)["status"], "success");
+        k += 1;
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    c.assert_same_state();
+    drop(byz);
+}
+
+/// A tiny validator-keyed peer that is not a running node: it can send arbitrary frames and
+/// collects what it receives.
+struct RawPeer {
+    net: net::NetHandle,
+    rx: std::sync::mpsc::Receiver<([u8; 32], Inbound)>,
+    _rt: tokio::runtime::Runtime,
+}
+
+impl RawPeer {
+    fn start(c: &Cluster, index: usize) -> RawPeer {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink: net::Sink = Arc::new(move |from, m| {
+            let _ = tx.send((from, m));
+        });
+        let all = validators_keys(c);
+        let peers: Vec<([u8; 32], Multiaddr)> = (0..c.keys.len())
+            .filter(|j| *j != index)
+            .map(|j| (all[j], c.addr_of(j).parse().unwrap()))
+            .collect();
+        let net = net::start(
+            rt.handle(),
+            net::NetParams {
+                secret: c.keys[index].to_bytes(),
+                listen: format!("/ip4/127.0.0.1/udp/{}/quic-v1", c.ports[index])
+                    .parse()
+                    .unwrap(),
+                validators: all,
+                peers,
+                rate_per_sec: 1e9,
+                rate_burst: 1e9,
+                delay: Duration::ZERO,
+            },
+            sink,
+        )
+        .unwrap();
+        RawPeer { net, rx, _rt: rt }
+    }
+
+    /// The next sync response from `from`, ignoring other traffic.
+    fn sync_response(&self, from: &[u8; 32], secs: u64) -> Option<btb_node::wire::SyncResponse> {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if let Ok((f, Inbound::SyncResp(r))) = self.rx.recv_timeout(Duration::from_millis(50)) {
+                if f == *from {
+                    return Some(*r);
+                }
+            }
+        }
+        None
+    }
+}
+
+#[test]
+fn sync_server_proves_what_it_serves_and_ignores_forged_responses() {
+    use btb_node::sync::{verify, Expect};
+    use btb_node::wire::{sync_request_frame, sync_response_frame, SyncResponse};
+    let _g = serial();
+    let mut c = Cluster::new(4, 3, fast(), 0, 4);
+    let peer = RawPeer::start(&c, 3);
+    c.wait_connected(3);
+    c.wait_until("past the first epoch", 40, || c.height(0) >= 7);
+    let all = validators_keys(&c);
+
+    // The context a syncing node would derive for epoch 0 from its own state.
+    let ep = c.node(0).call("btb_getEpoch", json!([0])).unwrap();
+    let set = ValidatorSet::new(
+        ep["validators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| Validator {
+                key: hex::decode32(v["key"].as_str().unwrap()).unwrap(),
+                stake: v["stake"].as_str().unwrap().parse().unwrap(),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let anchor = hex::decode32(ep["anchor"].as_str().unwrap()).unwrap();
+    let ctx = Context::for_epoch(
+        &btb_chain::staking::consensus_chain_id(CHAIN_ID),
+        0,
+        set,
+        Some(anchor),
+    );
+    let expect = |first: u64, parent| Expect {
+        ctx: &ctx,
+        epoch: 0,
+        first_height: first,
+        parent,
+        end_height: 4,
+    };
+
+    // From height 1: the whole first epoch, closed by a proof, from every honest node.
+    for (target, key) in all.iter().enumerate().take(3) {
+        peer.net.send(*key, sync_request_frame(1));
+        let r = peer.sync_response(key, 10).expect("an answer");
+        assert_eq!(
+            verify(&r, &expect(1, anchor)),
+            Ok(4),
+            "node {target}: {r:?}"
+        );
+        // The wire encoding survives a round trip.
+        assert_eq!(SyncResponse::decode(&r.encode()), Some(r.clone()));
+    }
+    // From the middle of the epoch.
+    peer.net.send(all[0], sync_request_frame(1));
+    let first = peer.sync_response(&all[0], 10).unwrap();
+    peer.net.send(all[1], sync_request_frame(3));
+    let mid = peer.sync_response(&all[1], 10).unwrap();
+    assert_eq!(
+        verify(&mid, &expect(3, first.blocks[1].id())),
+        Ok(2),
+        "{mid:?}"
+    );
+    // Beyond the head, and height 0: an empty answer, not an error.
+    for h in [10_000u64, 0] {
+        peer.net.send(all[0], sync_request_frame(h));
+        let r = peer.sync_response(&all[0], 10).unwrap();
+        assert!(r.blocks.is_empty());
+    }
+    // A response tampered with in flight no longer verifies.
+    let mut forged = first.clone();
+    forged.qc.as_mut().expect("closing proof").votes[0].1 .0[0] ^= 1;
+    assert!(verify(&forged, &expect(1, anchor)).is_err());
+    let mut cut = first.clone();
+    cut.blocks[2].payload.push(1);
+    assert!(verify(&cut, &expect(1, anchor)).is_err());
+
+    // Unsolicited responses (forged, replayed, truncated, empty) are ignored by the nodes.
+    let junk = [
+        sync_response_frame(&first),
+        sync_response_frame(&forged),
+        sync_response_frame(&SyncResponse::default()),
+        sync_response_frame(&first)[..40].to_vec(),
+        vec![4u8; 5000],
+    ];
+    for j in junk {
+        for key in all.iter().take(3) {
+            peer.net.send(*key, j.clone());
+        }
+    }
+    c.wait_until("junk to be counted", 20, || {
+        (0..3).all(|i| c.status(i)["sync"]["unsolicited"].as_u64().unwrap() >= 3)
+    });
+    let before = c.height(0);
+    let id = c.send_transfer(1, account_address(&key(77).verifying_key().to_bytes()), 5);
+    assert_eq!(c.receipt(1, &id)["status"], "success");
+    assert!(c.height(0) >= before);
+    for i in 0..3 {
+        let st = c.status(i);
+        assert_eq!(st["sync"]["rejected"], 0);
+        assert_eq!(st["sync"]["blocks_synced"], 0, "nobody was behind");
+        assert!(st["net"]["dropped_malformed"].as_u64().unwrap() >= 2);
+    }
+    c.assert_same_state();
+}
+
+/// Node 3 is offline for many more epochs than peers keep consensus instances for and must
+/// catch up through block sync. With `disk`, state and history live in RocksDB.
+fn lagging_node_catches_up(disk: bool) {
+    let mut c = Cluster::new_with(4, 4, fast(), 0, 4, disk);
+    c.wait_connected(3);
+    let bob = account_address(&key(77).verifying_key().to_bytes());
+    let mut total = 0;
+    let id = c.send_transfer(0, bob, 1_000);
+    total += 1_000;
+    let early = c.receipt(0, &id);
+    assert_eq!(early["status"], "success");
+    c.wait_until("node 3 to see it", 20, || c.balance(3, &bob) == total);
+    let early_height = early["height"].as_u64().unwrap();
+    let early_block = c
+        .node(3)
+        .call("btb_getBlock", json!([early_height]))
+        .unwrap();
+    assert!(!early_block.is_null());
+
+    c.kill(3);
+    let e_kill = epoch_of(&c, 0);
+    let h_kill = c.height(0);
+    // 11 more epochs of 4 blocks with node 3 away; transactions along the way.
+    let t = Instant::now();
+    let mut k = 0u64;
+    while epoch_of(&c, 0) < e_kill + 11 {
+        let via = (k % 3) as usize;
+        let id = c.send_transfer(via, bob, 10 + k);
+        assert_eq!(c.receipt(via, &id)["status"], "success");
+        total += 10 + k;
+        k += 1;
+    }
+    println!(
+        "node 3 offline for {} epochs ({} blocks) in {} ms",
+        epoch_of(&c, 0) - e_kill,
+        c.height(0) - h_kill,
+        t.elapsed().as_millis()
+    );
+
+    c.start(3);
+    if disk {
+        // History from before the restart is there at once, from disk.
+        let b = c
+            .node(3)
+            .call("btb_getBlock", json!([early_height]))
+            .unwrap();
+        assert_eq!(b["hash"], early_block["hash"]);
+        let r = c
+            .node(3)
+            .call("btb_getReceipt", json!([early["id"]]))
+            .unwrap();
+        assert_eq!(r["status"], "success");
+    }
+    c.wait_connected(3);
+    c.wait_until("node 3 to catch up through block sync", 90, || {
+        c.height(3) + 3 >= c.height(0) && epoch_of(&c, 3) + 1 >= epoch_of(&c, 0)
+    });
+    let synced = c.status(3)["sync"]["blocks_synced"].as_u64().unwrap();
+    println!(
+        "node 3 block-synced {synced} blocks over {} epochs",
+        epoch_of(&c, 0) - e_kill
+    );
+    assert!(
+        synced >= 4 * 9,
+        "catching up more than 8 epochs needs block sync (synced {synced})"
+    );
+    assert_eq!(c.status(3)["sync"]["rejected"], 0);
+    c.wait_until("same balance", 20, || {
+        c.balance(3, &bob) == c.balance(0, &bob)
+    });
+    assert_eq!(c.balance(3, &bob), total);
+    c.assert_same_state();
+    // History: with RocksDB every height, also the ones before the restart, is on node 3.
+    let upto = c.height(3).min(c.height(0)).saturating_sub(1);
+    if disk {
+        for h in 1..=upto {
+            let a = c.node(3).call("btb_getBlock", json!([h])).unwrap();
+            let b = c.node(0).call("btb_getBlock", json!([h])).unwrap();
+            assert!(!a.is_null(), "block {h} missing on the restarted node");
+            assert_eq!(a["hash"], b["hash"], "block {h}");
+            assert_eq!(a["transactions"], b["transactions"], "block {h}");
+        }
+    } else {
+        // Synced heights are served; the memory store of the restarted node starts empty.
+        let h = h_kill + 5;
+        let a = c.node(3).call("btb_getBlock", json!([h])).unwrap();
+        let b = c.node(0).call("btb_getBlock", json!([h])).unwrap();
+        assert_eq!(a["hash"], b["hash"]);
+    }
+    // And it takes part again.
+    let id = c.send_transfer(3, bob, 7);
+    assert_eq!(c.receipt(3, &id)["status"], "success");
+    assert_eq!(c.evidence_total(), 0, "a long absence is not equivocation");
+    if disk {
+        // Whole network restart from disk: same chain, history intact, still live.
+        let h = c.height(0);
+        let hash = c.node(0).call("btb_getBlock", json!([h])).unwrap()["hash"].clone();
+        for i in 0..4 {
+            c.kill(i);
+        }
+        for i in 0..4 {
+            c.start(i);
+        }
+        c.wait_connected(3);
+        for i in 0..4 {
+            let b = c.node(i).call("btb_getBlock", json!([h])).unwrap();
+            assert_eq!(b["hash"], hash, "node {i} lost block {h}");
+        }
+        let id = c.send_transfer(2, bob, 9);
+        assert_eq!(c.receipt(2, &id)["status"], "success");
+        c.wait_until("everyone past the restart height", 60, || {
+            (0..4).all(|i| c.height(i) > h)
+        });
+        c.assert_same_state();
+        assert_eq!(c.evidence_total(), 0, "a restart is not equivocation");
+    }
+}
+
+#[test]
+fn node_offline_for_more_than_eight_epochs_catches_up_by_block_sync() {
+    let _g = serial();
+    lagging_node_catches_up(false);
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_nodes_restart_from_disk_and_a_lagging_one_block_syncs() {
+    let _g = serial();
+    lagging_node_catches_up(true);
 }

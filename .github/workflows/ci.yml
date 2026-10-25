@@ -87,11 +87,13 @@ jobs:
         run: |
           cargo clippy -p btb-runtime --features rocksdb --all-targets -- -D warnings
           cargo clippy -p btb-tests -p btb-dev --features btb-tests/rocksdb,btb-dev/rocksdb --all-targets -- -D warnings
+          cargo clippy -p btb-node --features rocksdb --all-targets -- -D warnings
 
       - name: Test (rocksdb feature)
         run: |
           cargo test -p btb-runtime --features rocksdb
           cargo test -p btb-tests --features rocksdb --test rocks
+          cargo test -p btb-node --features rocksdb -- --test-threads=1
 
   sdk-ts:
     runs-on: ubuntu-latest

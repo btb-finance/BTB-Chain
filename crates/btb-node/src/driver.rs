@@ -13,30 +13,58 @@
 //! Pacing. The replica proposes only when told to (`set_hold_empty_proposals`). The driver
 //! proposes at once when there are transactions, or when an earlier non-empty block still needs
 //! the next block's certificate to become final, and otherwise at most every `idle_block_ms`.
+//!
+//! Besides consensus the driver does three more jobs: it files `SubmitEvidence` transactions
+//! for double signing it catches (`queue_evidence`), it keeps the block history
+//! (`blockstore`), and it serves and uses block sync (`serve_sync`, `apply_sync`) so a node
+//! that is arbitrarily far behind can catch up from its peers' history.
 
+use crate::blockstore::{BlockStore, StoredBlock, StoredReceipt};
 use crate::config::NodeParams;
 use crate::hex;
 use crate::net::NetHandle;
 use crate::storage::{ExecLog, ExecMeta, FileSafety};
-use crate::wire::{consensus_frame, payload_ok, tx_frame, Batch, Inbound, MAX_PAYLOAD};
+use crate::sync::{self, Expect, SyncError};
+use crate::wire::{
+    consensus_frame, payload_ok, sync_request_frame, sync_response_frame, tx_frame, Batch, Inbound,
+    SyncResponse, MAX_PAYLOAD,
+};
 use btb_chain::{
-    Address, Block as ChainBlock, ChainState, Executor, Mempool, MempoolConfig, Receipt, Status,
-    Transaction,
+    account_address, Address, Block as ChainBlock, ChainState, Executor, Mempool, MempoolConfig,
+    Receipt, Status, Transaction, TxBody, TxKind,
 };
 use btb_consensus::{
-    Action, Anchor, Config as ConsensusConfig, Evidence, Hash, LeaderPolicy, MemoryStorage,
-    Message, Replica, SafetyStorage,
+    Action, Anchor, Block as ConsensusBlock, Config as ConsensusConfig, Context, Evidence, Hash,
+    LeaderPolicy, MemoryStorage, Message, QuorumCert, Replica, SafetyStorage,
 };
 use btb_runtime::KvStore;
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// How many recent blocks (and their receipts) the node keeps for the API.
+/// Heights of history an in-memory node keeps for the API and for serving block sync (a node
+/// with a RocksDB data directory keeps all of it).
 const KEEP_BLOCKS: usize = 4096;
+/// No commit for this long makes a node ask its peers for blocks.
+const SYNC_STALL: Duration = Duration::from_millis(1_000);
+/// Give up on a peer that has not answered a block request within this time.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Minimum spacing of block requests while stalled.
+const SYNC_GAP: Duration = Duration::from_millis(300);
+/// Consensus blocks of one epoch a response is built from (plus up to 2 proof blocks, and the
+/// epoch's closing proof of up to 3).
+const SYNC_RANGE: usize = 16;
+/// Epoch-tail blocks remembered while waiting for the certificate that closes an epoch.
+const MAX_TAILS: usize = 64;
+/// Validators file the same evidence one after the other, this far apart.
+const EVIDENCE_STAGGER: Duration = Duration::from_millis(150);
+/// A reported offence that is still unslashed after this long is given up on by this node.
+const EVIDENCE_GIVE_UP: Duration = Duration::from_secs(120);
+/// A `SubmitEvidence` seen from another node holds back our own for this long.
+const EVIDENCE_SEEN_HOLD: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct RpcError {
@@ -71,13 +99,24 @@ pub enum Input {
     Shutdown,
 }
 
-struct StoredBlock {
-    header: btb_chain::Header,
-    hash: Hash,
-    state_root_after: Hash,
-    consensus_round: u64,
-    tx_ids: Vec<Hash>,
-    receipts: Vec<Receipt>,
+#[derive(Default)]
+struct SyncState {
+    /// Which peer to ask next (index into the sorted peer list); moves on after a failure.
+    cursor: usize,
+    inflight: Option<(Instant, [u8; 32])>,
+    last_req: Option<Instant>,
+    requests: u64,
+    blocks: u64,
+    served: u64,
+    rejected: u64,
+    unsolicited: u64,
+}
+
+struct PendingEvidence {
+    epoch: u64,
+    ev: Evidence,
+    due: Instant,
+    give_up: Instant,
 }
 
 /// Ended consensus instances kept to help laggards finish their epoch.
@@ -107,8 +146,21 @@ struct Driver<S: KvStore> {
     idle_block: Duration,
     inflight_ttl: Duration,
 
-    blocks: BTreeMap<u64, StoredBlock>,
-    receipt_index: HashMap<Hash, (u64, usize)>,
+    store: BlockStore,
+    sync: SyncState,
+    /// Blocks just above an epoch's last height seen in proposals and sync answers, by epoch:
+    /// candidates for the certificate that finalizes the epoch's last block.
+    tails: Vec<(u64, ConsensusBlock)>,
+    /// Last blocks of epochs whose closing proof is not stored yet: (epoch, block).
+    proofs_wanted: Vec<(u64, ConsensusBlock)>,
+    reporter: SigningKey,
+    reporter_pending: Vec<Hash>,
+    evidence_queue: Vec<PendingEvidence>,
+    /// (epoch, offender index) pairs already queued: one report per offender and epoch.
+    evidence_handled: HashSet<(u64, u32)>,
+    /// Verified `SubmitEvidence` transactions seen from others, by (epoch, offender index).
+    evidence_seen: HashMap<(u64, u32), Instant>,
+    evidence_submitted: Vec<String>,
     submitted: HashMap<Hash, Instant>,
     latencies: VecDeque<u64>,
     /// (sender, nonce) of transactions seen in proposals that are not final yet.
@@ -159,6 +211,11 @@ impl<S: KvStore> Driver<S> {
             std::fs::create_dir_all(d).map_err(|e| format!("create {}: {e}", d.display()))?;
         }
         let exec_log = ExecLog::open(data.as_deref(), [0; 32], head_height)?;
+        let store = match &data {
+            #[cfg(feature = "rocksdb")]
+            Some(d) => BlockStore::disk(&d.join("blocks"))?,
+            _ => BlockStore::memory(KEEP_BLOCKS as u64),
+        };
         let chain_cfg = *state.config();
         let epoch = state.current_epoch().map_err(|e| e.to_string())?;
         let now = Instant::now();
@@ -182,8 +239,16 @@ impl<S: KvStore> Driver<S> {
             tick: Duration::from_millis(tick_ms),
             idle_block: Duration::from_millis(t.idle_block_ms),
             inflight_ttl: Duration::from_millis(t.round_timeout_ms.saturating_mul(2)),
-            blocks: BTreeMap::new(),
-            receipt_index: HashMap::new(),
+            store,
+            sync: SyncState::default(),
+            tails: Vec::new(),
+            proofs_wanted: Vec::new(),
+            reporter: p.reporter.clone().unwrap_or_else(|| p.key.clone()),
+            reporter_pending: Vec::new(),
+            evidence_queue: Vec::new(),
+            evidence_handled: HashSet::new(),
+            evidence_seen: HashMap::new(),
+            evidence_submitted: Vec::new(),
             submitted: HashMap::new(),
             latencies: VecDeque::new(),
             inflight: HashMap::new(),
@@ -263,25 +328,28 @@ impl<S: KvStore> Driver<S> {
         Ok(())
     }
 
-    /// After the last block of the epoch is executed, move to the next epoch's instance.
+    /// When the chain has moved past the running epoch (its last block was executed, by
+    /// the replica's own commit or through block sync), start the instance of the chain's
+    /// current epoch. A replica that finished its epoch stays as an ended instance to serve
+    /// laggards; one that block sync overtook is dropped.
     fn check_epoch_switch(&mut self) {
-        loop {
-            let ended = self.replica.as_ref().is_some_and(Replica::epoch_ended);
-            let head_epoch = self.state.current_epoch().unwrap_or(self.epoch);
-            if !(ended && head_epoch > self.epoch) {
-                return;
-            }
-            if let Some(r) = self.replica.take() {
+        let Ok(head_epoch) = self.state.current_epoch() else {
+            return;
+        };
+        if head_epoch <= self.epoch {
+            return;
+        }
+        if let Some(r) = self.replica.take() {
+            if r.epoch_ended() && head_epoch == self.epoch + 1 {
                 let keys = std::mem::take(&mut self.keys);
                 self.ended.insert(self.epoch, (r, keys));
                 while self.ended.len() > KEEP_ENDED_EPOCHS {
                     self.ended.pop_first();
                 }
             }
-            if let Err(e) = self.begin_epoch(self.epoch + 1) {
-                self.fatal = Some(e);
-                return;
-            }
+        }
+        if let Err(e) = self.begin_epoch(head_epoch) {
+            self.fatal = Some(e);
         }
     }
 
@@ -327,7 +395,14 @@ impl<S: KvStore> Driver<S> {
             self.apply(acts, e);
         }
         self.check_epoch_switch();
+        self.flush_evidence();
+        if !self.proofs_wanted.is_empty() {
+            self.resolve_proofs();
+        }
+        self.maybe_request_sync();
         let now = Instant::now();
+        self.evidence_seen
+            .retain(|_, t| now.duration_since(*t) < EVIDENCE_GIVE_UP);
         self.inflight
             .retain(|_, t| now.duration_since(*t) < self.inflight_ttl);
         if self.submitted.len() > 10_000 {
@@ -341,6 +416,26 @@ impl<S: KvStore> Driver<S> {
         match i {
             Input::Net(from, Inbound::Consensus(epoch, msg)) => {
                 let mut msg = *msg;
+                if epoch == self.epoch || self.ended.contains_key(&epoch) {
+                    self.note_tails(epoch, &msg);
+                }
+                let known = epoch == self.epoch || self.ended.contains_key(&epoch);
+                let sender = if epoch == self.epoch {
+                    self.keys.iter().position(|k| *k == from)
+                } else {
+                    self.ended
+                        .get(&epoch)
+                        .and_then(|(_, keys)| keys.iter().position(|k| *k == from))
+                };
+                if let (true, Some(idx), Message::SyncRequest { block_id, .. }) =
+                    (known, sender, &msg)
+                {
+                    self.answer_block_request(epoch, idx as u32, *block_id);
+                }
+                if let (true, Some(idx), Message::Propose(p)) = (epoch == self.epoch, sender, &msg)
+                {
+                    self.remember_proposal(idx as u32, &p.block);
+                }
                 if epoch == self.epoch {
                     let Some(idx) = self.keys.iter().position(|k| *k == from) else {
                         return;
@@ -371,6 +466,8 @@ impl<S: KvStore> Driver<S> {
             Input::Net(_, Inbound::Tx(bytes)) => {
                 let _ = self.add_tx(&bytes, None);
             }
+            Input::Net(from, Inbound::SyncReq(h)) => self.serve_sync(from, h),
+            Input::Net(from, Inbound::SyncResp(r)) => self.on_sync_response(from, *r),
             Input::Rpc {
                 method,
                 params,
@@ -396,6 +493,7 @@ impl<S: KvStore> Driver<S> {
             let now = Instant::now();
             for tx in &b.txs {
                 self.inflight.insert((tx.sender(), tx.body.nonce), now);
+                self.note_evidence_tx(tx);
             }
         }
     }
@@ -420,7 +518,10 @@ impl<S: KvStore> Driver<S> {
                 Action::Broadcast(msg) => {
                     if let (true, Message::Propose(p)) = (current, &msg) {
                         self.observe_payload(p.block.round, &p.block.payload);
+                        let me = self.index();
+                        self.remember_proposal(me, &p.block);
                     }
+                    self.note_tails(epoch, &msg);
                     self.net.broadcast(consensus_frame(epoch, &msg));
                 }
                 Action::Commit(block) => {
@@ -441,6 +542,7 @@ impl<S: KvStore> Driver<S> {
                         eprintln!("btb-node[{}]: evidence: {what}", self.index());
                     }
                     self.evidence.push(what);
+                    self.queue_evidence(epoch, e);
                 }
             }
         }
@@ -599,28 +701,490 @@ impl<S: KvStore> Driver<S> {
             .retain(|(a, n), _| state.nonce(a).unwrap_or(0) <= *n);
 
         let h = chain_block.header.height;
-        for (i, r) in receipts.iter().enumerate() {
-            self.receipt_index.insert(r.id, (h, i));
+        let epoch = self.state.config().staking.epoch_of_block(h);
+        let is_epoch_end = h == self.state.config().staking.epoch_end(epoch);
+        let stored = StoredBlock {
+            header: chain_block.header,
+            hash: chain_block.hash(),
+            state_root_after: new_root,
+            consensus_round: block.round,
+            tx_ids,
+            receipts: receipts.iter().map(stored_receipt).collect(),
+            consensus: block,
+        };
+        self.store.put(&stored)?;
+        if is_epoch_end {
+            // The epoch's last block is final only together with the blocks that certify it;
+            // keep that proof so block sync can serve this epoch to laggards.
+            self.proofs_wanted.push((epoch, stored.consensus));
+            self.resolve_proofs();
         }
-        self.blocks.insert(
-            h,
-            StoredBlock {
-                header: chain_block.header,
-                hash: chain_block.hash(),
-                state_root_after: new_root,
-                consensus_round: block.round,
-                tx_ids,
-                receipts,
-            },
+        Ok(())
+    }
+
+    // -------------------------------------------------------------- consensus block recovery
+
+    /// Answer a consensus `SyncRequest` from the block store when it has the block. After a
+    /// restart the replica holds no blocks, and if every validator restarted together nobody
+    /// else would either.
+    fn answer_block_request(&mut self, epoch: u64, to: u32, block_id: Hash) {
+        let mut blocks = Vec::new();
+        let mut cur = block_id;
+        while blocks.len() < 64 {
+            let Some(b) = self.store.block_by_id(&cur) else {
+                break;
+            };
+            cur = b.parent;
+            blocks.push(b);
+        }
+        if !blocks.is_empty() {
+            self.apply(
+                vec![Action::Send {
+                    to,
+                    msg: Message::SyncResponse { blocks },
+                }],
+                epoch,
+            );
+        }
+    }
+
+    /// Keep proposals from the round's leader so that the uncommitted tip survives a restart
+    /// of all validators at once.
+    fn remember_proposal(&mut self, from: u32, b: &ConsensusBlock) {
+        let leader = self.replica.as_ref().map(|r| r.leader(b.round));
+        if leader == Some(from) && b.proposer == from && b.height > self.exec_log.done().height {
+            if let Err(e) = self.store.put_observed(b) {
+                self.fatal = Some(e);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- epoch closing proofs
+
+    /// Remember blocks just above the end of `epoch` (they only exist to certify its last block).
+    fn note_tails(&mut self, epoch: u64, msg: &Message) {
+        let end = self.state.config().staking.epoch_end(epoch);
+        let mut add = |b: &ConsensusBlock| {
+            if (b.height == end + 1 || b.height == end + 2)
+                && !self
+                    .tails
+                    .iter()
+                    .any(|(e, t)| *e == epoch && t.id() == b.id())
+            {
+                self.tails.push((epoch, b.clone()));
+                if self.tails.len() > MAX_TAILS {
+                    self.tails.remove(0);
+                }
+            }
+        };
+        match msg {
+            Message::Propose(p) => add(&p.block),
+            Message::SyncResponse { blocks } => blocks.iter().for_each(add),
+            _ => {}
+        }
+    }
+
+    /// The consensus context of `epoch` rebuilt from the chain state, with the epoch's anchor
+    /// and start height.
+    fn epoch_context(&self, epoch: u64) -> Option<(Context, Hash, u64)> {
+        let rec = self.state.epoch_record(epoch).ok()??;
+        let set = rec.consensus_set().ok()?;
+        Some((
+            Context::for_epoch(
+                &self.state.consensus_chain_id(),
+                epoch,
+                set,
+                Some(rec.anchor),
+            ),
+            rec.anchor,
+            rec.start_height,
+        ))
+    }
+
+    /// Store the closing proof of every epoch whose last block was executed, as far as the
+    /// certificates are known (they arrive a moment after the block commits).
+    fn resolve_proofs(&mut self) {
+        for (epoch, last) in std::mem::take(&mut self.proofs_wanted) {
+            if self.store.proof(epoch).is_some() {
+                continue;
+            }
+            match self.build_proof(epoch, &last) {
+                Some(p) => {
+                    if let Err(e) = self.store.put_proof(&p) {
+                        self.fatal = Some(e);
+                    }
+                }
+                None => self.proofs_wanted.push((epoch, last)),
+            }
+        }
+        while self.proofs_wanted.len() > 8 {
+            self.proofs_wanted.remove(0);
+        }
+    }
+
+    /// Blocks after `last` (the last block of `epoch`) and the certificate that, with `last`,
+    /// satisfies the same check a syncing node runs.
+    fn build_proof(&self, epoch: u64, last: &ConsensusBlock) -> Option<SyncResponse> {
+        let (ctx, _, _) = self.epoch_context(epoch)?;
+        let replica = if epoch == self.epoch {
+            self.replica.as_ref()
+        } else {
+            self.ended.get(&epoch).map(|(r, _)| r)
+        };
+        let mut qcs: Vec<QuorumCert> = replica.map(|r| r.high_qc().clone()).into_iter().collect();
+        qcs.extend(
+            self.tails
+                .iter()
+                .filter(|(e, _)| *e == epoch)
+                .map(|(_, t)| t.justify.clone()),
         );
-        while self.blocks.len() > KEEP_BLOCKS {
-            if let Some((_, old)) = self.blocks.pop_first() {
-                for r in &old.receipts {
-                    self.receipt_index.remove(&r.id);
+        let last_id = last.id();
+        for qc in qcs.into_iter().filter(|q| q.round > 0) {
+            // Walk from the certified block back to `last` through remembered tail blocks.
+            let mut path = Vec::new();
+            let mut cur = qc.block_id;
+            while cur != last_id && path.len() < 3 {
+                let Some((_, t)) = self
+                    .tails
+                    .iter()
+                    .find(|(e, t)| *e == epoch && t.id() == cur)
+                else {
+                    break;
+                };
+                path.push(t.clone());
+                cur = t.parent;
+            }
+            if cur != last_id || path.is_empty() {
+                continue;
+            }
+            path.reverse();
+            let mut blocks = vec![last.clone()];
+            blocks.extend(path.iter().cloned());
+            let candidate = SyncResponse {
+                epoch,
+                blocks,
+                qc: Some(qc.clone()),
+            };
+            let expect = Expect {
+                ctx: &ctx,
+                epoch,
+                first_height: last.height,
+                parent: last.parent,
+                end_height: last.height,
+            };
+            if sync::verify(&candidate, &expect).is_ok() {
+                return Some(SyncResponse {
+                    epoch,
+                    blocks: path,
+                    qc: Some(qc),
+                });
+            }
+        }
+        None
+    }
+
+    // -------------------------------------------------------------- block sync
+
+    /// Answer a peer's request for committed blocks starting at `from_height`. An empty answer
+    /// means "nothing I can prove from there".
+    fn serve_sync(&mut self, to: [u8; 32], from_height: u64) {
+        self.sync.served += 1;
+        let resp = self.build_sync_response(from_height).unwrap_or_default();
+        self.net.send(to, sync_response_frame(&resp));
+    }
+
+    fn build_sync_response(&self, from: u64) -> Option<SyncResponse> {
+        if from == 0 || from > self.store.latest() {
+            return None;
+        }
+        let cfg = self.state.config().staking;
+        let epoch = cfg.epoch_of_block(from);
+        let end = cfg.epoch_end(epoch);
+        let mut blocks = Vec::new();
+        let mut h = from;
+        while h <= end && blocks.len() < SYNC_RANGE {
+            let Some(b) = self.store.get(h) else { break };
+            blocks.push(b.consensus);
+            h += 1;
+        }
+        if blocks.is_empty() {
+            return None;
+        }
+        // Blocks after the range prove that the range is committed (2-chain rule).
+        for _ in 0..2 {
+            if h > end {
+                break;
+            }
+            let Some(b) = self.store.get(h) else { break };
+            blocks.push(b.consensus);
+            h += 1;
+        }
+        let mut qc = None;
+        if blocks.last().is_some_and(|b| b.height == end) {
+            if let Some(p) = self.store.proof(epoch) {
+                blocks.extend(p.blocks);
+                qc = p.qc;
+            }
+        }
+        Some(SyncResponse { epoch, blocks, qc })
+    }
+
+    /// Peers worth asking: validators of the current and the kept ended epochs, except us.
+    fn sync_peers(&self) -> Vec<[u8; 32]> {
+        let me = self.signing.verifying_key().to_bytes();
+        let mut peers: Vec<[u8; 32]> = self.keys.clone();
+        for (_, k) in self.ended.values() {
+            peers.extend(k.iter().copied());
+        }
+        peers.retain(|k| *k != me);
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
+    fn maybe_request_sync(&mut self) {
+        if self.fatal.is_some() {
+            return;
+        }
+        let since = self.last_commit_at.unwrap_or(self.started);
+        if since.elapsed() < SYNC_STALL {
+            return;
+        }
+        let now = Instant::now();
+        if let Some((t, _)) = self.sync.inflight {
+            if now.duration_since(t) < SYNC_TIMEOUT {
+                return;
+            }
+            self.sync.inflight = None;
+            self.sync.cursor += 1;
+        }
+        if self
+            .sync
+            .last_req
+            .is_some_and(|t| now.duration_since(t) < SYNC_GAP)
+        {
+            return;
+        }
+        self.send_sync_request();
+    }
+
+    fn send_sync_request(&mut self) {
+        let peers = self.sync_peers();
+        if peers.is_empty() {
+            return;
+        }
+        let peer = peers[self.sync.cursor % peers.len()];
+        let now = Instant::now();
+        self.sync.inflight = Some((now, peer));
+        self.sync.last_req = Some(now);
+        self.sync.requests += 1;
+        let from = self.exec_log.done().height + 1;
+        self.net.send(peer, sync_request_frame(from));
+    }
+
+    fn on_sync_response(&mut self, from: [u8; 32], r: SyncResponse) {
+        // Only the peer we asked, once; anything else is ignored without looking at it.
+        if !matches!(self.sync.inflight, Some((_, p)) if p == from) {
+            self.sync.unsolicited += 1;
+            return;
+        }
+        self.sync.inflight = None;
+        match self.apply_sync(&r) {
+            Ok(n) => {
+                self.sync.blocks += n;
+                // More may be waiting at the same peer.
+                self.send_sync_request();
+            }
+            Err(SyncError::Empty | SyncError::NoProof) => self.sync.cursor += 1,
+            Err(e) => {
+                self.sync.rejected += 1;
+                self.sync.cursor += 1;
+                eprintln!(
+                    "btb-node[{}]: rejected a block sync response: {e:?}",
+                    self.index()
+                );
+            }
+        }
+    }
+
+    /// Verify `r` against the validator set this node derived from its own executed chain, and
+    /// execute the blocks it proves. Returns how many blocks were executed.
+    fn apply_sync(&mut self, r: &SyncResponse) -> Result<u64, SyncError> {
+        let epoch = self.epoch;
+        let (ctx, anchor, start) = self.epoch_context(epoch).ok_or(SyncError::WrongEpoch)?;
+        let done = self.exec_log.done();
+        let end = self.state.config().staking.epoch_end(epoch);
+        let expect = Expect {
+            ctx: &ctx,
+            epoch,
+            first_height: done.height + 1,
+            parent: if done.height <= start {
+                anchor
+            } else {
+                done.id
+            },
+            end_height: end,
+        };
+        let n = sync::verify(r, &expect)?;
+        for b in r.blocks.iter().take(n) {
+            self.execute_commit(b.clone());
+            if self.fatal.is_some() {
+                // The driver stops; report it as a bad start rather than panicking.
+                return Err(SyncError::BadStart);
+            }
+        }
+        // The response may carry the proof that closes the epoch: keep it for others.
+        let last = &r.blocks[n - 1];
+        if last.height == end && r.blocks.len() > n && self.store.proof(epoch).is_none() {
+            let candidate = SyncResponse {
+                epoch,
+                blocks: r.blocks[n - 1..].to_vec(),
+                qc: r.qc.clone(),
+            };
+            let e = Expect {
+                ctx: &ctx,
+                epoch,
+                first_height: end,
+                parent: last.parent,
+                end_height: end,
+            };
+            if sync::verify(&candidate, &e).is_ok() {
+                let proof = SyncResponse {
+                    epoch,
+                    blocks: r.blocks[n..].to_vec(),
+                    qc: r.qc.clone(),
+                };
+                if let Err(e) = self.store.put_proof(&proof) {
+                    self.fatal = Some(e);
                 }
             }
         }
-        Ok(())
+        self.check_epoch_switch();
+        Ok(n as u64)
+    }
+
+    // -------------------------------------------------------------- evidence
+
+    /// A verified double-signing report: queue one `SubmitEvidence` per offender and epoch.
+    fn queue_evidence(&mut self, epoch: u64, ev: Evidence) {
+        let off = ev.offender();
+        let me = self.index();
+        let keys_len = if epoch == self.epoch {
+            self.keys.len()
+        } else {
+            self.ended.get(&epoch).map_or(0, |(_, k)| k.len())
+        };
+        if me == u32::MAX || keys_len == 0 || !self.evidence_handled.insert((epoch, off)) {
+            return;
+        }
+        // Validators report in turn, starting after the offender, so one transaction usually
+        // does the job and the others see it and stand down.
+        let n = keys_len as u32;
+        let rank = (me + n - off % n) % n;
+        if rank == 0 {
+            return; // never report oneself
+        }
+        let now = Instant::now();
+        self.evidence_queue.push(PendingEvidence {
+            epoch,
+            ev,
+            due: now + EVIDENCE_STAGGER * (rank - 1),
+            give_up: now + EVIDENCE_GIVE_UP,
+        });
+    }
+
+    /// Note a `SubmitEvidence` transaction from someone else, if its evidence checks out.
+    fn note_evidence_tx(&mut self, tx: &Transaction) {
+        let TxKind::SubmitEvidence { epoch, evidence } = &tx.body.kind else {
+            return;
+        };
+        let key = (*epoch, evidence.offender());
+        if self.evidence_seen.contains_key(&key) {
+            return;
+        }
+        if let Some((ctx, _, _)) = self.epoch_context(*epoch) {
+            if evidence.verify(&ctx) {
+                self.evidence_seen.insert(key, Instant::now());
+            }
+        }
+    }
+
+    fn flush_evidence(&mut self) {
+        if self.evidence_queue.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut keep = Vec::new();
+        for mut p in std::mem::take(&mut self.evidence_queue) {
+            if p.due > now {
+                keep.push(p);
+                continue;
+            }
+            if now >= p.give_up {
+                continue;
+            }
+            let off = p.ev.offender();
+            let operator = self
+                .state
+                .epoch_record(p.epoch)
+                .ok()
+                .flatten()
+                .and_then(|r| r.validators.get(off as usize).map(|v| v.operator));
+            let Some(operator) = operator else { continue };
+            if self
+                .state
+                .slashed_in_epoch(p.epoch, &operator)
+                .unwrap_or(true)
+            {
+                continue; // already slashed (or unreadable): nothing to file
+            }
+            let seen = self
+                .evidence_seen
+                .get(&(p.epoch, off))
+                .is_some_and(|t| now.duration_since(*t) < EVIDENCE_SEEN_HOLD);
+            if seen {
+                p.due = now + Duration::from_secs(1);
+                keep.push(p);
+                continue;
+            }
+            self.submit_evidence(p.epoch, p.ev);
+        }
+        self.evidence_queue = keep;
+    }
+
+    fn submit_evidence(&mut self, epoch: u64, ev: Evidence) {
+        let addr = account_address(&self.reporter.verifying_key().to_bytes());
+        let mempool = &self.mempool;
+        self.reporter_pending.retain(|id| mempool.contains(id));
+        let nonce = self.state.nonce(&addr).unwrap_or(0) + self.reporter_pending.len() as u64;
+        let off = ev.offender();
+        let tx = Transaction::sign(
+            TxBody {
+                chain_id: self.chain_id,
+                nonce,
+                kind: TxKind::SubmitEvidence {
+                    epoch,
+                    evidence: ev,
+                },
+            },
+            &self.reporter,
+        );
+        match self.add_tx(&tx.encode(), None) {
+            Ok(id) => {
+                self.reporter_pending.push(id);
+                self.evidence_seen.insert((epoch, off), Instant::now());
+                self.evidence_submitted.push(hex::encode(&id));
+                eprintln!(
+                    "btb-node[{}]: filed evidence against validator {off} (epoch {epoch}) in tx {}",
+                    self.index(),
+                    hex::encode(&id)
+                );
+            }
+            Err(e) => eprintln!(
+                "btb-node[{}]: could not file evidence against validator {off}: {e}",
+                self.index()
+            ),
+        }
     }
 
     // -------------------------------------------------------------- transactions
@@ -629,6 +1193,9 @@ impl<S: KvStore> Driver<S> {
     fn add_tx(&mut self, bytes: &[u8], local: Option<Instant>) -> Result<Hash, String> {
         let tx = Transaction::decode(bytes).map_err(|e| format!("bad transaction: {e:?}"))?;
         let id = tx.id();
+        if local.is_none() {
+            self.note_evidence_tx(&tx);
+        }
         if self.mempool.contains(&id) {
             return if local.is_some() {
                 Ok(id)
@@ -677,25 +1244,33 @@ impl<S: KvStore> Driver<S> {
             }
             "btb_getReceipt" => {
                 let id = h32(0)?;
-                match self.receipt_index.get(&id) {
-                    Some((h, i)) => {
-                        let b = &self.blocks[h];
-                        Ok(receipt_json(&b.receipts[*i], *h, *i))
-                    }
-                    None => Ok(Value::Null),
-                }
+                Ok(match self.store.receipt(&id) {
+                    Some((h, i, r)) => receipt_json(&r, h, i),
+                    None => Value::Null,
+                })
             }
             "btb_getBlock" => {
                 let h = match arg(0)? {
                     Value::String(s) if s == "latest" => {
-                        self.blocks.last_key_value().map(|(h, _)| *h).unwrap_or(0)
+                        self.state
+                            .head()
+                            .map_err(|e| RpcError::app(e.to_string()))?
+                            .height
                     }
                     v => v.as_u64().ok_or_else(|| {
                         RpcError::invalid_params("height must be a number or \"latest\"")
                     })?,
                 };
-                match self.blocks.get(&h) {
-                    Some(b) => Ok(block_json(h, b)),
+                if self.store.bounded() && h != 0 && h < self.store.first() {
+                    return Err(RpcError::app(format!(
+                        "block {h} was pruned: this node keeps heights {}..={} in memory \
+                         (run with RocksDB to keep all history)",
+                        self.store.first(),
+                        self.store.latest()
+                    )));
+                }
+                match self.store.get(h) {
+                    Some(b) => Ok(block_json(h, &b)),
                     None => Ok(Value::Null),
                 }
             }
@@ -811,6 +1386,19 @@ impl<S: KvStore> Driver<S> {
                 "evidence_found": st.evidence_found,
             },
             "evidence": self.evidence,
+            "evidence_submitted": self.evidence_submitted,
+            "history": {
+                "first": self.store.first(),
+                "latest": self.store.latest(),
+                "pruned_in_memory": self.store.bounded(),
+            },
+            "sync": {
+                "requests": self.sync.requests,
+                "blocks_synced": self.sync.blocks,
+                "served": self.sync.served,
+                "rejected": self.sync.rejected,
+                "unsolicited": self.sync.unsolicited,
+            },
             "net": {
                 "received": self.net.stats.received.load(std::sync::atomic::Ordering::Relaxed),
                 "sent": self.net.stats.sent.load(std::sync::atomic::Ordering::Relaxed),
@@ -823,19 +1411,30 @@ impl<S: KvStore> Driver<S> {
     }
 }
 
-fn receipt_json(r: &Receipt, height: u64, index: usize) -> Value {
+fn stored_receipt(r: &Receipt) -> StoredReceipt {
     let (status, detail) = match &r.status {
         Status::Success => ("success", String::new()),
         Status::Reverted(x) => ("reverted", format!("{x:?}")),
         Status::Invalid(x) => ("invalid", format!("{x:?}")),
         Status::Paused => ("paused", String::new()),
     };
+    StoredReceipt {
+        id: r.id,
+        status: status.into(),
+        detail,
+        gas_used: r.gas_used,
+        fee: r.fee,
+        output: r.output.clone(),
+    }
+}
+
+fn receipt_json(r: &StoredReceipt, height: u64, index: usize) -> Value {
     json!({
         "id": hex::encode(&r.id),
         "height": height,
         "index": index,
-        "status": status,
-        "detail": detail,
+        "status": r.status,
+        "detail": r.detail,
         "gas_used": r.gas_used,
         "fee": r.fee.to_string(),
         "output": hex::encode(&r.output),

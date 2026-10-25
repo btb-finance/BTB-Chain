@@ -59,7 +59,7 @@ Validators are run by parties who don't trust each other, so they must agree on 
 
 - **Fast path.** Transactions touching only one user's own data (sending your own tokens) need validator signatures but no global ordering, confirming in about half a second.
 - **Streaming consensus.** A pipelined BFT or DAG protocol proposes batches continuously; shared objects like DEX pools confirm in under a second. The consensus core is a Jolteon-style 2-chain HotStuff state machine in `crates/btb-consensus`; its safety rules, leader schedule and evidence records are in [CONSENSUS.md](CONSENSUS.md).
-- **Parallel execution.** Transactions that touch different data run at the same time (Block-STM style). Table declarations tell the scheduler what each transaction touches.
+- **Parallel execution.** Transactions that touch different data run at the same time (Block-STM style): built in `btb-chain` as speculative execution with a multi-version memory, validation and re-execution, identical to sequential execution by construction and by differential tests ([CHAIN.md](CHAIN.md#parallel-execution)). Transactions whose accounts are statically known and closed skip conflict tracking. This is an execution-level path inside an ordered block; the consensus-level fast path above (no global ordering) is not built yet.
 - **Request/response SDK.** `await dex.swap(...)` returns the result; batching, confirmation and retries are hidden.
 
 ## Execution layer

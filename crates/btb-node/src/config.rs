@@ -207,6 +207,9 @@ impl Default for Timing {
 pub struct NodeParams {
     pub genesis: GenesisFile,
     pub key: SigningKey,
+    /// Account that signs and pays for the `SubmitEvidence` transactions this node files when it
+    /// catches a validator double signing. `None`: the validator key's own account.
+    pub reporter: Option<SigningKey>,
     /// libp2p listen address, for example `/ip4/127.0.0.1/udp/9000/quic-v1`.
     pub listen: String,
     /// Other validators: `/ip4/.../udp/.../quic-v1/p2p/<peer id>` (the peer id pins the key).
@@ -230,6 +233,7 @@ impl NodeParams {
         NodeParams {
             genesis,
             key,
+            reporter: None,
             listen: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
             peers: Vec::new(),
             rpc: None,
@@ -252,6 +256,9 @@ impl NodeParams {
         let genesis = GenesisFile::load(&path_of("genesis").ok_or("config needs `genesis`")?)?;
         let key = load_key(&path_of("key_file").ok_or("config needs `key_file`")?)?;
         let mut p = NodeParams::new(genesis, key);
+        if let Some(f) = path_of("reporter_key_file") {
+            p.reporter = Some(load_key(&f)?);
+        }
         if let Some(l) = v.get("listen").and_then(Value::as_str) {
             p.listen = l.into();
         }

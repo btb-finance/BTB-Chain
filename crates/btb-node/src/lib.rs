@@ -2,12 +2,14 @@
 //! storage for crash safety (`storage`), a JSON-RPC API (`rpc`) and configuration (`config`).
 //! See `docs/NODE.md`.
 
+pub mod blockstore;
 pub mod config;
 pub mod driver;
 pub mod hex;
 pub mod net;
 pub mod rpc;
 pub mod storage;
+pub mod sync;
 pub mod wire;
 
 use btb_chain::{ChainState, GenesisConfig};
