@@ -30,6 +30,7 @@ Tables, indexes, queries and live subscriptions on one machine.
 **Deliverables**
 
 - [ ] Table and index storage on RocksDB
+  - In progress: tables, indexes and key layout done on an in-memory `KvStore` (`crates/btb-runtime`); the RocksDB backend is still to do
 - [ ] Jellyfish Merkle tree state commitment (provable state)
 - [ ] Query engine: lookups by primary key and index, filters, pagination
 - [ ] Read-set tracking and subscription invalidation (re-run queries when their data changes)

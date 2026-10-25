@@ -64,7 +64,7 @@ Validators are run by parties who don't trust each other, so they must agree on 
 
 ## State model
 
-BTB state is a database, not a raw key-value store.
+BTB state is a database, not a raw key-value store. Tables, indexes and everything else live in one ordered keyspace with a fixed key layout; see [STATE.md](STATE.md).
 
 | Feature | Design |
 | --- | --- |

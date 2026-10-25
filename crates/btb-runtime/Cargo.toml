@@ -1,0 +1,9 @@
+[package]
+name = "btb-runtime"
+description = "State database for BTB Chain: key-value store, tables, indexes, queries and a VM host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+btb-vm = { path = "../btb-vm" }
