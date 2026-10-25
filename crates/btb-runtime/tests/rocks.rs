@@ -120,3 +120,189 @@ fn batch_is_ordered_and_applied_together() {
         ]
     );
 }
+
+// ---- Tables, indexes, queries and deposits: RocksKv must equal MemKv ----
+
+mod tables {
+    use super::TempDir;
+    use btb_runtime::layout::{self, IndexValue};
+    use btb_runtime::rocks::RocksKv;
+    use btb_runtime::*;
+    use btb_vm::host::Host;
+    use std::ops::Bound;
+
+    const C: [u8; 32] = [7; 32];
+    const T: &[u8] = b"t";
+
+    /// Row = one score byte followed by a name.
+    fn tables() -> Tables {
+        let mut t = Tables::new();
+        t.register(
+            C,
+            T,
+            vec![
+                IndexDef::new("score", |r| {
+                    Ok(Some(IndexValue::U64(
+                        r.first().copied().unwrap_or(0).into(),
+                    )))
+                }),
+                IndexDef::new("name", |r| {
+                    let s = String::from_utf8_lossy(r.get(1..).unwrap_or(&[])).into_owned();
+                    Ok((!s.is_empty()).then_some(IndexValue::Str(s)))
+                }),
+            ],
+        )
+        .unwrap();
+        t
+    }
+
+    fn row(score: u8, name: &str) -> Vec<u8> {
+        let mut r = vec![score];
+        r.extend_from_slice(name.as_bytes());
+        r
+    }
+
+    fn mutate<K: KvStore>(kv: &mut K, t: &Tables, f: impl FnOnce(&mut RuntimeHost<K>)) {
+        let mut h = RuntimeHost::new(kv, t, C, [1; 32], 1);
+        f(&mut h);
+        let b = h.finish().unwrap();
+        kv.commit(b).unwrap();
+    }
+
+    fn page(p: &Page) -> String {
+        format!(
+            "{:?} next={:?}",
+            p.rows
+                .iter()
+                .map(|r| (r.id, r.data.clone()))
+                .collect::<Vec<_>>(),
+            p.next_cursor
+        )
+    }
+
+    /// Run a fixed op sequence and return a transcript of every observable result.
+    fn run<K: KvStore>(kv: &mut K) -> Vec<String> {
+        let t = tables();
+        let mut out = Vec::new();
+        kv.put(&layout::balance_key(&C), &1_000_000u64.to_le_bytes())
+            .unwrap();
+        mutate(kv, &t, |h| {
+            for (s, n) in [(3, "c"), (1, "a"), (3, "b"), (9, "z"), (5, "")] {
+                out.push(format!("insert {}", h.table_insert(T, &row(s, n))));
+            }
+            h.storage_write(b"k", b"vvvv");
+        });
+        mutate(kv, &t, |h| {
+            out.push(format!("update {}", h.table_update(T, 1, &row(4, "a2"))));
+            out.push(format!(
+                "update missing {}",
+                h.table_update(T, 99, &row(1, "q"))
+            ));
+            out.push(format!("delete {}", h.table_delete(T, 3)));
+            out.push(format!("delete again {}", h.table_delete(T, 3)));
+        });
+        let get = |k: &[u8], kv: &K| format!("{:?}", kv.get(k).unwrap());
+        for key in [
+            layout::balance_key(&C),
+            layout::usage_key(&C),
+            layout::deposit_key(&C),
+        ] {
+            out.push(get(&key, kv));
+        }
+        for order in [Order::Asc, Order::Desc] {
+            for limit in [1usize, 2, 10] {
+                // Walk every page of each query by following the cursor.
+                let walk = |f: &dyn Fn(Option<Cursor>) -> Page, out: &mut Vec<String>| {
+                    let mut cur = None;
+                    loop {
+                        let p = f(cur.take());
+                        out.push(page(&p));
+                        match p.next_cursor {
+                            Some(c) => cur = Some(c),
+                            None => break,
+                        }
+                    }
+                };
+                let o = |cursor| QueryOptions {
+                    order,
+                    limit,
+                    cursor,
+                    filter: None,
+                };
+                walk(&|c| scan_table(kv, &C, T, &o(c)).unwrap(), &mut out);
+                walk(
+                    &|c| by_index_eq(kv, &C, T, "score", &IndexValue::U64(3), &o(c)).unwrap(),
+                    &mut out,
+                );
+                walk(
+                    &|c| {
+                        by_index_range(
+                            kv,
+                            &C,
+                            T,
+                            "score",
+                            Bound::Included(&IndexValue::U64(1)),
+                            Bound::Excluded(&IndexValue::U64(9)),
+                            &o(c),
+                        )
+                        .unwrap()
+                    },
+                    &mut out,
+                );
+                walk(
+                    &|c| {
+                        by_index_range(kv, &C, T, "name", Bound::Unbounded, Bound::Unbounded, &o(c))
+                            .unwrap()
+                    },
+                    &mut out,
+                );
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tables_indexes_queries_and_deposits_match_memkv() {
+        let dir = TempDir::new();
+        let mut r = RocksKv::open(&dir.0).unwrap();
+        let mut m = MemKv::new();
+        let (a, b) = (run(&mut m), run(&mut r));
+        assert_eq!(a, b);
+        assert!(a.len() > 40);
+        // Raw keyspace is identical too (rows, index entries, counters, deposit accounting).
+        assert_eq!(
+            m.scan(b"", None, false, usize::MAX).unwrap(),
+            r.scan(b"", None, false, usize::MAX).unwrap()
+        );
+    }
+
+    #[test]
+    fn rows_and_index_entries_persist_across_reopen() {
+        let dir = TempDir::new();
+        let expected;
+        {
+            let mut r = RocksKv::open(&dir.0).unwrap();
+            run(&mut r);
+            expected = r.scan(b"", None, false, usize::MAX).unwrap();
+        }
+        let r = RocksKv::open(&dir.0).unwrap();
+        assert_eq!(r.scan(b"", None, false, usize::MAX).unwrap(), expected);
+        assert!(expected.iter().any(|(k, _)| k[0] == layout::TAG_INDEX));
+        let o = QueryOptions {
+            order: Order::Asc,
+            limit: 10,
+            cursor: None,
+            filter: None,
+        };
+        let p = by_index_eq(&r, &C, T, "name", &IndexValue::Str("a2".into()), &o).unwrap();
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.rows[0].data, row(4, "a2"));
+        // The old index entry of the updated row and the deleted row are gone.
+        let p = by_index_eq(&r, &C, T, "name", &IndexValue::Str("a".into()), &o).unwrap();
+        assert!(p.rows.is_empty());
+        let p = by_index_eq(&r, &C, T, "score", &IndexValue::U64(3), &o).unwrap();
+        assert_eq!(p.rows.len(), 2);
+        let p = by_index_eq(&r, &C, T, "score", &IndexValue::U64(9), &o).unwrap();
+        assert!(p.rows.is_empty());
+    }
+}

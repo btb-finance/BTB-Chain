@@ -67,20 +67,26 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.97.0 --profile minimal --component clippy
+          rustup toolchain install 1.97.0 --profile minimal \
+            --component clippy --component rust-src \
+            --target riscv64imac-unknown-none-elf
           rustup default 1.97.0
 
       - name: Install clang and libclang
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev
+          sudo apt-get install -y clang libclang-dev lld
 
       - uses: Swatinem/rust-cache@v2.7.8
         with:
           key: rocksdb
 
       - name: Clippy (rocksdb feature)
-        run: cargo clippy -p btb-runtime --features rocksdb --all-targets -- -D warnings
+        run: |
+          cargo clippy -p btb-runtime --features rocksdb --all-targets -- -D warnings
+          cargo clippy -p btb-tests -p btb-dev --features btb-tests/rocksdb,btb-dev/rocksdb --all-targets -- -D warnings
 
       - name: Test (rocksdb feature)
-        run: cargo test -p btb-runtime --features rocksdb
+        run: |
+          cargo test -p btb-runtime --features rocksdb
+          cargo test -p btb-tests --features rocksdb --test rocks

@@ -12,3 +12,8 @@ btb-codec = { path = "../btb-codec" }
 btb-sdk = { path = "../btb-sdk" }
 btb-runtime = { path = "../btb-runtime" }
 btb-dev = { path = "../btb-dev" }
+
+[features]
+default = []
+# Also run the RocksDB-backed end-to-end tests (needs clang/libclang).
+rocksdb = ["btb-runtime/rocksdb", "btb-dev/rocksdb"]

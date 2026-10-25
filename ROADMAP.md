@@ -29,8 +29,8 @@ Tables, indexes, queries and live subscriptions on one machine.
 
 **Deliverables**
 
-- [ ] Table and index storage on RocksDB
-  - In progress: tables, indexes and key layout done on an in-memory `KvStore` (`crates/btb-runtime`); RocksDB backend (`rocksdb` feature) done
+- [x] Table and index storage on RocksDB
+  - Tables, indexes and key layout in `crates/btb-runtime` over any `KvStore`; RocksDB backend behind the `rocksdb` feature, tested to give results identical to `MemKv` (tables, index queries, deposits, `examples/counter`) and to persist across reopen; `btb-dev --features rocksdb --data DIR` keeps todos across restarts
 - [x] Jellyfish Merkle tree state commitment (provable state)
 - [x] Query engine: lookups by primary key and index, filters, pagination
   - Contracts reach it through host call 15 (`table_index_scan`: index range, order, limit, cursor); row filters are in the Rust API only
@@ -38,9 +38,9 @@ Tables, indexes, queries and live subscriptions on one machine.
 - [x] Optimistic transactions for mutations (retry on conflict)
 - [x] Storage deposits per byte, refunded on delete
 
-**Gate:** query a table by index and watch a UI update live.
+**Gate:** query a table by index and watch a UI update live. **Met.**
 
-Gate demo: `examples/todo` (reads its rows through an index) served by `btb-dev` with a live page; run by `crates/btb-tests/tests/dev_gate.rs` (SSE stream gets a new event after `add` and `toggle`) and a Playwright smoke check. Not yet ticked off as a phase: the RocksDB item above is still open, and contract-declared indexes are temporary host-side registrations (see [docs/DEV_SERVER.md](docs/DEV_SERVER.md)).
+Gate demo: `examples/todo` (reads its rows through an index) served by `btb-dev` with a live page; run by `crates/btb-tests/tests/dev_gate.rs` (SSE stream gets a new event after `add` and `toggle`) and a Playwright smoke check. Phase 2 is complete; contract-declared indexes are still temporary host-side registrations (see [docs/DEV_SERVER.md](docs/DEV_SERVER.md)).
 
 ## Phase 3 — Single-node devnet
 
