@@ -21,6 +21,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
 | `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |
 | `docs/SCALING.md` | How each layer scales; node roles and how each earns; storage proofs |
+| `docs/GLOSSARY.md` | Alphabetical definitions of key terms used across the docs |
 | `docs/PRIOR_ART.md` | What BTB takes from Convex, ICP, NEAR, Sui/Aptos, CKB/PolkaVM, THORChain, Chainlink |
 | `CONTRIBUTING.md` | How to contribute, including AI-assisted work |
 
