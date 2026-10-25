@@ -1,0 +1,21 @@
+[package]
+name = "btb-edge"
+description = "BTB Chain edge caching node: caches site files, storage-backed files and query results in front of hosting nodes, verifies what it caches and earns per-request fees through vouchers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "btb-edge"
+path = "src/main.rs"
+
+[dependencies]
+btb-chain = { path = "../btb-chain" }
+btb-storage = { path = "../btb-storage" }
+btb-voucher = { path = "../btb-voucher" }
+sha2 = "0.11.1"
+serde_json = "1"
+
+[dev-dependencies]
+btb-voucher = { path = "../btb-voucher" }

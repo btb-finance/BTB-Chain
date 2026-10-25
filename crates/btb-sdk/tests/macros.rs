@@ -120,3 +120,26 @@ fn randomness_exports_a_marker_symbol() {
     lottery2();
     unscheduled_lottery();
 }
+
+#[btb::action]
+pub fn weather(city: String) -> btb_sdk::oracle::action::HttpRequest {
+    btb_sdk::oracle::action::HttpRequest::get(city)
+}
+
+#[btb::transform("weather")]
+pub fn weather_transform(resp: btb_sdk::oracle::action::HttpResponse) -> Vec<u8> {
+    resp.body
+}
+
+#[btb::transform]
+pub fn plain(resp: btb_sdk::oracle::action::HttpResponse) -> u16 {
+    resp.status
+}
+
+#[test]
+fn transform_exports_btb_transform_symbols() {
+    // The transform is found by the action's name, whatever the Rust function is called.
+    let _: extern "C" fn(*const u8, usize) = btb_transform_weather;
+    let _: extern "C" fn(*const u8, usize) = btb_transform_plain;
+    let _: extern "C" fn(*const u8, usize) = btb_action_weather;
+}

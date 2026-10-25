@@ -174,6 +174,7 @@ fn header_call_numbers_match_abi() {
         ("BTB_CONTRACT_ADDRESS", abi::CONTRACT_ADDRESS),
         ("BTB_RANDOM_BYTES", abi::RANDOM_BYTES),
         ("BTB_PRICE", abi::PRICE),
+        ("BTB_REPORT_REQUEST", abi::REPORT_REQUEST),
         ("BTB_TOKEN_OK", abi::TOKEN_OK),
         ("BTB_TOKEN_INVALID", abi::TOKEN_INVALID),
         ("BTB_TOKEN_INSUFFICIENT", abi::TOKEN_INSUFFICIENT),

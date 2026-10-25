@@ -30,6 +30,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
 | `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |
 | `docs/SCALING.md` | How each layer scales; node roles and how each earns; storage proofs |
+| `docs/EDGE.md` | `btb-edge`: edge caching nodes in front of hosting nodes; what is cached and verified, invalidation, vouchers, metrics |
 | `docs/STORAGE.md` | Storage nodes: erasure-coded pieces, assignment, challenges, slashing, repair, `btb store` / `btb fetch` |
 | `docs/NODE.md` | The validator node: run a local 4-validator testnet, RPC API, crash safety |
 | `docs/TESTNET.md` | Faucet and explorer, `scripts/testnet-local.sh`, and the plan for a public testnet (built, not deployed) |

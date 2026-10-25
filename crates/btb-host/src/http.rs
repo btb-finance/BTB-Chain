@@ -11,6 +11,8 @@
 //! | `GET /c/<contract>/query/<fn>?...&proof=1` | JSON: result, height, proof bundle for the keys it read |
 //! | `GET /c/<contract>/subscribe/<fn>?...` | Server-Sent Events: the result, then each change |
 //! | `GET /site/<contract>/<path>` | a published static file (`index.html` for `/` and `dir/`) |
+//! | `GET /site/<contract>/<path>` (no such file, but `<path>.root` holds a storage root) | the large file, fetched from storage nodes and verified against the root |
+//! | `GET /file/<root hex>` | a file stored on storage nodes, fetched by root, verified (any `k` of `n` pieces) |
 //! | `GET /api/site/<contract>` | JSON list of published files and their SHA-256 |
 //! | `GET /proof/<contract>?key=<hex>[,<hex>..][&height=N]` | proof bundle for contract storage keys |
 //! | `GET /proof/<contract>/site/<path>[?height=N]` | proof bundle for a site file |
@@ -36,6 +38,9 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A site file `<path>.root` holds the 64-hex storage root of the large file served at `<path>`.
+const ROOT_SUFFIX: &str = ".root";
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_LINE: u64 = 8192;
@@ -122,7 +127,7 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
     })
 }
 
-const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: x-btb-caller, content-type, if-none-match\r\nAccess-Control-Expose-Headers: x-btb-height, x-btb-content-hash, etag\r\n";
+const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: x-btb-caller, content-type, if-none-match\r\nAccess-Control-Expose-Headers: x-btb-height, x-btb-content-hash, x-btb-storage-root, etag\r\n";
 
 fn write_response(
     conn: &mut TcpStream,
@@ -213,6 +218,7 @@ fn route(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<()> 
             "501 Not Implemented",
             "hosting nodes do not run mutations: send a signed transaction to a validator (btb_sendTransaction)",
         ),
+        ("GET", ["file", root]) => storage_file_route(ctx, conn, req, root),
         ("GET", ["site", c]) => site_file(ctx, conn, req, c, ""),
         ("GET", ["site", c, rest @ ..]) => site_file(ctx, conn, req, c, &rest.join("/")),
         ("GET", ["api", "site", c]) => site_list(ctx, conn, c),
@@ -443,11 +449,23 @@ fn site_file(
         .node
         .with_chain::<crate::state::Recording, _, _>(move |st| {
             let h = st.head().map(|h| h.height).unwrap_or(0);
-            site::get(st.store(), &contract, &p).map(|f| (f, h))
+            let f = site::get(st.store(), &contract, &p)?;
+            if f.is_some() || p.len() + ROOT_SUFFIX.len() > site::MAX_PATH_BYTES {
+                return Ok((f, None, h));
+            }
+            // Not on chain: a `<path>.root` file may point at a large file on storage nodes.
+            let ptr = site::get(st.store(), &contract, &format!("{p}{ROOT_SUFFIX}"))?;
+            let root = ptr
+                .and_then(|f| String::from_utf8(f.content).ok())
+                .and_then(|t| hex::decode32(t.trim()).ok());
+            Ok::<_, btb_chain::state::StateError>((f, root, h))
         });
     let (file, height) = match r {
-        Ok(Ok((Some(f), h))) => (f, h),
-        Ok(Ok((None, _))) => return err(conn, "404 Not Found", "no such file"),
+        Ok(Ok((Some(f), _, h))) => (f, h),
+        Ok(Ok((None, Some(root), h))) => {
+            return storage_backed(ctx, conn, req, &root, crate::site::content_type(&path), h)
+        }
+        Ok(Ok((None, None, _))) => return err(conn, "404 Not Found", "no such file"),
         Ok(Err(e)) => return err(conn, "500 Internal Server Error", &e.to_string()),
         Err(e) => return err(conn, "503 Service Unavailable", &e),
     };
@@ -469,6 +487,74 @@ fn site_file(
         &extra,
         &file.content,
     )
+}
+
+/// The chain as `btb-storage` sees it: node RPC, read only.
+struct NodeChain<'a>(&'a Node);
+
+impl btb_storage::chain::Chain for NodeChain<'_> {
+    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.0.call(method, params).map_err(|e| e.message)
+    }
+    fn send(&self, _: btb_chain::storage::StorageOp) -> Result<Value, String> {
+        Err("a hosting node does not send storage transactions".into())
+    }
+    fn address(&self) -> [u8; 32] {
+        [0; 32]
+    }
+}
+
+fn storage_file_route(
+    ctx: &Ctx,
+    conn: &mut TcpStream,
+    req: &Request,
+    root: &str,
+) -> std::io::Result<()> {
+    let Ok(root) = hex::decode32(root) else {
+        return err(conn, "400 Bad Request", "root must be 64 hex characters");
+    };
+    let height = ctx.shared.head.load(Ordering::SeqCst);
+    storage_backed(ctx, conn, req, &root, "application/octet-stream", height)
+}
+
+/// Serve the file with storage root `root`: any `k` verified pieces from storage nodes, decoded
+/// and checked against the root. A caller that sends `X-BTB-Storage: redirect` (an edge node,
+/// which fetches from storage nodes itself) gets only the root, no body. `ETag` is the root:
+/// the content is immutable.
+fn storage_backed(
+    ctx: &Ctx,
+    conn: &mut TcpStream,
+    req: &Request,
+    root: &[u8; 32],
+    ctype: &str,
+    height: u64,
+) -> std::io::Result<()> {
+    let tag = hex::encode(root);
+    let extra = format!(
+        "ETag: \"{tag}\"\r\nX-BTB-Storage-Root: {tag}\r\nX-BTB-Height: {height}\r\nCache-Control: public, max-age=31536000, immutable\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: sandbox allow-scripts allow-forms allow-popups\r\n"
+    );
+    if req
+        .headers
+        .get("if-none-match")
+        .is_some_and(|v| v.trim_matches('"') == tag)
+    {
+        return write_response(conn, "304 Not Modified", "text/plain", &extra, b"");
+    }
+    if req
+        .headers
+        .get("x-btb-storage")
+        .is_some_and(|v| v.eq_ignore_ascii_case("redirect"))
+    {
+        return write_response(conn, "200 OK", ctype, &extra, b"");
+    }
+    match btb_storage::client::fetch(&NodeChain(&ctx.node), root) {
+        Ok(data) => write_response(conn, "200 OK", ctype, &extra, &data),
+        Err(e) => err(
+            conn,
+            "502 Bad Gateway",
+            &format!("storage fetch failed: {e}"),
+        ),
+    }
 }
 
 fn site_list(ctx: &Ctx, conn: &mut TcpStream, contract: &str) -> std::io::Result<()> {

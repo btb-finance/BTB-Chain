@@ -62,6 +62,8 @@ pub struct RuntimeHost<'a, S: KvStore> {
     /// `random_bytes` so transactions that never ask do not read the beacon key.
     rand_tx: Option<[u8; 32]>,
     random: Option<btb_vm::rand::RandomSource>,
+    /// Reports queued by this call (capped at `layout::MAX_REPORTS_PER_CALL`).
+    reports: u32,
 }
 
 impl<'a, S: KvStore> RuntimeHost<'a, S> {
@@ -82,6 +84,7 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             fault: None,
             rand_tx: None,
             random: None,
+            reports: 0,
         }
     }
 
@@ -306,6 +309,33 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
             self.random = Some(btb_vm::rand::RandomSource::new(&seed, &tx));
         }
         self.random.as_mut().map(|r| r.next(len))
+    }
+
+    fn report_request(&mut self, data: &[u8]) -> Option<u64> {
+        // Only a chain with an oracle committee can sign reports, and only a state-changing
+        // call may queue one (the VM already traps a read-only host).
+        if self.read_only || self.reports >= layout::MAX_REPORTS_PER_CALL {
+            return None;
+        }
+        let r = self.kv.get(&layout::oracle_config_key());
+        self.kv(r)?;
+        let r = self.kv.get(&layout::report_counter_key());
+        let id = self
+            .kv(r)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map_or(0, u64::from_le_bytes);
+        let next = id.checked_add(1)?;
+        let mut rec = self.height.to_le_bytes().to_vec();
+        rec.extend_from_slice(&self.contract);
+        rec.extend_from_slice(data);
+        let r = self.kv.put(&layout::report_key(id), &rec);
+        self.kv(r);
+        let r = self
+            .kv
+            .put(&layout::report_counter_key(), &next.to_le_bytes());
+        self.kv(r);
+        self.reports += 1;
+        Some(id)
     }
 
     fn price(&mut self, pair: u32) -> Option<btb_vm::host::PriceRecord> {

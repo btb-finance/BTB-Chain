@@ -670,7 +670,12 @@ pub(crate) fn end_block(
         return Ok(()); // a chain without validators has no epochs to rotate
     };
     pay_rewards(kv, &current)?;
-    let mut next = select_set(kv, cfg)?;
+    // With a beacon DKG running, the set was locked at the start of its window so that the
+    // beacon committee is exactly the epoch's validator set (`crate::dkg`).
+    let mut next = match crate::dkg::locked_set(kv, epoch + 1)? {
+        Some(locked) => locked,
+        None => select_set(kv, cfg)?,
+    };
     if next.is_empty() {
         next = current.validators.clone(); // never leave consensus without a set
     }

@@ -62,9 +62,11 @@ Sub-tags: `0 Register { endpoint, deposit }`, `1 AddDeposit { amount }`, `2 With
 
 State layout (tags `0x40` to `0x47`): see the table in `storage.rs`.
 
-### Randomness (known limit)
+### Randomness
 
-There is no randomness beacon yet. The seed for assignment is the **parent block hash** (the head while a block runs); for challenge chunks and reassignment it is the **hash of the block that closes the round**. A proposer can grind these (try other transactions or timestamps) to bias which nodes get a file or which chunk is asked. It cannot forge a proof or take money, only shift placement and challenges, which is acceptable for a testnet. The seed switches to the threshold beacon of [ORACLES.md](ORACLES.md#1-verifiable-randomness) when that exists; nothing else changes.
+**The seed is the threshold beacon** ([ORACLES.md](ORACLES.md#1-verifiable-randomness)) whenever the block being executed has one: `seed = SHA256("btb.storage.seed.v1" || beacon seed)`, read from the block's seed record (state key `50 02`, which holds `height || seed` and is trusted only when its height is the current block's). It is used for the piece assignment of a `Store` (in the block that carries the transaction) and for the challenge chunks, deadlines and reassignments decided at the end of a block. The validators release the partial signatures of height `h` only after block `h` is committed, so the transactions of block `h` and the block that closes a challenge round are fixed before anyone can know the seed: **a proposer can no longer grind placement or challenged chunks**, and neither can a node that wants a particular file or chunk (a `Store` or a missed challenge cannot be steered by choosing transactions or timestamps).
+
+**Fallback (documented, not silent).** Two cases have no beacon, and only there the old seed is used: a chain without an oracle config, and the first `dkg_window` blocks of a chain whose beacon key is generated on chain. The fallback seed is the **parent block hash** for `Store` (the head while a block runs) and the **hash of the block that closes the round** for the scheduler. It is grindable by a proposer (try other transactions or timestamps), which can only shift placement and challenges, never forge a proof or take money. Every block after the first key exists uses the beacon; nothing else in the protocol differs between the two. Tested: `storage_placement_follows_the_beacon_seed` (`crates/btb-chain/tests/storage_beacon.rs`, which also checks that the challenged chunk is the one derived from the beacon of the block that opened the round).
 
 ## The storage node (`btb storage-node run`)
 
@@ -106,6 +108,6 @@ Pieces are files `<dir>/<file hex>/<index>.piece`, written atomically.
 
 - Hosting nodes serving large site files by root from storage nodes ([HOSTING.md](HOSTING.md)): the pieces and the client exist, the `btb-host` route does not.
 - Retrieval payments (vouchers per byte served by storage and edge nodes), extending the paid duration of a stored file, deleting a file early, a protocol fee, and encryption of fragments before upload (the client can encrypt before `store`; nodes only ever see opaque pieces).
-- The threshold beacon for seeds (above), and sampling several chunks per challenge for large pieces.
+- Sampling several chunks per challenge for large pieces.
 - The assignment scans every registered node per piece; an indexed or sortition-tree structure is needed with thousands of nodes. The scheduler caps its work at 256 events per block (later ones wait).
 - A node that is dead but registered is only discovered by a missed challenge; there is no faster liveness signal.

@@ -2,7 +2,7 @@
 
 Short definitions of terms used across the BTB Chain docs, in alphabetical order. Each entry points to the document that describes it in full.
 
-**Action.** A function kind that calls the outside world (for example an HTTPS request) and then writes a result the validators have agreed on. See [Oracles](ORACLES.md#3-custom-web-data-https-requests).
+**Action.** A function kind that calls the outside world (for example an HTTPS request): it is requested with a transaction, every validator makes the request and runs the contract's transform, and when two thirds of the stake signed the same bytes the chain delivers them to the contract's `<name>_callback` mutation. See [Oracles](ORACLES.md#3-custom-web-data-https-requests).
 
 **Batch auction.** The way the native DEX settles swaps: all swaps on a pool in one block get the same price, so transaction ordering gives no front-running advantage. See [Architecture](ARCHITECTURE.md#front-running-protection) and [Chain: Native DEX](CHAIN.md#native-dex).
 
@@ -15,6 +15,8 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 **Cron.** A function kind that is a mutation run on a schedule, by block height or block timestamp and never a local clock. It is paid from the contract's prepaid balance. See [Languages](LANGUAGE.md#four-function-kinds).
 
 **Determinism.** The rule that anything affecting consensus gives the same result on every node: no floats, system time, thread scheduling or unseeded randomness. See [Languages](LANGUAGE.md#design-rules-all-languages).
+
+**DKG (distributed key generation).** The protocol by which the validators create a threshold key together so that nobody ever holds it whole. BTB runs a joint-Feldman DKG on chain for the beacon key at genesis and reshares it at every epoch change. See [Oracles](ORACLES.md#key-provisioning-and-the-dkg).
 
 **Edge node.** A lightweight node, possibly a laptop or phone, that caches popular content near users, relays requests and holds small pieces, earning per request. See [Scaling](SCALING.md#five-ways-to-earn).
 

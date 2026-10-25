@@ -11,6 +11,7 @@
 //! running (out of gas, abort, ...) reverts its own state changes but still consumes its nonce
 //! and pays for the gas it used.
 
+use crate::actions::{self, ActionError, ActionOp, ActionVote};
 use crate::block::{tx_root, Block};
 use crate::parallel::{self, ParResult, ParStats};
 use crate::staking::{self, Fail, StakeError};
@@ -23,6 +24,7 @@ use crate::tx::{
     MAX_NAME_BYTES,
 };
 use crate::{relay_pool, sha256, validator_pool, RELAY_SHARE_BPS, TOTAL_SUPPLY};
+use btb_codec::{Decode, Encode};
 use btb_runtime::kv::{BatchOp, KvStore, Overlay, WriteBatch};
 use btb_runtime::{layout, merkle, RuntimeHost};
 use btb_vm::decode::Trap;
@@ -85,6 +87,10 @@ pub enum Revert {
     Dex(crate::dex::DexError),
     /// A storage transaction was refused (nothing changed).
     Storage(crate::storage::StorageError),
+    /// A beacon key-generation transaction was refused (nothing changed).
+    Dkg(crate::dkg::DkgError),
+    /// An action transaction was refused (nothing changed).
+    Action(ActionError),
     Vm(String),
 }
 
@@ -99,13 +105,25 @@ pub enum Status {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    Tx { sender: Address },
-    Cron { contract: Address, function: String },
+    Tx {
+        sender: Address,
+    },
+    Cron {
+        contract: Address,
+        function: String,
+    },
+    /// The callback delivering the result of the HTTPS action request `request`.
+    Action {
+        contract: Address,
+        function: String,
+        request: Hash,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
-    /// Transaction id, or `SHA256("btb.cron.v1" || height || contract || function)`.
+    /// Transaction id, `SHA256("btb.cron.v1" || height || contract || function)`, or for an
+    /// action callback `SHA256("btb.action.cb.v1" || request id)`.
     pub id: Hash,
     pub origin: Origin,
     pub status: Status,
@@ -161,6 +179,7 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
         TxKind::Channel(op) => fee.checked_add(op.debit()),
         TxKind::Dex(op) => fee.checked_add(op.debit()),
         TxKind::Storage(op) => fee.checked_add(op.debit(&cfg.storage)),
+        TxKind::Action(op) => fee.checked_add(op.debit()),
         _ => Some(fee),
     }
 }
@@ -242,6 +261,32 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
             }
             if !tx.verify_signature() {
                 return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::Dkg(op) => {
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::Action(op) => {
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+            let min = tx.intrinsic_gas();
+            let limit = op.gas_limit();
+            if limit < min {
+                return Err(Invalid::GasLimitTooLow { min });
+            }
+            if limit > cfg.max_tx_gas {
+                return Err(Invalid::GasLimitTooHigh {
+                    max: cfg.max_tx_gas,
+                });
             }
         }
         TxKind::Site(op) => {
@@ -368,6 +413,14 @@ impl<S: KvStore> Ctx<'_, S> {
         entropy_id: &Hash,
     ) -> Result<RunResult, StateError> {
         let c = load_contract(&mut *self.cache, &record.code)?;
+        // The callback of an HTTPS action takes the agreed result of validators; only the chain
+        // delivering it (caller `actions::CALLER`) may run it, never a transaction.
+        if kind == FunctionKind::Mutation
+            && caller != actions::CALLER
+            && c.is_action_callback(function)
+        {
+            return Ok((0, Err(Revert::Action(ActionError::CallbackIsSystemOnly))));
+        }
         let mut host = RuntimeHost::new(&self.overlay, &self.tables, contract, caller, self.height);
         // Randomness: only a marked mutation or cron may ask (the VM enforces that); its
         // bytes derive from the block beacon, this id (tx id, or the cron receipt id) and the
@@ -564,6 +617,266 @@ impl<S: KvStore> Ctx<'_, S> {
         })
     }
 
+    /// An HTTPS action transaction (`crate::actions`).
+    fn exec_action(
+        &mut self,
+        sender: &Address,
+        op: &ActionOp,
+        id: &Hash,
+        intrinsic: u64,
+    ) -> Result<Done, StateError> {
+        let refuse = |gas_used: u64, e: ActionError| Done {
+            gas_used,
+            output: Vec::new(),
+            result: Err(Revert::Action(e)),
+        };
+        match op {
+            ActionOp::SetHosts { contract, hosts } => {
+                let Some(rec) = self.contract_record(contract)? else {
+                    return Ok(refuse(intrinsic, ActionError::NoSuchContract));
+                };
+                if &rec.deployer != sender {
+                    return Ok(refuse(intrinsic, ActionError::NotDeployer));
+                }
+                actions::set_hosts(&mut self.overlay, contract, hosts)?;
+                Ok(Done {
+                    gas_used: intrinsic,
+                    output: Vec::new(),
+                    result: Ok(()),
+                })
+            }
+            ActionOp::Request {
+                contract,
+                function,
+                args,
+                gas_limit,
+                max_fee,
+            } => {
+                let Some(rec) = self.contract_record(contract)? else {
+                    return Ok(refuse(intrinsic, ActionError::NoSuchContract));
+                };
+                if self.lazy_tables && self.registered.insert(*contract) {
+                    if let Err(m) = register_manifest(&mut self.tables, *contract, &rec.manifest) {
+                        return Err(StateError(format!("stored manifest invalid: {m}")));
+                    }
+                }
+                let c = load_contract(&mut *self.cache, &rec.code)?;
+                if !c.has_entry(FunctionKind::Action, function) {
+                    return Ok(refuse(intrinsic, ActionError::NoSuchAction));
+                }
+                let callback = format!("{function}{}", btb_vm::contract::CALLBACK_SUFFIX);
+                if !c.has_entry(FunctionKind::Mutation, &callback) {
+                    return Ok(refuse(intrinsic, ActionError::NoCallback));
+                }
+                if actions::pending_count(&self.overlay)? >= actions::MAX_PENDING
+                    || actions::pending_list(&self.overlay)?
+                        .iter()
+                        .filter(|(_, p)| p.requester == *sender)
+                        .count()
+                        >= actions::MAX_PENDING_PER_REQUESTER
+                {
+                    return Ok(refuse(intrinsic, ActionError::TooManyPending));
+                }
+                let epoch = self.height.saturating_sub(1) / self.cfg.staking.epoch_len;
+                let Some(epoch_rec) = staking::epoch_record(&self.overlay, epoch)? else {
+                    return Ok(refuse(intrinsic, ActionError::NoValidators));
+                };
+                // The escrow pays every validator's answer and the callback's full gas limit.
+                let needed = (self.cfg.cron_gas_limit)
+                    .saturating_add(actions::RESPONSE_GAS * epoch_rec.validators.len() as u64)
+                    .saturating_mul(self.cfg.gas_price);
+                if *max_fee < needed {
+                    return Ok(refuse(
+                        intrinsic,
+                        ActionError::EscrowTooLow {
+                            needed,
+                            max_fee: *max_fee,
+                        },
+                    ));
+                }
+                // First phase: read-only (the VM forces it), returns the request to make.
+                let (used, res) = self.run_contract(
+                    &rec,
+                    *contract,
+                    *sender,
+                    FunctionKind::Action,
+                    function,
+                    args,
+                    gas_limit - intrinsic,
+                    id,
+                )?;
+                let gas_used = intrinsic + used;
+                let output = match res {
+                    Ok((output, _no_writes)) => output,
+                    Err(r) => {
+                        return Ok(Done {
+                            gas_used,
+                            output: Vec::new(),
+                            result: Err(r),
+                        })
+                    }
+                };
+                let Ok(spec) = btb_codec::http::HttpRequest::decode(&output) else {
+                    return Ok(refuse(gas_used, ActionError::BadRequestSpec));
+                };
+                let hosts = actions::hosts_of(&self.overlay, contract)?;
+                let spec = match actions::validate_request(spec, &hosts) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(refuse(gas_used, e)),
+                };
+                let pending = actions::Pending {
+                    requester: *sender,
+                    contract: *contract,
+                    function: function.clone(),
+                    args: args.clone(),
+                    request: spec.encode(),
+                    hosts,
+                    created: self.height,
+                    deadline: self.height.saturating_add(actions::DEADLINE_BLOCKS),
+                    escrow: *max_fee,
+                };
+                self.debit(sender, *max_fee)?;
+                self.credit(&actions::escrow_pool(), *max_fee)?;
+                actions::pending_put(&mut self.overlay, id, &pending)?;
+                Ok(Done {
+                    gas_used,
+                    output: id.to_vec(),
+                    result: Ok(()),
+                })
+            }
+        }
+    }
+
+    /// End of block, after the crons: take in the validators' votes on pending HTTPS actions and
+    /// deliver every request that reached a verdict (agreement, disagreement or deadline) to its
+    /// callback. Bad votes are skipped, never an error. Deliveries share the cron gas caps; the
+    /// ones that do not fit wait for the next block.
+    fn run_actions(
+        &mut self,
+        votes: &[ActionVote],
+        receipts: &mut Vec<Receipt>,
+    ) -> Result<(), StateError> {
+        if actions::pending_count(&self.overlay)? == 0 {
+            return Ok(());
+        }
+        let epoch = self.height.saturating_sub(1) / self.cfg.staking.epoch_len;
+        let rec = staking::epoch_record(&self.overlay, epoch)?;
+        let validators: BTreeMap<[u8; 32], (u64, Address)> = rec
+            .iter()
+            .flat_map(|r| r.validators.iter())
+            .map(|v| (v.consensus_key, (v.stake, v.operator)))
+            .collect();
+        let total: u128 = validators.values().map(|(s, _)| u128::from(*s)).sum();
+        for v in votes.iter().take(actions::MAX_VOTES_PER_BLOCK) {
+            if !validators.contains_key(&v.key)
+                || !v.verify(self.cfg.chain_id)
+                || actions::pending_get(&self.overlay, &v.request)?.is_none()
+            {
+                continue;
+            }
+            actions::record_vote(&mut self.overlay, v)?;
+        }
+        let mut delivered = 0usize;
+        let mut gas_total = 0u64;
+        for (id, p) in actions::pending_list(&self.overlay)? {
+            let mut tallies: BTreeMap<Hash, u128> = BTreeMap::new();
+            let mut voters = Vec::new();
+            for (key, outcome) in actions::votes_of(&self.overlay, &id)? {
+                if let Some((stake, operator)) = validators.get(&key) {
+                    *tallies.entry(outcome).or_default() += u128::from(*stake);
+                    voters.push(*operator);
+                }
+            }
+            let tallies: Vec<(Hash, u128)> = tallies.into_iter().collect();
+            let (status, data) = match actions::decide(self.height, p.deadline, total, &tallies) {
+                actions::Verdict::Wait => continue,
+                actions::Verdict::Agreed(h) => actions::outcome_get(&self.overlay, &id, &h)?
+                    .unwrap_or((actions::STATUS_FAILED, b"outcome missing".to_vec())),
+                actions::Verdict::Disagreed => (actions::STATUS_DISAGREEMENT, Vec::new()),
+                actions::Verdict::TimedOut => (actions::STATUS_TIMEOUT, Vec::new()),
+            };
+            if delivered >= self.cfg.max_crons_per_block as usize
+                || gas_total.saturating_add(self.cfg.cron_gas_limit) > self.cfg.cron_gas_block_cap
+            {
+                break;
+            }
+            delivered += 1;
+            gas_total += self.settle_action(&id, &p, status, &data, &voters, receipts)?;
+        }
+        Ok(())
+    }
+
+    /// Deliver `(status, data)` to the callback of request `id`, then settle its escrow: the
+    /// callback's gas to the validator pool, `RESPONSE_GAS` to each validator that answered
+    /// (capped by what is left), the rest back to the requester. Returns the callback's gas.
+    fn settle_action(
+        &mut self,
+        id: &Hash,
+        p: &actions::Pending,
+        status: u8,
+        data: &[u8],
+        voters: &[Address],
+        receipts: &mut Vec<Receipt>,
+    ) -> Result<u64, StateError> {
+        actions::remove(&mut self.overlay, id)?;
+        let callback = format!("{}{}", p.function, btb_vm::contract::CALLBACK_SUFFIX);
+        let cb_id = sha256(&[b"btb.action.cb.v1", id]);
+        let mut receipt = Receipt {
+            id: cb_id,
+            origin: Origin::Action {
+                contract: p.contract,
+                function: callback.clone(),
+                request: *id,
+            },
+            status: Status::Success,
+            gas_used: 0,
+            fee: 0,
+            output: Vec::new(),
+        };
+        let price = self.cfg.gas_price;
+        let mut used = 0;
+        match self.contract_record(&p.contract)? {
+            None => receipt.status = Status::Reverted(Revert::NoSuchContract),
+            Some(rec) => {
+                let input = (*id, p.args.clone(), status, data.to_vec()).encode();
+                let (u, res) = self.run_contract(
+                    &rec,
+                    p.contract,
+                    actions::CALLER,
+                    FunctionKind::Mutation,
+                    &callback,
+                    &input,
+                    self.cfg.cron_gas_limit,
+                    &cb_id,
+                )?;
+                used = u;
+                match res {
+                    Ok((out, batch)) => {
+                        self.overlay.commit(batch)?;
+                        receipt.output = out;
+                    }
+                    Err(r) => receipt.status = Status::Reverted(r),
+                }
+            }
+        }
+        let fee = used.saturating_mul(price).min(p.escrow);
+        receipt.gas_used = used;
+        receipt.fee = fee;
+        self.debit(&actions::escrow_pool(), p.escrow)?;
+        self.credit(&validator_pool(), fee)?;
+        let mut left = p.escrow - fee;
+        if !voters.is_empty() {
+            let per = (actions::RESPONSE_GAS.saturating_mul(price)).min(left / voters.len() as u64);
+            for v in voters {
+                self.credit(v, per)?;
+            }
+            left -= per * voters.len() as u64;
+        }
+        self.credit(&p.requester, left)?;
+        receipts.push(receipt);
+        Ok(used)
+    }
+
     pub(crate) fn apply_tx(&mut self, tx: &Transaction) -> Result<Receipt, StateError> {
         let id = tx.id();
         let sender = tx.sender();
@@ -688,6 +1001,24 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::storage::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Dkg(op) => {
+                let (chain, height) = (self.cfg.chain_id, self.height);
+                let gas_used = tx.intrinsic_gas();
+                match crate::dkg::apply(&mut self.overlay, chain, height, &tx.public_key, op) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::dkg::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Dkg(e)),
+                    },
+                    Err(crate::dkg::Fail::State(e)) => return Err(e),
+                }
+            }
+            TxKind::Action(op) => self.exec_action(&sender, op, &id, tx.intrinsic_gas())?,
             TxKind::Site(op) => {
                 let gas_used = tx.intrinsic_gas();
                 match crate::site::apply(&mut self.overlay, &sender, op) {
@@ -992,7 +1323,7 @@ impl Executor {
         crate::oracle::begin_block(
             &mut ctx.overlay,
             cfg.chain_id,
-            cfg.staking.epoch_len,
+            &cfg.staking,
             h.height,
             &block.oracle,
         )
@@ -1051,7 +1382,9 @@ impl Executor {
             }
         }
         ctx.run_crons(&mut receipts)?;
+        ctx.run_actions(&block.actions, &mut receipts)?;
         crate::dex::end_block(&mut ctx.overlay, &cfg, h.height)?;
+        crate::reports::end_block(&mut ctx.overlay, h.height)?;
         crate::oracle::end_block(
             &mut ctx.overlay,
             cfg.chain_id,

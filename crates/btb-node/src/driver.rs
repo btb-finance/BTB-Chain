@@ -19,6 +19,7 @@
 //! (`blockstore`), and it serves and uses block sync (`serve_sync`, `apply_sync`) so a node
 //! that is arbitrarily far behind can catch up from its peers' history.
 
+use crate::actions::ActionNode;
 use crate::attest;
 use crate::blockstore::{BlockStore, StoredBlock, StoredReceipt};
 use crate::config::NodeParams;
@@ -26,6 +27,7 @@ use crate::explorer::tx_json;
 use crate::hex;
 use crate::net::NetHandle;
 use crate::oracle::{OracleMsg, OracleNode};
+use crate::reports::ReportNode;
 use crate::storage::{ExecLog, ExecMeta, FileSafety};
 use crate::sync::{self, Expect, SyncError};
 use crate::wire::{
@@ -49,6 +51,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod glue;
 
 /// Heights of history an in-memory node keeps for the API and for serving block sync (a node
 /// with a RocksDB data directory keeps all of it).
@@ -198,6 +202,12 @@ struct Driver<S: KvStore + 'static> {
     oracle: Option<OracleNode>,
     /// Committed blocks waiting for their beacon before they can be executed (oracle chains only).
     pending_exec: VecDeque<btb_consensus::Block>,
+    /// Blocks are being executed from a block sync response (not live consensus).
+    applying_sync: bool,
+    /// HTTPS actions: fetches in flight and the validators' votes (`crate::actions`).
+    actions: ActionNode,
+    /// Signed reports for other chains (`crate::reports`).
+    reports: ReportNode,
 }
 
 /// `(sender, nonce)` of every transaction in the given block payloads.
@@ -340,8 +350,12 @@ impl<S: KvStore + 'static> Driver<S> {
                 .map_or(SYNC_GAP, |m| Duration::from_millis(m).min(SYNC_GAP)),
             oracle,
             pending_exec: VecDeque::new(),
+            applying_sync: false,
+            actions: ActionNode::new(p.genesis.chain_id, p.key.clone(), p.fetch_policy.clone()),
+            reports: ReportNode::new(p.genesis.chain_id),
         };
         d.begin_epoch(epoch)?;
+        d.oracle_after_block();
         Ok(d)
     }
 
@@ -480,6 +494,7 @@ impl<S: KvStore + 'static> Driver<S> {
         }
         self.check_epoch_switch();
         self.oracle_tick();
+        self.action_tick();
         self.flush_evidence();
         if !self.proofs_wanted.is_empty() {
             self.resolve_proofs();
@@ -741,13 +756,24 @@ impl<S: KvStore + 'static> Driver<S> {
             let head = self.exec_log.done().height;
             o.prices.for_proposal(head)
         });
-        if out.is_empty() && observations.is_empty() {
+        // Validators' answers to pending HTTPS actions ride along too, within the payload budget.
+        let mut actions = Vec::new();
+        for v in self.action_votes_for_proposal() {
+            let n = btb_codec::Encode::encode(&v).len() + 8;
+            if size + n > MAX_PAYLOAD {
+                break;
+            }
+            size += n;
+            actions.push(v);
+        }
+        if out.is_empty() && observations.is_empty() && actions.is_empty() {
             return Vec::new();
         }
         Batch {
             timestamp: now_ms(),
             txs: out,
             observations,
+            actions,
         }
         .encode()
     }
@@ -788,7 +814,9 @@ impl<S: KvStore + 'static> Driver<S> {
         self.drain_pending_exec();
     }
 
-    /// Execute queued blocks whose beacon is available, in order. Returns whether any ran.
+    /// Execute queued blocks whose beacon is available, in order. Returns whether any ran. A
+    /// block of an epoch that has no beacon key yet (the first blocks of a chain that generates
+    /// its key on chain) needs none and runs at once.
     fn drain_pending_exec(&mut self) -> bool {
         let mut ran = false;
         while self.fatal.is_none() {
@@ -796,17 +824,25 @@ impl<S: KvStore + 'static> Driver<S> {
                 break;
             };
             let h = front.height;
-            let beacon = self.oracle.as_ref().and_then(|o| o.beacons.get(h)).cloned();
-            let Some(beacon) = beacon else {
-                if let Some(o) = self.oracle.as_mut() {
-                    if o.waiting.map(|w| w.0) != Some(h) {
-                        o.waiting = Some((h, Instant::now(), None));
+            let epoch = self.state.config().staking.epoch_of_block(h);
+            let required =
+                btb_chain::oracle::beacon_required(self.state.store(), epoch).unwrap_or(true);
+            let beacon = if required {
+                let found = self.oracle.as_ref().and_then(|o| o.beacons.get(h)).cloned();
+                let Some(found) = found else {
+                    if let Some(o) = self.oracle.as_mut() {
+                        if o.waiting.map(|w| w.0) != Some(h) {
+                            o.waiting = Some((h, Instant::now(), None));
+                        }
                     }
-                }
-                break;
+                    break;
+                };
+                Some(found)
+            } else {
+                None
             };
             let block = self.pending_exec.pop_front().expect("front exists");
-            self.execute_now(block, Some(beacon));
+            self.execute_now(block, beacon);
             ran = true;
         }
         if self.pending_exec.is_empty() {
@@ -863,9 +899,14 @@ impl<S: KvStore + 'static> Driver<S> {
             })?;
         let head = self.state.head().map_err(|e| e.to_string())?;
         let root = self.state.root().map_err(|e| e.to_string())?;
-        let (ts, txs, observations) = match Batch::decode(&block.payload) {
-            Some(b) => (b.timestamp.max(head.timestamp), b.txs, b.observations),
-            None => (head.timestamp, Vec::new(), Vec::new()),
+        let (ts, txs, observations, action_votes) = match Batch::decode(&block.payload) {
+            Some(b) => (
+                b.timestamp.max(head.timestamp),
+                b.txs,
+                b.observations,
+                b.actions,
+            ),
+            None => (head.timestamp, Vec::new(), Vec::new(), Vec::new()),
         };
         let meta = ExecMeta {
             height: block.height,
@@ -873,11 +914,12 @@ impl<S: KvStore + 'static> Driver<S> {
             id: block.id(),
         };
         self.exec_log.begin(meta, head.height)?;
-        let chain_block =
-            ChainBlock::new(head.height + 1, head.hash, ts, root, txs).with_oracle(OracleInput {
+        let chain_block = ChainBlock::new(head.height + 1, head.hash, ts, root, txs)
+            .with_oracle(OracleInput {
                 beacon: beacon.clone(),
                 observations,
-            });
+            })
+            .with_actions(action_votes);
         let (chain_block, receipts, new_root) = match self
             .executor
             .execute_block(&mut self.state, &chain_block)
@@ -963,6 +1005,7 @@ impl<S: KvStore + 'static> Driver<S> {
             self.proofs_wanted.push((epoch, stored.consensus));
             self.resolve_proofs();
         }
+        self.oracle_after_block();
         Ok(())
     }
 
@@ -973,6 +1016,9 @@ impl<S: KvStore + 'static> Driver<S> {
         let Some(msg) = OracleMsg::decode(bytes) else {
             return;
         };
+        if self.on_action_msg(from, &msg) {
+            return;
+        }
         let is_validator = self.keys.contains(&from);
         let Some(o) = self.oracle.as_mut() else {
             return;
@@ -989,19 +1035,94 @@ impl<S: KvStore + 'static> Driver<S> {
                 }
                 false
             }
-            _ if !is_validator => false,
+            // A partial is authenticated against the key's holder list, which may include the
+            // next epoch's validators before this node switched epochs.
             OracleMsg::Partial { height, index, sig } => {
                 o.beacons.on_partial(&from, height, index, &sig).is_some()
             }
+            _ if !is_validator => false,
             OracleMsg::Beacon(b) => o.beacons.on_beacon(b),
             OracleMsg::Price(ob) => {
                 o.prices.on_observation(ob, &self.keys);
                 false
             }
+            // handled by `on_action_msg` above
+            OracleMsg::Action(_)
+            | OracleMsg::ReportPartial { .. }
+            | OracleMsg::ReportSig { .. }
+            | OracleMsg::ReportWant { .. } => false,
         };
         if completed {
             let ran = self.drain_pending_exec();
             self.after_oracle_execution(ran);
+        }
+    }
+
+    /// After a block was executed: let the beacon key generation make progress (deal, complain,
+    /// collect shares), install new epoch keys and release partials that were waiting for one.
+    fn oracle_after_block(&mut self) {
+        let me = self.index();
+        let Some(o) = self.oracle.as_mut() else {
+            return;
+        };
+        let Ok(head) = self.state.head() else {
+            return;
+        };
+        let epoch = self.state.config().staking.epoch_of_block(head.height + 1);
+        let ops = match o.dkg.step(self.state.store(), head.height + 1, epoch) {
+            Ok(ops) => ops,
+            Err(e) => {
+                eprintln!("btb-node[{me}]: beacon key generation: {e}");
+                Vec::new()
+            }
+        };
+        if std::mem::take(&mut o.dkg.changed) {
+            o.shares_changed = true;
+        }
+        o.sync_keys(&self.state, epoch);
+        let released = o.beacons.flush();
+        for m in released {
+            self.net.broadcast(m.frame());
+        }
+        // While catching up on old blocks the windows are long past: send nothing.
+        if !ops.is_empty() && !self.applying_sync {
+            self.submit_dkg(ops);
+        }
+    }
+
+    /// Sign key generation operations with the consensus key and submit them.
+    fn submit_dkg(&mut self, ops: Vec<btb_chain::DkgOp>) {
+        let addr = account_address(&self.signing.verifying_key().to_bytes());
+        let mempool = &self.mempool;
+        if let Some(o) = self.oracle.as_mut() {
+            o.dkg.pending.retain(|id| mempool.contains(id));
+        }
+        for op in ops {
+            // The next free nonce: committed ones plus our own still waiting in the mempool.
+            let waiting = self
+                .oracle
+                .as_ref()
+                .map_or(0, |o| o.dkg.pending.len() as u64);
+            let tx = Transaction::sign(
+                TxBody {
+                    chain_id: self.chain_id,
+                    nonce: self.state.nonce(&addr).unwrap_or(0) + waiting,
+                    kind: TxKind::Dkg(op),
+                },
+                &self.signing,
+            );
+            match self.add_tx(&tx.encode(), None) {
+                Ok(id) => {
+                    if let Some(o) = self.oracle.as_mut() {
+                        o.dkg.pending.push(id);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "btb-node[{}]: could not submit a beacon key generation transaction: {e} \
+                     (the consensus key's account must hold a little BTB for fees)",
+                    self.index()
+                ),
+            }
         }
     }
 
@@ -1341,13 +1462,16 @@ impl<S: KvStore + 'static> Driver<S> {
             end_height: end,
         };
         let n = sync::verify(r, &expect)?;
+        self.applying_sync = true;
         for b in r.blocks.iter().take(n) {
             self.execute_commit(b.clone());
             if self.fatal.is_some() {
                 // The driver stops; report it as a bad start rather than panicking.
+                self.applying_sync = false;
                 return Err(SyncError::BadStart);
             }
         }
+        self.applying_sync = false;
         // The response may carry the proof that closes the epoch: keep it for others.
         let last = &r.blocks[n - 1];
         if last.height == end && r.blocks.len() > n && self.store.proof(epoch).is_none() {
@@ -1771,11 +1895,14 @@ impl<S: KvStore + 'static> Driver<S> {
                     }),
                 })
             }
+            "btb_actionRequests" => self.rpc_action_requests(),
+            "btb_oracleReport" => self.rpc_report(arr),
             m if m.starts_with("btb_oracle") => {
                 crate::oracle_rpc::handle(&self.state, &self.store, m, arr)
             }
             m if m.starts_with("btb_dex") => crate::dex_rpc::handle(&self.state, m, arr),
             m if m.starts_with("btb_storage") => crate::storage_rpc::handle(&self.state, m, arr),
+            m if m.starts_with("btb_channel") => crate::channel_rpc::handle(&self.state, m, arr),
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {method}"),
@@ -1835,6 +1962,8 @@ impl<S: KvStore + 'static> Driver<S> {
                 "holds_share": o.beacons.holds_share(),
                 "blocks_waiting_for_beacon": self.pending_exec.len(),
                 "rejected_partials": o.beacons.rejected,
+                "dkg_deals_sent": o.dkg.deals_sent,
+                "dkg_complaints_sent": o.dkg.complaints_sent,
                 "pending_prices": o.prices.pending(),
             })),
             "evidence": self.evidence,
@@ -1973,6 +2102,7 @@ mod tests {
             timestamp: 1,
             txs: txs[..2].to_vec(),
             observations: Vec::new(),
+            actions: Vec::new(),
         }
         .encode();
         let taken = payload_nonces(&[ancestor.as_slice()]);

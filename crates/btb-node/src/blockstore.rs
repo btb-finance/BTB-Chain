@@ -658,6 +658,7 @@ mod tests {
                 timestamp: 1,
                 txs,
                 observations: vec![],
+                actions: vec![],
             }
             .encode();
             b.consensus.payload_hash = ConsensusBlock::hash_payload(&b.consensus.payload);

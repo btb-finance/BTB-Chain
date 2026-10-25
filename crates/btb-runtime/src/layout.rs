@@ -88,6 +88,30 @@ pub fn oracle_price_key(pair: u32) -> Vec<u8> {
     k
 }
 
+/// `50 01`: the oracle config; its presence means the chain has a beacon committee.
+pub fn oracle_config_key() -> Vec<u8> {
+    vec![TAG_ORACLE, 0x01]
+}
+
+/// Reports for other chains (`btb-chain` `actions.rs`, `docs/ORACLES.md`).
+pub const TAG_REPORT: u8 = 0x52;
+
+/// `52 00`: the next report id, `u64` LE.
+pub fn report_counter_key() -> Vec<u8> {
+    vec![TAG_REPORT, 0x00]
+}
+
+/// `52 01 id:u64be`: a report waiting for (or holding) its committee signature,
+/// `height:u64 LE || contract[32] || data`. Ids ascend with height, so the oldest come first.
+pub fn report_key(id: u64) -> Vec<u8> {
+    let mut k = vec![TAG_REPORT, 0x01];
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// Most reports one call may queue.
+pub const MAX_REPORTS_PER_CALL: u32 = 8;
+
 pub fn usage_key(addr: &Address) -> Vec<u8> {
     let mut k = vec![TAG_USAGE];
     k.extend_from_slice(addr);

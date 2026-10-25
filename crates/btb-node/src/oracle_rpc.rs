@@ -2,7 +2,8 @@
 //!
 //! | Method | Parameters | Result |
 //! | --- | --- | --- |
-//! | `btb_oracleConfig` | `[]` | `null` (no oracles) or `{threshold, holders, group_key, max_age_blocks, pairs}` |
+//! | `btb_oracleConfig` | `[]` | `null` (no oracles) or `{epoch, key, interim_dealer, dkg_window, max_age_blocks, pairs}`; `key` is `null` while the epoch has none, else `{origin, threshold, group_key, holders}` |
+//! | `btb_oracleDkg` | `[]` | the key generations on the board: `[{target, from, status, window_start, window_end, deal_end, committee, deals, disqualified}]` |
 //! | `btb_oracleBeacon` | `[]` or `[height]` | `{epoch, height, signature, seed}`; no height: the last executed block's |
 //! | `btb_oraclePrice` | `[pair_id]` | `null` or `{pair, name, price, decimals, height, reporters}` |
 //!
@@ -13,8 +14,8 @@
 use crate::blockstore::BlockStore;
 use crate::driver::{RpcError, RpcResult};
 use crate::hex;
-use btb_chain::oracle;
 use btb_chain::ChainState;
+use btb_chain::{dkg, oracle};
 use btb_oracle::Beacon;
 use btb_runtime::KvStore;
 use serde_json::{json, Value};
@@ -38,19 +39,53 @@ pub fn handle<S: KvStore>(
     method: &str,
     params: &[Value],
 ) -> RpcResult {
-    let Some(loaded) = oracle::load(st.store()).map_err(app)? else {
+    let Some(og) = oracle::load(st.store()).map_err(app)? else {
         return Ok(Value::Null);
     };
     match method {
-        "btb_oracleConfig" => Ok(json!({
-            "threshold": loaded.group.threshold,
-            "group_key": hex::encode(&loaded.group.public_key.to_bytes()),
-            "holders": loaded.genesis.holders.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
-            "max_age_blocks": loaded.genesis.max_age_blocks,
-            "pairs": loaded.genesis.pairs.iter()
-                .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
-                .collect::<Vec<_>>(),
-        })),
+        "btb_oracleConfig" => {
+            let head = st.head().map_err(app)?.height;
+            let epoch = st.config().staking.epoch_of_block(head + 1);
+            let key = oracle::epoch_key(st.store(), epoch).map_err(app)?;
+            Ok(json!({
+                "epoch": epoch,
+                "key": key.map(|k| json!({
+                    "origin": k.origin,
+                    "threshold": k.group.threshold,
+                    "group_key": hex::encode(&k.group.public_key.to_bytes()),
+                    "holders": k.holders.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
+                })),
+                "interim_dealer": !og.group_key.is_empty(),
+                "dkg_window": og.dkg_window,
+                "max_age_blocks": og.max_age_blocks,
+                "pairs": og.pairs.iter()
+                    .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        "btb_oracleDkg" => {
+            let mut out = Vec::new();
+            for s in dkg::sessions(st.store()).map_err(app)? {
+                let deals = dkg::deals(st.store(), s.target).map_err(app)?;
+                out.push(json!({
+                    "target": s.target,
+                    "from": s.from,
+                    "status": match s.status {
+                        dkg::STATUS_OPEN => "open",
+                        dkg::STATUS_DONE => "done",
+                        _ => "failed",
+                    },
+                    "window_start": s.window_start,
+                    "window_end": s.window_end,
+                    "deal_end": s.deal_end,
+                    "committee": s.committee().iter().map(|k| hex::encode(k)).collect::<Vec<_>>(),
+                    "deals": deals.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+                    "disqualified": deals.iter().filter(|(_, d)| d.disqualified)
+                        .map(|(d, _)| *d).collect::<Vec<_>>(),
+                }));
+            }
+            Ok(Value::Array(out))
+        }
         "btb_oracleBeacon" => {
             let head = st.head().map_err(app)?.height;
             let h = match params.first() {
@@ -72,7 +107,7 @@ pub fn handle<S: KvStore>(
                 .and_then(Value::as_u64)
                 .and_then(|x| u32::try_from(x).ok())
                 .ok_or_else(|| RpcError::invalid_params("pair id must be a number"))?;
-            let Some(cfg) = loaded.genesis.pairs.iter().find(|p| p.id == pair) else {
+            let Some(cfg) = og.pairs.iter().find(|p| p.id == pair) else {
                 return Ok(Value::Null);
             };
             Ok(match oracle::price(st.store(), pair).map_err(app)? {

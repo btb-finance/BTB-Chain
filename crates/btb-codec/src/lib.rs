@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+pub mod http;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 

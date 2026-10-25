@@ -768,6 +768,43 @@ struct Byzantine {
     _rt: tokio::runtime::Runtime,
 }
 
+#[test]
+fn large_site_file_points_at_a_storage_root() {
+    let _g = serial();
+    let mut e = setup();
+    // The pointer is an ordinary small site file holding the storage root in hex. This root is
+    // not on chain, so fetching the bytes must fail (nothing unverified is ever served), while
+    // an edge node that asks for the redirect gets the root and fetches from storage itself.
+    let root = hex::encode(&[0xabu8; 32]);
+    publish(&mut e, "movie.mp4.root", root.as_bytes());
+    let c = hex::encode(&e.ctr);
+    e.c.wait_until("the host to serve the pointer", 30, || {
+        e.get(&format!("/site/{c}/movie.mp4.root")).status == 200
+    });
+    let url = format!("/site/{c}/movie.mp4");
+    let r = http(e.addr(), "GET", &url, &[("X-BTB-Storage", "redirect")]);
+    assert_eq!(r.status, 200);
+    assert!(r.body.is_empty());
+    assert_eq!(r.headers["x-btb-storage-root"], root);
+    assert_eq!(r.headers["content-type"], "application/octet-stream");
+    assert_eq!(r.headers["etag"], format!("\"{root}\""));
+    let r = http(
+        e.addr(),
+        "GET",
+        &url,
+        &[("If-None-Match", &format!("\"{root}\""))],
+    );
+    assert_eq!(r.status, 304);
+    let r = e.get(&url);
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(r.text().contains("storage fetch failed"), "{}", r.text());
+    // The same file by root, and malformed roots.
+    assert_eq!(e.get(&format!("/file/{root}")).status, 502);
+    assert_eq!(e.get("/file/not-hex").status, 400);
+    // A path with neither a file nor a pointer is still a 404.
+    assert_eq!(e.get(&format!("/site/{c}/other.mp4")).status, 404);
+}
+
 fn byzantine(c: &Lite, index: usize) -> Byzantine {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)

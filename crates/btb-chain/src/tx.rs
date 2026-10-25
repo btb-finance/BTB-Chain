@@ -13,6 +13,8 @@
 //! Unstake  (tag 4): amount:u64
 //! RegisterValidator (tag 5): consensus_key[32] || network_addr:bytes
 //! SubmitEvidence    (tag 6): epoch:u64 || evidence
+//! Dkg               (tag 14): sub:u8 || fields (`dkg.rs`: 0 deal, 1 complain), sent by a consensus key
+//! Action            (tag 13): sub:u8 || fields (`actions.rs`: 0 request an HTTPS action, 1 set the contract's hosts)
 //! Storage           (tag 12): sub:u8 || fields (`storage.rs`: 0 register, 1 add deposit, 2 withdraw, 3 store, 4 prove)
 //! Dex               (tag 10): sub:u8 || fields (`dex.rs`: 0 place, 1 cancel)
 //! Site              (tag 9): sub:u8 || fields (`site.rs`: 0 publish, 1 remove)
@@ -23,8 +25,8 @@
 //! ```
 //!
 //! `kind` is the entry-point kind (0 query, 1 mutation, 2 cron, 3 action). All four decode so
-//! the error is a clear "kind not allowed", but only mutation is valid in a
-//! transaction: queries never go through consensus and actions are not transactions.
+//! the error is a clear "kind not allowed", but only mutation is valid in a `Call`: queries never
+//! go through consensus, and an action is requested with `Action` (tag 13), not called.
 //!
 //! The signature is Ed25519 over `SHA256("btb.tx.sig.v1" || body)`. The body contains the
 //! chain id, so a signature made for one chain is useless on another. The sender is
@@ -206,6 +208,10 @@ pub enum TxKind {
     Dex(crate::dex::DexOp),
     /// A storage-node or stored-file operation (`crate::storage`).
     Storage(crate::storage::StorageOp),
+    /// A beacon key-generation message (`crate::dkg`), signed by a validator's consensus key.
+    Dkg(crate::dkg::DkgOp),
+    /// An HTTPS action request, or the contract's host allowlist (`crate::actions`).
+    Action(crate::actions::ActionOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -351,6 +357,14 @@ impl Encode for TxBody {
                 12u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Dkg(op) => {
+                14u8.encode_to(out);
+                op.encode_to(out);
+            }
+            TxKind::Action(op) => {
+                13u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
     }
 }
@@ -405,6 +419,14 @@ impl TxBody {
             },
             12 => match crate::storage::StorageOp::decode_from(r)? {
                 Ok(op) => TxKind::Storage(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            14 => match crate::dkg::DkgOp::decode_from(r)? {
+                Ok(op) => TxKind::Dkg(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            13 => match crate::actions::ActionOp::decode_from(r)? {
+                Ok(op) => TxKind::Action(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
             t => return Err(TxError::BadTag(t)),
@@ -512,6 +534,8 @@ impl Transaction {
             TxKind::Site(op) => op.gas(),
             TxKind::Dex(op) => op.gas(),
             TxKind::Storage(op) => op.gas(),
+            TxKind::Dkg(op) => op.gas(),
+            TxKind::Action(op) => op.gas(),
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }
@@ -524,6 +548,7 @@ impl Transaction {
     pub fn gas_limit(&self) -> u64 {
         match &self.body.kind {
             TxKind::Call { gas_limit, .. } => *gas_limit,
+            TxKind::Action(op) => op.gas_limit(),
             _ => self.intrinsic_gas(),
         }
     }

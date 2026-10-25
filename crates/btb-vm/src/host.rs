@@ -109,6 +109,17 @@ pub mod abi {
     /// `HOST_PRICE_MUTATION` gas (a read plus a per-read fee that goes to the validators); in
     /// queries `HOST_PRICE_QUERY`, and queries are not billed.
     pub const PRICE: u64 = 41;
+    /// `report_request(data_ptr, data_len) -> report id | NOT_FOUND`. Mutations and crons only
+    /// (a read-only host, so queries, actions and transforms, traps with `WriteInQuery`).
+    /// Asks the chain's beacon committee to threshold-sign `data` (at most `MAX_REPORT_BYTES`)
+    /// as a report for other chains; returns the report id (a counter, chain wide). The signed
+    /// message binds the chain id, the calling contract, the id and the data, so a report cannot
+    /// be passed off as another contract's. `NOT_FOUND`: the host has no report queue (a chain
+    /// without an oracle committee). Gas `HOST_REPORT_REQUEST + REPORT_BYTE * len`, charged first.
+    pub const REPORT_REQUEST: u64 = 42;
+
+    /// Largest report accepted by `report_request`.
+    pub const MAX_REPORT_BYTES: u64 = 1024;
 
     /// Largest `len` accepted by `random_bytes`.
     pub const MAX_RANDOM_BYTES: u64 = 1024;
@@ -312,6 +323,11 @@ pub trait Host {
     }
     /// The agreed price of `pair`, if any.
     fn price(&mut self, _pair: u32) -> Option<PriceRecord> {
+        None
+    }
+    /// Queue `data` to be threshold-signed as a report for other chains; returns its id. `None`:
+    /// the host has no report queue.
+    fn report_request(&mut self, _data: &[u8]) -> Option<u64> {
         None
     }
 }
@@ -668,6 +684,15 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                         0
                     }
                 }
+            }
+            abi::REPORT_REQUEST => {
+                check_write(host)?;
+                vm.charge_gas(cost(gas::HOST_REPORT_REQUEST, gas::REPORT_BYTE, a1))?;
+                if a1 > abi::MAX_REPORT_BYTES {
+                    return Err(Trap::Abort("report_request: data above the maximum".into()));
+                }
+                let data = buf(vm, a0, a1)?;
+                host.report_request(&data).unwrap_or(abi::NOT_FOUND)
             }
             abi::RETURN_DATA => {
                 vm.charge_gas(cost(gas::HOST_RETURN_DATA, gas::RETURN_BYTE, a1))?;

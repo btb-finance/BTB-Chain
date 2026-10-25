@@ -1,6 +1,6 @@
 # Hosting nodes
 
-Status: working on a local multi-validator network (`crates/btb-host`, tests in `crates/btb-host/tests/host.rs`). Not done: payment-channel fees on requests, RocksDB persistence of the follower's state, state sync from snapshots, a relay for signed transactions, edge caching (see [Limits](#limits)).
+Status: working on a local multi-validator network (`crates/btb-host`, tests in `crates/btb-host/tests/host.rs`). Not done: payment-channel fees on requests, RocksDB persistence of the follower's state, state sync from snapshots, a relay for signed transactions (see [Limits](#limits)). Large files from storage nodes are served ([below](#large-files-from-storage-nodes)); edge caching in front of hosting nodes is [EDGE.md](EDGE.md).
 
 A hosting node is a **non-validator that follows the chain without trusting anyone** and serves the read side of an app: queries, live subscriptions, websites and Merkle proofs. Doubling the number of hosting nodes doubles read capacity without adding work for validators ([SCALING.md](SCALING.md)).
 
@@ -135,6 +135,16 @@ A contract's deployer publishes static files with the `Site` transaction (`TxKin
 
 Serving: `GET /site/<contract>/<path>` (`/site/<contract>/` and `dir/` serve `index.html`). Content types come from the extension (unknown ones are `application/octet-stream`); responses carry `ETag` (and answer `If-None-Match` with `304`), `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups`. The sandbox gives every site an opaque origin, so a contract's JavaScript cannot read another contract's site, cookies or local storage on the same host; its calls to the node's API are cross-origin requests the API allows. A site that needs same-origin features should be served from its own domain (a reverse proxy mapping a hostname to `/site/<contract>/`).
 
+### Large files from storage nodes
+
+Files above the on-chain limit live on storage nodes ([STORAGE.md](STORAGE.md)). A hosting node serves them by **storage root**, verified before a byte is sent:
+
+- `GET /file/<root hex>`: the file with that root. The node asks the chain where the pieces are (`btb_storageFile`), downloads any `k` of the `n` pieces, checks each piece's Merkle path against the root, decodes, encodes again and compares the id (`btb_storage::client::fetch`). `ETag` is the root and the response is `immutable`; `X-BTB-Storage-Root` names it.
+- `GET /site/<contract>/<path>` when `<path>` is not a site file but `<path>.root` is: that small on-chain file holds the 64-hex root, and the node serves the large file under `<path>` with the content type of `<path>`'s extension. The deployer publishes the pointer with a normal `Site` transaction after `btb store`.
+- A request with `X-BTB-Storage: redirect` (an [edge node](EDGE.md), which fetches from storage nodes itself) gets `200` with `X-BTB-Storage-Root` and an empty body instead.
+
+The whole file is held in memory while it is fetched and there is no range support here; put an edge node in front for popular or very large files.
+
 ## Tests
 
 `crates/btb-host/tests/host.rs` runs a real 4-validator cluster (`crates/btb-node/tests/lite`, real QUIC and consensus) and a hosting node:
@@ -151,7 +161,7 @@ Serving: `GET /site/<contract>/<path>` (`/site/<contract>/` and `dir/` serve `in
 ## Limits
 
 - **State is in memory.** A restarted hosting node replays the chain from genesis, which needs validators that still hold the history (RocksDB validators keep all of it, memory validators 4096 heights). Persisting the follower's state in RocksDB and state sync from snapshots are not done.
-- **No fees yet.** Hosting nodes are meant to earn per-request fees through payment-channel vouchers ([TOKENOMICS.md](TOKENOMICS.md)); this crate serves requests for free. The relay share of mutation fees is not paid either ([CHAIN.md](CHAIN.md#fees)).
+- **No fees yet.** Hosting nodes are meant to earn per-request fees through payment-channel vouchers ([TOKENOMICS.md](TOKENOMICS.md)); this crate serves requests for free (edge nodes already sell requests against vouchers, [EDGE.md](EDGE.md#payments)). The relay share of mutation fees is not paid either ([CHAIN.md](CHAIN.md#fees)).
 - **No transaction relay.** A hosting node does not accept signed transactions; send them to a validator. (Validators accept sync requests from followers but not transactions or consensus messages.)
 - **Reads share the block-execution thread** (see above), and the HTTP server is a simple thread-per-connection one with a connection cap (`max_connections`, 256).
 - **Head proofs are unanchored** until a few blocks later (the attestation and the commit evidence need the blocks after the height); ranges cannot be proven (see [Proofs](#proofs)). State roots *are* validator-attested; a client that does not pass the validator set still gets only the Merkle check.

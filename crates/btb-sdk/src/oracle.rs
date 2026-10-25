@@ -43,6 +43,92 @@ use alloc::vec::Vec;
 pub mod num {
     pub const RANDOM_BYTES: u64 = 40;
     pub const PRICE: u64 = 41;
+    pub const REPORT_REQUEST: u64 = 42;
+}
+
+/// Largest report `report::request` accepts.
+pub const MAX_REPORT_BYTES: usize = 1024;
+
+/// Reports for other chains (`docs/ORACLES.md`, section 4).
+pub mod report {
+    use super::*;
+
+    /// Ask the beacon committee to threshold-sign `data` for other chains. Returns the report id.
+    /// Mutations and crons only. The signature covers the chain id, this contract's address, the
+    /// id and `data`; relayers fetch it with the `btb_oracleReport` RPC and a verifier on the
+    /// other chain checks it against the committee's group key.
+    pub fn request(data: &[u8]) -> u64 {
+        if data.len() > MAX_REPORT_BYTES {
+            crate::host::abort("report::request: at most 1024 bytes");
+        }
+        let id = ecall(
+            num::REPORT_REQUEST,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            0,
+            0,
+            0,
+        );
+        if id == u64::MAX {
+            crate::host::abort("report::request: this chain has no oracle committee");
+        }
+        id
+    }
+}
+
+/// HTTPS actions (`docs/ORACLES.md`, section 3).
+///
+/// ```ignore
+/// // Phase 1, read-only, in the requesting transaction: what should every validator fetch?
+/// #[btb::action]
+/// pub fn weather(city: String) -> HttpRequest {
+///     HttpRequest::get(format!("https://api.example.com/w/{city}"))
+/// }
+///
+/// // Phase 2, per validator, pure: keep only what is stable. The validators sign the encoding
+/// // of the return value; the string names the action.
+/// #[btb::transform("weather")]
+/// pub fn weather_transform(resp: HttpResponse) -> i32 {
+///     /* parse resp.body */
+///     0
+/// }
+///
+/// // Phase 3: the chain delivers the agreed result (or an error status) in a later block.
+/// #[btb::mutation]
+/// pub fn weather_callback(id: Address, args: Vec<u8>, status: u8, data: Vec<u8>) {
+///     action::require_callback();
+///     if status == action::STATUS_OK { /* i32::decode(&data) ... */ }
+/// }
+/// ```
+pub mod action {
+    use btb_codec::Address;
+
+    pub use btb_codec::http::{HttpRequest, HttpResponse, METHOD_GET, METHOD_POST};
+
+    /// The caller address the chain gives a callback. No account or contract has it.
+    pub const CALLER: Address = Address(*b"btb.action.callback.caller.v1\0\0\0");
+
+    /// Delivered: `data` is the transformed result that at least two thirds of the stake signed.
+    pub const STATUS_OK: u8 = 0;
+    /// Agreed failure: at least two thirds of the stake report the same error; `data` is a text.
+    pub const STATUS_FAILED: u8 = 1;
+    /// The validators answered differently and no result can reach two thirds any more.
+    pub const STATUS_DISAGREEMENT: u8 = 2;
+    /// Not enough validators answered before the deadline.
+    pub const STATUS_TIMEOUT: u8 = 3;
+
+    /// Is the running call the chain delivering an action result?
+    pub fn from_oracle() -> bool {
+        crate::host::caller() == CALLER
+    }
+
+    /// Abort unless the chain is delivering an action result. A callback must call this first:
+    /// the chain also refuses to run it from a transaction, this is the second lock.
+    pub fn require_callback() {
+        if !from_oracle() {
+            crate::host::abort("callback: only the chain may deliver action results");
+        }
+    }
 }
 
 /// Most bytes one `random_bytes` call returns.

@@ -26,12 +26,18 @@
 //!
 //! # Randomness
 //!
-//! There is no randomness beacon yet. Assignment and challenge chunks use a deterministic seed:
-//! the **parent block hash** for `Store` (the head hash while a block runs) and the **block's own
-//! hash** at the end-of-block scheduler. It is *grindable by a proposer*, who can try different
-//! transactions or timestamps to bias which nodes get a file or which chunk is challenged.
-//! That is acceptable for a testnet (a proposer cannot forge a proof or steal funds, only bias
-//! placement); it switches to the threshold beacon of `docs/ORACLES.md` with the oracle work.
+//! Assignment and challenge chunks use the **threshold beacon** of `docs/ORACLES.md` whenever the
+//! block has one: the seed is `SHA256("btb.storage.seed.v1" || beacon seed)` of the block being
+//! executed (state key `50 02`). The validators release the beacon of a height only after that
+//! block is committed, so neither the transactions that place a file nor the block that closes
+//! a challenge round can be steered by a proposer.
+//!
+//! **Fallback.** A chain without an oracle config, and the first `dkg_window` blocks of a chain
+//! that generates its first beacon key on chain, have no beacon. There the seed is the **parent
+//! block hash** for `Store` (the head hash while a block runs) and the **block's own hash** at
+//! the end-of-block scheduler. That is *grindable by a proposer*, who can try different
+//! transactions or timestamps to bias placement or challenged chunks; it cannot forge a proof
+//! or steal funds. Once the beacon exists the fallback is never used again.
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
@@ -905,7 +911,26 @@ fn digest(parts: &[&[u8]]) -> Hash {
     s.finalize().into()
 }
 
-/// The chain's seed for assignment while a block runs: the head (parent) hash.
+/// The seed derived from the beacon of block `height`, if the block has one.
+fn beacon_seed(kv: &impl KvStore, height: u64) -> Result<Option<Hash>, StateError> {
+    let Some(rec) = kv.get(&layout::oracle_seed_key())? else {
+        return Ok(None);
+    };
+    let at = rec.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok());
+    Ok(match (at, rec.get(8..40)) {
+        (Some(at), Some(seed)) if u64::from_le_bytes(at) == height && rec.len() == 40 => {
+            Some(digest(&[b"btb.storage.seed.v1", seed]))
+        }
+        _ => None,
+    })
+}
+
+/// The seed for block `height`: its beacon if it has one, else `fallback` (a block hash).
+fn seed_for(kv: &impl KvStore, height: u64, fallback: Hash) -> Result<Hash, StateError> {
+    Ok(beacon_seed(kv, height)?.unwrap_or(fallback))
+}
+
+/// The chain's fallback seed for assignment while a block runs: the head (parent) hash.
 fn head_hash(kv: &impl KvStore) -> Result<Hash, StateError> {
     let b = kv
         .get(&crate::state::meta_head_key())?
@@ -1068,7 +1093,7 @@ fn store(
         .pay_per_period(piece_len)
         .ok_or(StorageError::TooExpensive)?;
     // Plan the whole assignment before writing anything.
-    let seed = head_hash(kv)?;
+    let seed = seed_for(kv, height, head_hash(kv)?)?;
     let mut mine: BTreeMap<Address, u32> = BTreeMap::new();
     let mut planned: BTreeMap<Address, u64> = BTreeMap::new();
     let mut nodes = Vec::with_capacity(n);
@@ -1219,6 +1244,7 @@ pub(crate) fn end_block(
     height: u64,
     block_hash: Hash,
 ) -> Result<(), StateError> {
+    let block_hash = seed_for(kv, height, block_hash)?;
     if kv
         .scan(&[TAG_FILE], Some(&[TAG_FILE + 1]), false, 1)?
         .is_empty()

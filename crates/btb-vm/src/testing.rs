@@ -30,6 +30,8 @@ pub struct MemHost {
     pub random: Option<RandomSource>,
     /// Agreed prices by pair id.
     pub prices: BTreeMap<u32, PriceRecord>,
+    /// Reports queued by `report_request`, in order (the id is the index).
+    pub reports: Vec<Vec<u8>>,
 }
 
 impl TokenStore for MemHost {
@@ -148,6 +150,10 @@ impl Host for MemHost {
     }
     fn price(&mut self, pair: u32) -> Option<PriceRecord> {
         self.prices.get(&pair).copied()
+    }
+    fn report_request(&mut self, data: &[u8]) -> Option<u64> {
+        self.reports.push(data.to_vec());
+        Some(self.reports.len() as u64 - 1)
     }
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
         let Some(t) = self.tables.get(table) else {

@@ -461,9 +461,10 @@ impl<S: KvStore> ChainState<S> {
         Self::from_genesis_full(kv, genesis, validators, None)
     }
 
-    /// `from_genesis_with_validators` plus the oracle config (beacon key holders and price
+    /// `from_genesis_with_validators` plus the oracle config (beacon key setup and price
     /// feeds, `crate::oracle`). The genesis hash commits to it. With an oracle config every
-    /// block must carry a valid beacon.
+    /// block of an epoch that has a beacon key must carry a valid beacon; the validators
+    /// generate the keys on chain (`crate::dkg`).
     pub fn from_genesis_full(
         mut kv: S,
         genesis: &GenesisConfig,
@@ -515,6 +516,8 @@ impl<S: KvStore> ChainState<S> {
         )
         .map_err(GenesisError::Config)?;
         if let Some(og) = oracle {
+            og.validate_for(genesis.config.staking.epoch_len)
+                .map_err(GenesisError::Config)?;
             crate::oracle::genesis_ops(og, &mut batch).map_err(GenesisError::Config)?;
         }
         batch.put(meta_config_key(), genesis.config.encode());

@@ -16,6 +16,7 @@
 //! | `btb_getAccountTxs` | `[address_hex, limit?, before_height?]` | newest-first transactions |
 //! | `btb_getEpoch` | `[epoch?]` | validator set of an epoch |
 //! | `btb_status` | `[]` | node status |
+//! | `btb_channel` | `[channel_id_hex]` | payment channel (payer, payer key, payee, deposit, expiry, closing) or `null`, see `channel_rpc` |
 //!
 //! The `btb_storage*` methods (storage nodes, stored files, duties) are in `storage_rpc`.
 //!

@@ -125,3 +125,9 @@ pub const HOST_PRICE_QUERY: u64 = 200;
 /// is paid like all gas to the validator pool.
 pub const PRICE_READ_FEE: u64 = 10_000;
 pub const HOST_PRICE_MUTATION: u64 = HOST_PRICE_QUERY + PRICE_READ_FEE;
+
+/// `report_request(data_ptr, len)`: base plus `REPORT_BYTE` per byte. The committee signs every
+/// report, which costs the validators a pairing-free partial signature each and a block's worth
+/// of gossip, so it is priced well above a storage write.
+pub const HOST_REPORT_REQUEST: u64 = 5_000;
+pub const REPORT_BYTE: u64 = 10;

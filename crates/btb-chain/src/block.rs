@@ -8,6 +8,7 @@
 //! `timestamp` (Unix milliseconds) is chosen by the proposer. Execution checks only that it is
 //! not earlier than the parent's; contracts never see it, and crons run by block height.
 
+use crate::actions::ActionVote;
 use crate::oracle::OracleInput;
 use crate::sha256;
 use crate::tx::{Hash, Transaction, TxError};
@@ -48,6 +49,9 @@ pub struct Block {
     /// the unique group signature on `(chain, epoch, height)` and the observations are covered
     /// by the consensus block id of the payload they came in.
     pub oracle: OracleInput,
+    /// Validators' signed answers to pending HTTPS actions (`crate::actions`). They need no
+    /// oracle config. Like `oracle`, not part of the header hash.
+    pub actions: Vec<ActionVote>,
 }
 
 pub fn tx_root(txs: &[Transaction]) -> Hash {
@@ -76,7 +80,14 @@ impl Block {
             },
             txs,
             oracle: OracleInput::default(),
+            actions: Vec::new(),
         }
+    }
+
+    /// The same block with validators' action votes attached.
+    pub fn with_actions(mut self, actions: Vec<ActionVote>) -> Self {
+        self.actions = actions;
+        self
     }
 
     /// The same block with oracle input attached.
@@ -103,8 +114,15 @@ impl Block {
         txs.encode_to(&mut o);
         // Optional trailing section: absent (not even a length) when there is no oracle input,
         // so blocks of chains without oracles encode exactly as before.
-        if !self.oracle.is_empty() {
+        if !self.oracle.is_empty() || !self.actions.is_empty() {
             self.oracle.encode_to(&mut o);
+        }
+        // Then, only if there are any, the action votes.
+        if !self.actions.is_empty() {
+            (self.actions.len() as u32).encode_to(&mut o);
+            for v in &self.actions {
+                v.encode_to(&mut o);
+            }
         }
         o
     }
@@ -124,6 +142,16 @@ impl Block {
         } else {
             OracleInput::decode_from(&mut r)?
         };
+        let mut actions = Vec::new();
+        if r.remaining() > 0 {
+            let n = u32::decode_from(&mut r)? as usize;
+            if n == 0 || n > crate::actions::MAX_VOTES_PER_BLOCK {
+                return Err(DecodeError::TrailingBytes.into());
+            }
+            for _ in 0..n {
+                actions.push(ActionVote::decode_from(&mut r)?);
+            }
+        }
         if r.remaining() != 0 {
             return Err(DecodeError::TrailingBytes.into());
         }
@@ -135,6 +163,7 @@ impl Block {
             header,
             txs,
             oracle,
+            actions,
         })
     }
 }

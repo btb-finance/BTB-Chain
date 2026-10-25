@@ -2,16 +2,20 @@
 //! storage for crash safety (`storage`), a JSON-RPC API (`rpc`) and configuration (`config`).
 //! See `docs/NODE.md`.
 
+pub mod actions;
 pub mod attest;
 pub mod blockstore;
+pub mod channel_rpc;
 pub mod config;
 pub mod dex_rpc;
+pub mod dkg;
 pub mod driver;
 pub mod explorer;
 pub mod hex;
 pub mod net;
 pub mod oracle;
 pub mod oracle_rpc;
+pub mod reports;
 pub mod rpc;
 pub mod storage;
 pub mod storage_rpc;

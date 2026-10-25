@@ -29,6 +29,8 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Site(_) => "site",
         TxKind::Dex(_) => "dex",
         TxKind::Storage(_) => "storage",
+        TxKind::Action(_) => "action",
+        TxKind::Dkg(_) => "dkg",
     }
 }
 
@@ -107,6 +109,30 @@ pub fn tx_json(tx: &Transaction) -> Value {
                 json!(format!("{op:?}").split([' ', '(', '{']).next()),
             );
         }
+        TxKind::Dkg(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
+        TxKind::Action(op) => match op {
+            btb_chain::ActionOp::Request {
+                contract,
+                function,
+                max_fee,
+                ..
+            } => {
+                o.insert("op".into(), json!("request"));
+                o.insert("to".into(), json!(hex::encode(contract)));
+                o.insert("function".into(), json!(function));
+                o.insert("max_fee".into(), json!(max_fee.to_string()));
+            }
+            btb_chain::ActionOp::SetHosts { contract, hosts } => {
+                o.insert("op".into(), json!("set_hosts"));
+                o.insert("to".into(), json!(hex::encode(contract)));
+                o.insert("hosts".into(), json!(hosts));
+            }
+        },
     }
     v
 }
@@ -116,6 +142,10 @@ pub fn counterparty(tx: &Transaction) -> Option<[u8; 32]> {
     match &tx.body.kind {
         TxKind::Transfer { to, .. } => Some(*to),
         TxKind::Call { contract, .. } => Some(*contract),
+        TxKind::Action(
+            btb_chain::ActionOp::Request { contract, .. }
+            | btb_chain::ActionOp::SetHosts { contract, .. },
+        ) => Some(*contract),
         TxKind::Site(btb_chain::site::SiteOp::Publish { contract, .. })
         | TxKind::Site(btb_chain::site::SiteOp::Remove { contract, .. }) => Some(*contract),
         _ => None,

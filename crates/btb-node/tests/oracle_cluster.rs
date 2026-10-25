@@ -102,6 +102,9 @@ struct Cluster {
     keys: Vec<SigningKey>,
     shares: Vec<KeyShare>,
     group: GroupKey,
+    /// The validators generate the beacon key on chain; `shares` and `group` are unused.
+    #[allow(dead_code)]
+    dkg: bool,
     ports: Vec<u16>,
     kvs: Vec<SharedKv>,
     nodes: Vec<Option<Node>>,
@@ -131,6 +134,11 @@ fn honest_prices() -> PriceFn {
 
 impl Cluster {
     fn new(total: usize, running: usize, prices: PriceFn) -> Cluster {
+        Self::build(total, running, prices, None)
+    }
+
+    /// `dkg`: `(epoch_len, dkg_window)` -> no trusted dealer; the validators generate the key.
+    fn build(total: usize, running: usize, prices: PriceFn, dkg: Option<(u64, u64)>) -> Cluster {
         let keys: Vec<SigningKey> = (0..total).map(|i| key(10 + i as u8)).collect();
         let faucet = Wallet {
             key: key(99),
@@ -148,12 +156,21 @@ impl Cluster {
             name: "btb-oracle-test".into(),
             timestamp: 0,
             gas_price: 1,
-            epoch_len: 10_000,
+            epoch_len: dkg.map_or(10_000, |d| d.0),
             min_stake: 100 * UNITS_PER_BTB,
             storage: Default::default(),
             oracle: Some(OracleGenesis {
-                group_key: group.encode(),
-                holders: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
+                group_key: if dkg.is_some() {
+                    Vec::new()
+                } else {
+                    group.encode()
+                },
+                holders: if dkg.is_some() {
+                    Vec::new()
+                } else {
+                    keys.iter().map(|k| k.verifying_key().to_bytes()).collect()
+                },
+                dkg_window: dkg.map_or(20, |d| d.1),
                 pairs: vec![
                     PairConfig {
                         id: 0,
@@ -181,8 +198,9 @@ impl Cluster {
             kvs: (0..total).map(|_| SharedKv::default()).collect(),
             nodes: (0..total).map(|_| None).collect(),
             keys,
-            shares,
+            shares: if dkg.is_some() { Vec::new() } else { shares },
             group,
+            dkg: dkg.is_some(),
             prices,
             wallet: faucet,
             _dir: tempfile::tempdir().unwrap(),
@@ -211,7 +229,8 @@ impl Cluster {
             round_timeout_ms: 600,
             idle_block_ms: 100,
         };
-        p.oracle_share = Some(self.shares[i].clone());
+        p.oracle_share = self.shares.get(i).cloned();
+        p.dkg_dir = Some(self._dir.path().join(format!("dkg{i}")));
         p.price_interval_ms = 150;
         let f = self.prices.clone();
         p.price_source = Some(PriceSource::new(move |pair| f(i, pair)));
@@ -578,4 +597,263 @@ fn a_node_that_joins_late_catches_up_and_gets_the_beacons_it_needs() {
     for k in 0..4 {
         assert!((1..=6).contains(&roll(&c, 3, &mut w, contract)), "{k}");
     }
+}
+
+// ------------------------------------------------------------------------------ on-chain DKG
+
+/// What `btb_oracleConfig` says about the key of the current epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyView {
+    epoch: u64,
+    origin: u64,
+    group_key: Vec<u8>,
+    holders: Vec<String>,
+}
+
+fn key_view(c: &Cluster, i: usize) -> Option<KeyView> {
+    let v = c.node(i).call("btb_oracleConfig", json!([])).ok()?;
+    let k = v.get("key").filter(|k| !k.is_null())?;
+    Some(KeyView {
+        epoch: v["epoch"].as_u64()?,
+        origin: k["origin"].as_u64()?,
+        group_key: hex::decode(k["group_key"].as_str()?).ok()?,
+        holders: k["holders"]
+            .as_array()?
+            .iter()
+            .map(|h| h.as_str().unwrap().to_string())
+            .collect(),
+    })
+}
+
+/// Check the beacon of `height` on node `i` against the group key `pk` (the message is the
+/// documented one, so anybody could do this).
+fn verify_beacon(c: &Cluster, i: usize, height: u64, pk: &[u8]) -> Beacon {
+    let v = c.node(i).call("btb_oracleBeacon", json!([height])).unwrap();
+    assert!(!v.is_null(), "node {i} has no beacon for {height}");
+    let b = Beacon {
+        epoch: v["epoch"].as_u64().unwrap(),
+        height: v["height"].as_u64().unwrap(),
+        signature: hex::decode(v["signature"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    };
+    let pk = btb_oracle::bls::G1::from_bytes(pk.try_into().unwrap()).unwrap();
+    let sig = btb_oracle::bls::G2::from_bytes(&b.signature).unwrap();
+    assert!(
+        btb_oracle::bls::verify(&pk, &beacon_message(CHAIN_ID, b.epoch, b.height), &sig),
+        "beacon {height} (epoch {}) does not verify under the group key",
+        b.epoch
+    );
+    b
+}
+
+#[test]
+fn validators_generate_the_beacon_key_on_chain_and_reshare_it_across_epochs() {
+    let _g = serial();
+    // 5 validators, 50-block epochs, a 14-block DKG window (deals in the first 7).
+    let (epoch_len, window) = (50u64, 14u64);
+    let c = Cluster::build(5, 5, honest_prices(), Some((epoch_len, window)));
+    c.wait_connected();
+
+    // No trusted party: the key does not exist until the validators have generated it, and the
+    // blocks of the window have no beacon.
+    assert!(key_view(&c, 0).is_none() || c.height(0) > 1);
+    c.wait_until("the genesis key", 60, || {
+        (0..5).all(|i| key_view(&c, i).is_some())
+    });
+    let k0 = key_view(&c, 0).unwrap();
+    assert_eq!((k0.epoch, k0.origin, k0.holders.len()), (0, 0, 5));
+    for i in 1..5 {
+        assert_eq!(
+            key_view(&c, i).unwrap(),
+            k0,
+            "node {i} disagrees on the key"
+        );
+    }
+    for h in 1..=window {
+        let b = c.node(0).call("btb_oracleBeacon", json!([h])).unwrap();
+        assert!(b.is_null(), "block {h} is inside the DKG window: no beacon");
+    }
+    let h = c.height(0).max(window + 2);
+    c.wait_until("beacons after the window", 30, || {
+        (0..5).all(|i| c.height(i) >= h + 2)
+    });
+    verify_beacon(&c, 0, h, &k0.group_key);
+    for i in 0..5 {
+        assert_eq!(
+            c.status(i)["oracle"]["holds_share"],
+            true,
+            "node {i} derived its share"
+        );
+        assert!(c.status(i)["oracle"]["dkg_deals_sent"].as_u64().unwrap() >= 1);
+    }
+    let sessions = c.node(0).call("btb_oracleDkg", json!([])).unwrap();
+    assert_eq!(sessions[0]["status"], "done");
+    assert_eq!(sessions[0]["deals"].as_array().unwrap().len(), 5);
+    assert!(sessions[0]["disqualified"].as_array().unwrap().is_empty());
+
+    // Validator 4 leaves: it unbonds, and epoch 1's set (and beacon committee) is {0..3}.
+    // This must land before the tail window locks the next set (height 37).
+    assert!(c.height(0) < epoch_len - window, "too late for the test");
+    // (its consensus key doubles as the operator key, so the DKG deal already used a nonce)
+    let acct = c
+        .node(0)
+        .call(
+            "btb_getAccount",
+            json!([hex::encode(&account_address(
+                &key(14).verifying_key().to_bytes()
+            ))]),
+        )
+        .unwrap();
+    let mut leaver = Wallet {
+        key: key(14),
+        nonce: acct["nonce"].as_u64().unwrap(),
+    };
+    let tx = leaver.sign(TxKind::Unstake {
+        amount: 100 * UNITS_PER_BTB,
+    });
+    c.run(0, &tx);
+
+    // Walk through epochs 1, 2 and 3 recording the key each epoch uses.
+    let mut seen: std::collections::BTreeMap<u64, KeyView> = std::collections::BTreeMap::new();
+    seen.insert(0, k0.clone());
+    c.wait_until("epoch 3", 150, || {
+        for i in 0..4 {
+            if let Some(k) = key_view(&c, i) {
+                seen.entry(k.epoch).or_insert(k);
+            }
+        }
+        (0..4).all(|i| c.status(i)["epoch"].as_u64().unwrap() >= 3)
+    });
+    c.wait_until("the key of epoch 3 on every node", 30, || {
+        for i in 0..4 {
+            if let Some(k) = key_view(&c, i) {
+                seen.entry(k.epoch).or_insert(k);
+            }
+        }
+        seen.contains_key(&3)
+    });
+    for e in 0..=3u64 {
+        let k = seen
+            .get(&e)
+            .unwrap_or_else(|| panic!("no key seen for epoch {e}"));
+        assert_eq!(
+            k.group_key, k0.group_key,
+            "resharing keeps one group key (epoch {e})"
+        );
+        assert_eq!(k.origin, e, "every epoch's key was generated on chain");
+    }
+    assert_eq!(seen[&0].holders.len(), 5);
+    for e in 1..=3 {
+        assert_eq!(seen[&e].holders.len(), 4, "epoch {e}: the leaver is out");
+    }
+    let leaver_key = hex::encode(&key(14).verifying_key().to_bytes());
+    for e in 1..=3 {
+        assert!(
+            !seen[&e].holders.contains(&leaver_key),
+            "epoch {e} still lists the removed validator"
+        );
+    }
+    assert!(seen[&0].holders.contains(&leaver_key));
+
+    // Beacons of every epoch verify under the one group key, and the nodes agree on blocks.
+    c.wait_until("blocks of epoch 3", 60, || {
+        (0..4).all(|i| c.height(i) >= 3 * epoch_len + 3)
+    });
+    let h = (0..4).map(|i| c.height(i)).min().unwrap();
+    assert!(h > 3 * epoch_len);
+    for height in [
+        window + 3,
+        epoch_len - 1,
+        epoch_len + 1,
+        2 * epoch_len + 5,
+        3 * epoch_len + 1,
+        h,
+    ] {
+        let b = verify_beacon(&c, 0, height, &k0.group_key);
+        for i in 1..4 {
+            assert_eq!(
+                verify_beacon(&c, i, height, &k0.group_key),
+                b,
+                "beacon {height} differs between nodes"
+            );
+        }
+    }
+    let blocks: Vec<Value> = (0..4)
+        .map(|i| c.node(i).call("btb_getBlock", json!([h])).unwrap())
+        .collect();
+    for b in &blocks {
+        assert!(!b.is_null(), "block {h} missing on a node");
+        assert_eq!(b["hash"], blocks[0]["hash"], "block {h} differs");
+    }
+    for i in 0..4 {
+        assert_eq!(c.status(i)["oracle"]["rejected_partials"], 0);
+    }
+    // The board of the last two generations is auditable over RPC.
+    let sessions = c.node(0).call("btb_oracleDkg", json!([])).unwrap();
+    let last = sessions.as_array().unwrap().last().unwrap().clone();
+    assert!(last["status"] == "done" || last["status"] == "open");
+    assert_eq!(
+        last["from"].as_u64().unwrap(),
+        last["target"].as_u64().unwrap() - 1
+    );
+}
+
+#[test]
+fn a_restarted_validator_keeps_its_share_and_the_next_resharing_still_works() {
+    let _g = serial();
+    let (epoch_len, window) = (40u64, 12u64);
+    let mut c = Cluster::build(4, 4, honest_prices(), Some((epoch_len, window)));
+    c.wait_connected();
+    c.wait_until("the genesis key", 60, || {
+        (0..4).all(|i| key_view(&c, i).is_some())
+    });
+    let k0 = key_view(&c, 0).unwrap();
+    // restart node 1 after the first resharing
+    c.wait_until("epoch 1", 90, || {
+        (0..4).all(|i| c.status(i)["epoch"].as_u64().unwrap() >= 1)
+    });
+    c.kill(1);
+    // 3 of 4 holders still sign (threshold 3); the chain keeps going
+    c.wait_until("progress with node 1 down", 30, || {
+        let h = c.height(0);
+        c.live().iter().all(|i| c.height(*i) >= h) && c.height(0) > epoch_len + 2
+    });
+    c.start(1);
+    c.wait_connected();
+    c.wait_until("node 1 holds a share again", 30, || {
+        c.status(1)["oracle"]["holds_share"] == true
+    });
+    c.wait_until("node 1 caught up", 60, || c.height(1) + 3 >= c.height(0));
+    // the next epoch change reshares again, with node 1 dealing from its recovered share
+    c.wait_until("epoch 3", 150, || {
+        (0..4).all(|i| c.status(i)["epoch"].as_u64().unwrap() >= 3)
+    });
+    let k3 = key_view(&c, 0).unwrap();
+    assert_eq!(k3.group_key, k0.group_key);
+    assert_eq!(k3.origin, k3.epoch);
+    // The restarted node dealt again from its recovered share (its counters restarted at 0), and
+    // the last generation on the board has at least the threshold of dealers (an individual
+    // deal can miss the short deal phase on a loaded machine).
+    c.wait_until("the epoch 3 key generation on the board", 30, || {
+        let s = c.node(1).call("btb_oracleDkg", json!([])).unwrap();
+        s.as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["target"] == 3 && x["status"] == "done")
+    });
+    assert!(
+        c.status(1)["oracle"]["dkg_deals_sent"].as_u64().unwrap() >= 1,
+        "node 1 did not deal after its restart: {}",
+        c.status(1)["oracle"]
+    );
+    let sessions = c.node(1).call("btb_oracleDkg", json!([])).unwrap();
+    let last = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["target"] == 3)
+        .unwrap();
+    assert!(last["deals"].as_array().unwrap().len() >= 3, "{last}");
 }

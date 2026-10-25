@@ -4,6 +4,8 @@
 //! * [`threshold`]: Shamir-shared keys, partial signatures, aggregation, the partial collector.
 //! * [`dkg`]: joint-Feldman distributed key generation with complaints, resharing, and the
 //!   trusted-dealer bootstrap.
+//! * [`dkg_crypto`]: encryption of DKG shares to consensus keys, and publicly checkable
+//!   decryption proofs for complaints.
 //! * [`beacon`]: the per-height beacon value and seed.
 //! * [`price`]: signed price observations and the stake-weighted median.
 //!
@@ -12,7 +14,9 @@
 pub mod beacon;
 pub mod bls;
 pub mod dkg;
+pub mod dkg_crypto;
 pub mod price;
+pub mod report;
 pub mod threshold;
 
 pub use beacon::{beacon_message, seed_of, Beacon};

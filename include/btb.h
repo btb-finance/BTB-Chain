@@ -38,6 +38,7 @@
 /* Oracles (range 40..49): see docs/ORACLES.md. */
 #define BTB_RANDOM_BYTES 40
 #define BTB_PRICE 41
+#define BTB_REPORT_REQUEST 42
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
@@ -174,6 +175,13 @@ static inline void btb_random_bytes(uint8_t *out, uint64_t len) {
  * per-read fee in gas. */
 static inline uint64_t btb_price(uint32_t pair, uint8_t out[32]) {
   return btb_ecall5(BTB_PRICE, pair, BTB_P(out), 0, 0, 0);
+}
+
+/* Mutations and crons only. Asks the beacon committee to threshold-sign data (at most 1024 bytes)
+ * for other chains; returns the report id, or BTB_NOT_FOUND on a chain without an oracle
+ * committee. Queries, actions and transforms trap. */
+static inline uint64_t btb_report_request(const uint8_t *data, uint64_t len) {
+  return btb_ecall5(BTB_REPORT_REQUEST, BTB_P(data), len, 0, 0, 0);
 }
 
 /* ---- User tokens (see docs/TOKENOMICS.md). 32-byte token ids; u128 amounts are passed as

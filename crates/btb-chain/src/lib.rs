@@ -6,22 +6,28 @@
 //! nothing uses floats or hash-map iteration order. Queries and actions are never
 //! transactions. See `docs/CHAIN.md`.
 
+pub mod actions;
 pub mod block;
 pub mod channel;
 pub mod dex;
+pub mod dkg;
+pub mod dkg_agent;
 pub mod exec;
 pub mod mempool;
 pub mod oracle;
 pub(crate) mod parallel;
+pub mod reports;
 pub mod site;
 pub mod staking;
 pub mod state;
 pub mod storage;
 pub mod tx;
 
+pub use actions::{ActionError, ActionOp, ActionVote};
 pub use block::{Block, Header};
 pub use channel::{channel_id, Channel, ChannelError, ChannelOp};
 pub use dex::{dex_fees, dex_vault, Asset, DexError, DexOp};
+pub use dkg::{DkgError, DkgOp};
 pub use exec::{BlockError, ExecMode, Executor, Invalid, Origin, Receipt, Revert, Status};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
 pub use oracle::{OracleGenesis, OracleInput, PairConfig};

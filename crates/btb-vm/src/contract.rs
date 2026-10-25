@@ -10,6 +10,11 @@
 //! (grows down from `sp`), then the input region (16-byte trampoline + input), both below
 //! `mem_size & !15`. The call fails with `OutOfMemory` unless at least `MIN_STACK` bytes remain between the loaded image and the input region.
 //!
+//! HTTPS actions (`docs/ORACLES.md`): `btb_action_<name>` runs read-only and returns the request
+//! to make (an `HttpRequest`). `btb_transform_<name>` is a pure entry that maps one validator's
+//! `HttpResponse` to the bytes the validators sign; it runs with no state access at all
+//! (`call_transform`). The agreed result is delivered to the mutation `<name>_callback`.
+//!
 //! Randomness: `random_bytes` (host call 40) is available only to mutation and cron entry points
 //! marked `randomness`. The marker is an exported symbol `btb_randomness_<kind>_<name>` (kind
 //! `mutation` or `cron`) that `#[btb::mutation(randomness)]` and
@@ -27,6 +32,9 @@ use crate::vm::{Exit, Vm};
 
 const PREFIX: &str = "btb_";
 const RANDOMNESS_PREFIX: &str = "btb_randomness_";
+const TRANSFORM_PREFIX: &str = "btb_transform_";
+/// Suffix of the mutation that receives an action's agreed result: `<action>_callback`.
+pub const CALLBACK_SUFFIX: &str = "_callback";
 const MAX_NAME: usize = 64;
 const EBREAK: u32 = 0x0010_0073;
 const TRAMPOLINE: u64 = 16;
@@ -119,6 +127,8 @@ pub struct CallOutcome {
 pub struct Contract {
     elf: Vec<u8>,
     entries: Vec<EntryPoint>,
+    /// `btb_transform_<name>` symbols: `(name, address)`, sorted by name.
+    transforms: Vec<(String, u64)>,
 }
 
 fn valid_name(n: &str) -> bool {
@@ -133,8 +143,22 @@ impl Contract {
     pub fn from_elf(bytes: &[u8]) -> Result<Self, ContractError> {
         let mut entries: Vec<EntryPoint> = Vec::new();
         let mut markers: Vec<(FunctionKind, String)> = Vec::new();
+        let mut transforms: Vec<(String, u64)> = Vec::new();
         for (sym, addr) in elf::export_list(bytes)? {
             if !sym.starts_with(PREFIX) {
+                continue;
+            }
+            if let Some(name) = sym.strip_prefix(TRANSFORM_PREFIX) {
+                if !valid_name(name) {
+                    return Err(ContractError::InvalidName(name.to_string()));
+                }
+                if transforms.iter().any(|(n, _)| n == name) {
+                    return Err(ContractError::DuplicateEntry {
+                        kind: FunctionKind::Action,
+                        name: format!("transform {name}"),
+                    });
+                }
+                transforms.push((name.to_string(), addr));
                 continue;
             }
             if let Some(rest) = sym.strip_prefix(RANDOMNESS_PREFIX) {
@@ -192,9 +216,11 @@ impl Contract {
             return Err(ContractError::NoEntryPoints);
         }
         entries.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        transforms.sort();
         Ok(Contract {
             elf: bytes.to_vec(),
             entries,
+            transforms,
         })
     }
 
@@ -209,7 +235,34 @@ impl Contract {
             .any(|e| e.kind == kind && e.name == name && e.randomness)
     }
 
-    /// Run one entry point in a fresh VM. Queries always run read-only, whatever `host` says.
+    /// Whether the entry point `(kind, name)` exists.
+    pub fn has_entry(&self, kind: FunctionKind, name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.kind == kind && e.name == name)
+    }
+
+    /// Whether `btb_transform_<name>` exists.
+    pub fn has_transform(&self, name: &str) -> bool {
+        self.transforms.iter().any(|(n, _)| n == name)
+    }
+
+    /// Names of the transform entries.
+    pub fn transform_names(&self) -> impl Iterator<Item = &str> {
+        self.transforms.iter().map(|(n, _)| n.as_str())
+    }
+
+    /// Whether `function` is the callback (`<action>_callback`) of an action of this contract.
+    /// The chain refuses to run such a function from an ordinary transaction: only the result
+    /// delivery of an agreed HTTPS action may call it.
+    pub fn is_action_callback(&self, function: &str) -> bool {
+        function
+            .strip_suffix(CALLBACK_SUFFIX)
+            .is_some_and(|a| self.has_entry(FunctionKind::Action, a))
+    }
+
+    /// Run one entry point in a fresh VM. Queries and actions always run read-only, whatever
+    /// `host` says.
     pub fn call(
         &self,
         kind: FunctionKind,
@@ -227,6 +280,53 @@ impl Contract {
                 kind,
                 name: name.to_string(),
             })?;
+        // Only a marked mutation or cron may use the beacon; the host is read-only for queries
+        // anyway, but the flag is the single gate and is off for everything else.
+        let rand = entry.randomness && matches!(kind, FunctionKind::Mutation | FunctionKind::Cron);
+        if matches!(kind, FunctionKind::Query | FunctionKind::Action) {
+            self.run_at(
+                entry.addr,
+                rand,
+                input,
+                &mut ReadOnly(host),
+                gas_limit,
+                mem_size,
+            )
+        } else {
+            self.run_at(entry.addr, rand, input, host, gas_limit, mem_size)
+        }
+    }
+
+    /// Run `btb_transform_<name>` on `input` (an encoded `HttpResponse`). The function is pure:
+    /// the host has no storage, no tables, no balances, no randomness and no prices, and every
+    /// state-changing call traps. Same input, same output, on every validator.
+    pub fn call_transform(
+        &self,
+        name: &str,
+        input: &[u8],
+        gas_limit: u64,
+        mem_size: usize,
+    ) -> Result<CallOutcome, CallError> {
+        let (_, addr) = self
+            .transforms
+            .iter()
+            .find(|(n, _)| n == name)
+            .ok_or_else(|| CallError::NoSuchEntry {
+                kind: FunctionKind::Action,
+                name: format!("transform {name}"),
+            })?;
+        self.run_at(*addr, false, input, &mut NullHost, gas_limit, mem_size)
+    }
+
+    fn run_at(
+        &self,
+        addr: u64,
+        randomness: bool,
+        input: &[u8],
+        host: &mut impl Host,
+        gas_limit: u64,
+        mem_size: usize,
+    ) -> Result<CallOutcome, CallError> {
         let mut vm = Vm::new(mem_size, gas_limit);
         let loaded = elf::load(&mut vm, &self.elf).map_err(CallError::Elf)?;
 
@@ -249,18 +349,10 @@ impl Contract {
         vm.set_reg(1, base);
         vm.set_reg(10, input_ptr);
         vm.set_reg(11, input_len);
-        vm.set_pc(entry.addr);
-        // Only a marked mutation or cron may use the beacon; the host is read-only for queries
-        // anyway, but the flag is the single gate and is off for everything else.
-        vm.set_randomness_allowed(
-            entry.randomness && matches!(kind, FunctionKind::Mutation | FunctionKind::Cron),
-        );
+        vm.set_pc(addr);
+        vm.set_randomness_allowed(randomness);
 
-        let result = if kind == FunctionKind::Query {
-            run_with_host(&mut vm, &mut ReadOnly(host))
-        } else {
-            run_with_host(&mut vm, host)
-        };
+        let result = run_with_host(&mut vm, host);
         let gas_used = vm.gas_used();
         match result {
             Ok(Exit::Return(output)) => Ok(CallOutcome { output, gas_used }),
@@ -270,6 +362,47 @@ impl Contract {
             }),
             Err(trap) => Err(CallError::Trap { trap, gas_used }),
         }
+    }
+}
+
+/// The host of a transform: nothing to read, nothing to write.
+struct NullHost;
+
+impl Host for NullHost {
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn storage_read(&mut self, _key: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn storage_write(&mut self, _key: &[u8], _value: &[u8]) {}
+    fn storage_remove(&mut self, _key: &[u8]) {}
+    fn caller(&self) -> Address {
+        [0; 32]
+    }
+    fn block_height(&self) -> u64 {
+        0
+    }
+    fn token_balance(&self, _addr: &Address) -> u64 {
+        0
+    }
+    fn token_transfer(&mut self, _to: &Address, _amount: u64) -> bool {
+        false
+    }
+    fn table_insert(&mut self, _table: &[u8], _row: &[u8]) -> u64 {
+        0
+    }
+    fn table_get(&mut self, _table: &[u8], _id: u64) -> Option<Vec<u8>> {
+        None
+    }
+    fn table_update(&mut self, _table: &[u8], _id: u64, _row: &[u8]) -> bool {
+        false
+    }
+    fn table_delete(&mut self, _table: &[u8], _id: u64) -> bool {
+        false
+    }
+    fn table_scan(&mut self, _table: &[u8], _start_id: u64, _max: u64) -> Vec<u64> {
+        Vec::new()
     }
 }
 
@@ -330,6 +463,9 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     }
     fn price(&mut self, pair: u32) -> Option<crate::host::PriceRecord> {
         self.0.price(pair)
+    }
+    fn report_request(&mut self, data: &[u8]) -> Option<u64> {
+        self.0.report_request(data)
     }
 }
 

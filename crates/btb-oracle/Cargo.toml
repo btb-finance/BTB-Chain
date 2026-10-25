@@ -9,3 +9,8 @@ license.workspace = true
 blst = "0.3.15"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+# BSD-3-Clause. Edwards-curve ECDH and Chaum-Pedersen proofs for DKG share delivery. Same
+# major version as the one `ed25519-dalek` 2 uses, so consensus keys convert directly.
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables"] }
+# Apache-2.0 OR MIT. Encrypts the DKG shares to their recipients.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }

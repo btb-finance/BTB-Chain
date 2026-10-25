@@ -37,9 +37,22 @@ pub fn cron(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// A function that calls the outside world; validators agree on the result.
+///
+/// Its first phase (this function, run read-only on the requesting transaction) returns the
+/// `HttpRequest` every validator makes. The agreed result arrives in the mutation
+/// `<name>_callback(request_id, args, status, data)`; an optional `#[btb::transform]` of the same
+/// name strips what differs between validators' responses first.
 #[proc_macro_attribute]
 pub fn action(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry("action", attr, item)
+}
+
+/// The pure function that turns one validator's `HttpResponse` into the bytes the validators
+/// sign, for the action of the same name. It runs with no state access, so it cannot read the
+/// chain, the clock or randomness: same response in, same bytes out. Export `btb_transform_<name>`.
+#[proc_macro_attribute]
+pub fn transform(attr: TokenStream, item: TokenStream) -> TokenStream {
+    entry("transform", attr, item)
 }
 
 fn entry(kind: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -56,11 +69,16 @@ fn entry(kind: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     let mut every_blocks = None;
     let mut randomness = false;
-    if !attr.is_empty() {
+    // `#[btb::transform("weather")]` names the action it belongs to, so the transform can have
+    // its own Rust name next to the action's (default: the function's own name).
+    let mut export_name: Option<String> = None;
+    if kind == "transform" && !attr.is_empty() {
+        export_name = Some(syn::parse2::<LitStr>(attr.clone())?.value());
+    } else if !attr.is_empty() {
         if kind != "cron" && kind != "mutation" {
             return Err(syn::Error::new(
                 attr.span(),
-                if kind == "query" || kind == "action" {
+                if kind == "query" || kind == "action" || kind == "transform" {
                     "queries and actions can never use randomness (only a mutation or cron can be marked `randomness`)"
                 } else {
                     "this attribute takes no arguments"
@@ -86,8 +104,9 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
             "contract functions cannot be async, generic or variadic",
         ));
     }
-    let name = sig.ident.to_string();
-    let name = name.strip_prefix("r#").unwrap_or(&name);
+    let ident_name = sig.ident.to_string();
+    let name = export_name.as_deref().unwrap_or(&ident_name);
+    let name = name.strip_prefix("r#").unwrap_or(name);
     if name.is_empty()
         || name.len() > 64
         || !name

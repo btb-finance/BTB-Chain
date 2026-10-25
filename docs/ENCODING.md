@@ -27,6 +27,17 @@ Structs are encoded as the tuple of their fields in declaration order. Enums are
 
 A decoder MUST reject: truncated input; trailing bytes after the value; bool or option tags other than 0/1; invalid UTF-8; and any length prefix larger than its configured maximum (default 16,777,216 elements/bytes in `btb-codec`). Allocation must never be sized from an unchecked prefix.
 
+## Structures used by HTTPS actions
+
+Two structures are fixed so that contracts in any language and the validators agree ([ORACLES.md](ORACLES.md#3-custom-web-data-https-requests)). Both are plain concatenations of their fields, in order:
+
+| Structure | Fields |
+| --- | --- |
+| `HttpRequest` (returned by an action's first phase) | `method: u8` (0 GET, 1 POST), `url: string`, `headers: vec<(string, string)>`, `body: bytes`, `max_response_bytes: u32`, `timeout_ms: u32` |
+| `HttpResponse` (the input of a transform) | `status: u16`, `body: bytes` |
+
+The result a validator signs is the encoding of the transform's return value in this same format (or, without a transform, the raw response body). A callback receives `(request id: [u8; 32], args: bytes, status: u8, data: bytes)`.
+
 ## Examples (hex)
 
 | Value | Type | Bytes |

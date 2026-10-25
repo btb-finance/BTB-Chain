@@ -55,6 +55,7 @@ fn oracle_genesis(group: &GroupKey, n: usize) -> OracleGenesis {
         holders: (0..n).map(ckey_bytes).collect(),
         pairs: pairs(),
         max_age_blocks: 20,
+        dkg_window: 20,
     }
 }
 

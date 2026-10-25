@@ -177,6 +177,16 @@ impl G1 {
         G1(r)
     }
 
+    /// Multiply by a small public integer (cheap: only as many bit steps as `k` has bits).
+    pub fn mul_u64(&self, k: u64) -> G1 {
+        let bits = (64 - k.leading_zeros()).max(1) as usize;
+        let bytes = k.to_le_bytes();
+        let mut r = blst_p1::default();
+        // SAFETY: `bytes` has 8 bytes (64 bits) and `bits <= 64`.
+        unsafe { blst_p1_mult(&mut r, &self.0, bytes.as_ptr(), bits) };
+        G1(r)
+    }
+
     pub fn add(&self, o: &G1) -> G1 {
         let mut r = blst_p1::default();
         // SAFETY: all pointers valid; `add_or_double` handles equal inputs.

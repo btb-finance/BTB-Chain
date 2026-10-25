@@ -85,6 +85,8 @@ impl GenesisFile {
         self.validator_set()?;
         if let Some(o) = &self.oracle {
             o.validate().map_err(|e| format!("oracle: {e}"))?;
+            o.validate_for(self.epoch_len)
+                .map_err(|e| format!("oracle: {e}"))?;
         }
         let sum: u128 = self.allocations.iter().map(|(_, v)| u128::from(*v)).sum();
         if sum != u128::from(TOTAL_SUPPLY) {
@@ -116,6 +118,7 @@ impl GenesisFile {
                 "group_key": hex::encode(&o.group_key),
                 "holders": o.holders.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
                 "max_age_blocks": o.max_age_blocks,
+                "dkg_window": o.dkg_window,
                 "pairs": o.pairs.iter()
                     .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
                     .collect::<Vec<_>>(),
@@ -196,15 +199,10 @@ impl GenesisFile {
 }
 
 fn oracle_from_json(o: &Value) -> Result<btb_chain::OracleGenesis, String> {
-    let s = |k: &str| -> Result<&str, String> {
-        o.get(k)
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("genesis oracle: missing string `{k}`"))
-    };
     let holders = o
         .get("holders")
         .and_then(Value::as_array)
-        .ok_or("genesis oracle: missing list `holders`")?
+        .map_or(&[][..], Vec::as_slice)
         .iter()
         .map(|h| hex::decode32(h.as_str().ok_or("genesis oracle: holder must be hex")?))
         .collect::<Result<Vec<_>, String>>()?;
@@ -234,13 +232,21 @@ fn oracle_from_json(o: &Value) -> Result<btb_chain::OracleGenesis, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     let og = btb_chain::OracleGenesis {
-        group_key: hex::decode(s("group_key")?)?,
+        // absent or empty: the validators generate the key on chain (no trusted dealer)
+        group_key: match o.get("group_key").and_then(Value::as_str) {
+            Some(k) => hex::decode(k)?,
+            None => Vec::new(),
+        },
         holders,
         pairs,
         max_age_blocks: o
             .get("max_age_blocks")
             .and_then(Value::as_u64)
             .unwrap_or(100),
+        dkg_window: o
+            .get("dkg_window")
+            .and_then(Value::as_u64)
+            .unwrap_or(btb_chain::oracle::DEFAULT_DKG_WINDOW),
     };
     og.validate().map_err(|e| format!("genesis oracle: {e}"))?;
     Ok(og)
@@ -282,7 +288,7 @@ pub fn save_key(path: &Path, key: &SigningKey) -> Result<(), String> {
     write_private(path, &serde_json::to_string_pretty(&text).expect("json"))
 }
 
-fn write_private(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -360,6 +366,17 @@ pub struct NodeParams {
     pub price_source: Option<crate::oracle::PriceSource>,
     /// How often the validator observes and signs prices, milliseconds.
     pub price_interval_ms: u64,
+    /// Where the validator keeps its beacon key shares (`dkg_dir` in the node config; default
+    /// `<data_dir>/dkg`, else `dkg` next to the config). `None`: shares are not stored and are
+    /// re-derived from the chain after a restart. See `crate::dkg`.
+    pub dkg_dir: Option<PathBuf>,
+    /// Passphrase that encrypts the share files (`BTB_KEY_PASSPHRASE`). `None`: plain files with
+    /// owner-only permissions.
+    pub key_passphrase: Option<String>,
+    /// How this validator fetches for HTTPS actions: SSRF rules, redirects, transform gas
+    /// (`crate::actions`). The default is strict (https only, public addresses only); tests use
+    /// `FetchPolicy::test_mode()`.
+    pub fetch_policy: crate::actions::FetchPolicy,
 }
 
 impl NodeParams {
@@ -382,6 +399,9 @@ impl NodeParams {
             oracle_share: None,
             price_source: None,
             price_interval_ms: 1_000,
+            dkg_dir: None,
+            key_passphrase: None,
+            fetch_policy: crate::actions::FetchPolicy::default(),
         }
     }
 
@@ -438,6 +458,12 @@ impl NodeParams {
             _ => {}
         }
         p.sync_poll_ms = v.get("sync_poll_ms").and_then(Value::as_u64);
+        p.dkg_dir = path_of("dkg_dir")
+            .or_else(|| p.data_dir.as_ref().map(|d| d.join("dkg")))
+            .or_else(|| Some(dir.join("dkg")));
+        p.key_passphrase = std::env::var("BTB_KEY_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.is_empty());
         if let Some(f) = path_of("oracle_share_file") {
             p.oracle_share = Some(load_oracle_share(&f)?);
         }
@@ -463,19 +489,39 @@ pub fn init_testnet(
     base_port: u16,
     rpc_base_port: u16,
 ) -> Result<Vec<PathBuf>, String> {
-    init_testnet_with(validators, dir, chain_id, base_port, rpc_base_port, false)
+    init_testnet_with(
+        validators,
+        dir,
+        chain_id,
+        base_port,
+        rpc_base_port,
+        Oracles::Off,
+    )
 }
 
-/// `init_testnet`, optionally with oracles: a beacon key dealt to the validators by a trusted
-/// dealer (this tool; it sees every share, so it is for local testnets only) and two demo price
-/// feeds (`BTC/USD` = pair 0, `ETH/USD` = pair 1).
+/// How `init_testnet_with` sets up the oracles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Oracles {
+    /// No oracles: `random_bytes` traps and prices do not exist.
+    Off,
+    /// The validators generate the beacon key on chain in the first blocks (no trusted party).
+    Dkg,
+    /// **Testnets only.** This tool deals the beacon key as a trusted dealer and writes every
+    /// share to the node directories (`--insecure-dealer`); epoch changes already reshare it
+    /// on chain.
+    InsecureDealer,
+}
+
+/// `init_testnet`, optionally with oracles: the beacon key (generated by the validators on chain,
+/// or dealt by this tool with `Oracles::InsecureDealer`) and two demo price feeds (`BTC/USD` =
+/// pair 0, `ETH/USD` = pair 1).
 pub fn init_testnet_with(
     validators: usize,
     dir: &Path,
     chain_id: u64,
     base_port: u16,
     rpc_base_port: u16,
-    oracle: bool,
+    oracle: Oracles,
 ) -> Result<Vec<PathBuf>, String> {
     use rand::RngCore;
     if validators == 0 || validators > 100 {
@@ -523,16 +569,25 @@ pub fn init_testnet_with(
     };
     let mut genesis = genesis;
     let mut shares = Vec::new();
-    if oracle {
-        let mut entropy = [0u8; 32];
-        rng.fill_bytes(&mut entropy);
-        let (group, dealt) =
-            btb_oracle::trusted_deal(btb_oracle::Params::standard(validators), &entropy)
-                .map_err(|e| format!("beacon key: {e:?}"))?;
-        shares = dealt;
+    if oracle != Oracles::Off {
+        let (group_key, holders) = if oracle == Oracles::InsecureDealer {
+            let mut entropy = [0u8; 32];
+            rng.fill_bytes(&mut entropy);
+            let (group, dealt) =
+                btb_oracle::trusted_deal(btb_oracle::Params::standard(validators), &entropy)
+                    .map_err(|e| format!("beacon key: {e:?}"))?;
+            shares = dealt;
+            (
+                group.encode(),
+                keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         genesis.oracle = Some(btb_chain::OracleGenesis {
-            group_key: group.encode(),
-            holders: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
+            group_key,
+            holders,
+            dkg_window: btb_chain::oracle::DEFAULT_DKG_WINDOW,
             pairs: vec![
                 btb_chain::PairConfig {
                     id: 0,

@@ -15,6 +15,7 @@ btb-node = { path = "../btb-node" }
 btb-chain = { path = "../btb-chain" }
 btb-runtime = { path = "../btb-runtime" }
 btb-consensus = { path = "../btb-consensus" }
+btb-storage = { path = "../btb-storage" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 sha2 = "0.11.1"
 serde_json = "1"

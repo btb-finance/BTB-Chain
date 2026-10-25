@@ -111,11 +111,10 @@ fn eval_poly(coeffs: &[Fr], x: u64) -> Fr {
 
 /// Evaluate the committed polynomial at `x`: `sum_k C_k * x^k`.
 pub fn eval_commitments(commitments: &[G1], x: u64) -> G1 {
-    let fx = Fr::from_u64(x);
     commitments
         .iter()
         .rev()
-        .fold(G1::identity(), |acc, c| acc.mul(&fx).add(c))
+        .fold(G1::identity(), |acc, c| acc.mul_u64(x).add(c))
 }
 
 /// Does `share` lie on the polynomial committed to by `commitments`, as the share of the
@@ -339,16 +338,19 @@ impl Transcript {
                     .collect::<Result<_, _>>()?
             }
         };
-        let mut public_key = G1::identity();
-        for (d, w) in &weights {
-            public_key = public_key.add(&self.commitments[d][0].mul(w));
-        }
-        let public_shares: Vec<G1> = (0..self.params.n)
-            .map(|j| {
+        // Combine the dealers' commitments coefficient by coefficient first (`t` weighted sums),
+        // then evaluate once per recipient: far fewer full-width multiplications than weighting
+        // every evaluation.
+        let combined: Vec<G1> = (0..self.params.t)
+            .map(|k| {
                 weights.iter().fold(G1::identity(), |acc, (d, w)| {
-                    acc.add(&eval_commitments(&self.commitments[d], j as u64 + 1).mul(w))
+                    acc.add(&self.commitments[d][k].mul(w))
                 })
             })
+            .collect();
+        let public_key = combined[0];
+        let public_shares: Vec<G1> = (0..self.params.n)
+            .map(|j| eval_commitments(&combined, j as u64 + 1))
             .collect();
         let group = GroupKey::new(self.params.t, public_key, public_shares)?;
         if let Mode::Reshare { old } = &self.mode {

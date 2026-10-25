@@ -9,6 +9,7 @@
 //! of the previous block and, with a pipelined 2-chain commit, that block is not executed yet
 //! when the next one is proposed. See docs/NODE.md.
 
+use btb_chain::actions::ActionVote;
 use btb_chain::exec::check_static;
 use btb_chain::{ChainConfig, Transaction};
 use btb_codec::{Decode, Encode, Reader};
@@ -166,19 +167,26 @@ pub struct Batch {
     /// Encoded as an optional trailing list, so a batch without any is byte-identical to the
     /// old format.
     pub observations: Vec<SignedObservation>,
+    /// Validators' signed answers to pending HTTPS actions (`btb_chain::actions`). A second
+    /// optional trailing list (the observation list is then present, possibly empty).
+    pub actions: Vec<ActionVote>,
 }
 
 impl Batch {
     pub fn encode(&self) -> Vec<u8> {
         let raw: Vec<Vec<u8>> = self.txs.iter().map(Transaction::encode).collect();
         let mut out = (self.timestamp, raw).encode();
-        if !self.observations.is_empty() {
+        if !self.observations.is_empty() || !self.actions.is_empty() {
             let obs: Vec<Vec<u8>> = self
                 .observations
                 .iter()
                 .map(|o| o.encode().to_vec())
                 .collect();
             obs.encode_to(&mut out);
+        }
+        if !self.actions.is_empty() {
+            let votes: Vec<Vec<u8>> = self.actions.iter().map(Encode::encode).collect();
+            votes.encode_to(&mut out);
         }
         out
     }
@@ -187,18 +195,33 @@ impl Batch {
         let mut r = Reader::new(bytes, MAX_PAYLOAD);
         let timestamp = u64::decode_from(&mut r).ok()?;
         let raw: Vec<Vec<u8>> = Vec::decode_from(&mut r).ok()?;
-        let observations = if r.remaining() == 0 {
-            Vec::new()
+        let (observations, trailing) = if r.remaining() == 0 {
+            (Vec::new(), false)
         } else {
             let obs: Vec<Vec<u8>> = Vec::decode_from(&mut r).ok()?;
-            if obs.is_empty() || obs.len() > btb_chain::oracle::MAX_OBS_PER_BLOCK {
+            if obs.len() > btb_chain::oracle::MAX_OBS_PER_BLOCK {
                 return None;
             }
-            obs.iter()
+            let obs = obs
+                .iter()
                 .map(|b| SignedObservation::decode(b))
-                .collect::<Option<Vec<_>>>()?
+                .collect::<Option<Vec<_>>>()?;
+            (obs, true)
         };
-        if r.remaining() != 0 {
+        let actions = if trailing && r.remaining() > 0 {
+            let votes: Vec<Vec<u8>> = Vec::decode_from(&mut r).ok()?;
+            if votes.is_empty() || votes.len() > btb_chain::actions::MAX_VOTES_PER_BLOCK {
+                return None;
+            }
+            votes
+                .iter()
+                .map(|b| ActionVote::decode(b).ok())
+                .collect::<Option<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        // An empty observation list is only valid as the lead-in of a vote list.
+        if r.remaining() != 0 || (trailing && observations.is_empty() && actions.is_empty()) {
             return None;
         }
         let txs = raw
@@ -209,6 +232,7 @@ impl Batch {
             timestamp,
             txs,
             observations,
+            actions,
         })
     }
 }
@@ -272,6 +296,7 @@ mod tests {
             timestamp: 5,
             txs: vec![tx(7, 0, &k), tx(7, 1, &k)],
             observations: vec![],
+            actions: vec![],
         };
         assert_eq!(Batch::decode(&good.encode()), Some(good.clone()));
         assert!(payload_ok(&good.encode(), &cfg));
@@ -280,12 +305,14 @@ mod tests {
             timestamp: 5,
             txs: vec![tx(8, 0, &k)],
             observations: vec![],
+            actions: vec![],
         };
         assert!(!payload_ok(&wrong.encode(), &cfg));
         let dup = Batch {
             timestamp: 5,
             txs: vec![tx(7, 0, &k), tx(7, 0, &k)],
             observations: vec![],
+            actions: vec![],
         };
         assert!(!payload_ok(&dup.encode(), &cfg));
         let mut forged = tx(7, 0, &k);
@@ -294,6 +321,7 @@ mod tests {
             timestamp: 5,
             txs: vec![forged],
             observations: vec![],
+            actions: vec![],
         };
         assert!(!payload_ok(&bad.encode(), &cfg));
         assert!(!payload_ok(&[1, 2, 3], &cfg));
@@ -303,6 +331,67 @@ mod tests {
         let mut small = cfg;
         small.max_block_txs = 1;
         assert!(!payload_ok(&good.encode(), &small));
+    }
+
+    #[test]
+    fn batches_carry_action_votes() {
+        use btb_chain::actions::ActionVote;
+        let cfg = ChainConfig::new(7);
+        let k = SigningKey::from_bytes(&[1; 32]);
+        let v = |i: u8| ActionVote::sign(7, &k, [i; 32], 0, vec![i; 5]);
+        // votes only, votes next to observations, and next to transactions
+        for (txs, votes) in [(vec![], vec![v(1), v(2)]), (vec![tx(7, 0, &k)], vec![v(3)])] {
+            let b = Batch {
+                timestamp: 5,
+                txs,
+                observations: vec![],
+                actions: votes,
+            };
+            assert_eq!(Batch::decode(&b.encode()), Some(b.clone()));
+            assert!(payload_ok(&b.encode(), &cfg));
+        }
+        // a batch without votes encodes as before (no trailing section at all)
+        let plain = Batch {
+            timestamp: 5,
+            txs: vec![],
+            observations: vec![],
+            actions: vec![],
+        };
+        assert_eq!(plain.encode().len(), 8 + 4);
+        // an empty vote list, a vote list without the observation list, trailing junk and a
+        // truncated vote are all refused
+        let mut with = Batch {
+            actions: vec![v(1)],
+            ..plain.clone()
+        }
+        .encode();
+        let full = with.clone();
+        with.push(7);
+        assert!(Batch::decode(&with).is_none());
+        for cut in [1, 5, 40] {
+            assert!(Batch::decode(&full[..full.len() - cut]).is_none());
+        }
+        let mut empty_lists = plain.encode();
+        empty_lists.extend_from_slice(&0u32.to_le_bytes());
+        assert!(
+            Batch::decode(&empty_lists).is_none(),
+            "empty observation list alone"
+        );
+        empty_lists.extend_from_slice(&0u32.to_le_bytes());
+        assert!(Batch::decode(&empty_lists).is_none(), "empty vote list");
+        // a result above the cap does not even decode
+        let big = ActionVote::sign(
+            7,
+            &k,
+            [9; 32],
+            0,
+            vec![0; btb_chain::actions::MAX_RESULT_BYTES + 1],
+        );
+        let b = Batch {
+            actions: vec![big],
+            ..plain
+        };
+        assert!(Batch::decode(&b.encode()).is_none());
     }
 
     #[test]
