@@ -43,6 +43,8 @@ pub fn cost(i: &Instr) -> u64 {
 
 /// `caller(out_ptr)`: flat, writes 32 bytes.
 pub const HOST_CALLER: u64 = 10;
+/// `contract_address(out_ptr)`: flat, writes 32 bytes.
+pub const HOST_CONTRACT_ADDRESS: u64 = 10;
 /// `block_height()`: flat.
 pub const HOST_BLOCK_HEIGHT: u64 = 5;
 /// `token_balance(addr_ptr)`: flat, reads a 32-byte address.
@@ -85,3 +87,27 @@ pub const TABLE_SCAN_ID: u64 = 10;
 /// before the (optional) copy. Each id costs an index entry read plus a row existence check.
 pub const HOST_TABLE_INDEX_SCAN: u64 = 400;
 pub const TABLE_INDEX_SCAN_ID: u64 = 40;
+
+// ---- User tokens (native multi-token module) ----------------------------------------------------
+//
+// Charged before the call runs, like the calls above. These are separate from native BTB
+// (`HOST_TOKEN_BALANCE` / `HOST_TOKEN_TRANSFER`).
+
+/// `token_create`: base plus `TOKEN_BYTE` per request byte (writes the info record, the creator's
+/// balance and the creator's nonce).
+pub const HOST_TOKEN_CREATE: u64 = 2000;
+/// `token_transfer_of`: flat (info read, two balance reads, up to two balance writes).
+pub const HOST_TOKEN_TRANSFER_OF: u64 = 400;
+/// `token_balance_of`: flat (info read and balance read).
+pub const HOST_TOKEN_BALANCE_OF: u64 = 100;
+/// `token_info`: base plus `TOKEN_BYTE` per info byte actually copied, charged before the copy.
+pub const HOST_TOKEN_INFO: u64 = 150;
+/// `token_holders`: base plus `TOKEN_BYTE` per request byte up front, plus `TOKEN_HOLDER_ENTRY`
+/// per holder returned and `TOKEN_BYTE` per cursor byte returned, charged before the optional copy.
+pub const HOST_TOKEN_HOLDERS: u64 = 300;
+pub const TOKEN_HOLDER_ENTRY: u64 = 30;
+/// `token_mint`: flat (info read and write, balance read and write).
+pub const HOST_TOKEN_MINT: u64 = 500;
+/// `token_burn`: flat (info read and write, balance read and write).
+pub const HOST_TOKEN_BURN: u64 = 400;
+pub const TOKEN_BYTE: u64 = 1;

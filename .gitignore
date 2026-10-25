@@ -41,3 +41,4 @@ examples/c-counter/counter.elf
 examples/c-counter/build/
 examples/token/token.elf
 examples/dex/dex.elf
+examples/launcher/launcher.elf

@@ -1,6 +1,6 @@
 # Dev server (`btb-dev`)
 
-`btb-dev` is a single-node server for trying contracts with the Phase 2 state database. It is the Phase 2 gate demo ("query a table by index and watch a UI update live"), not the Phase 3 `btb dev`: no hot reload, no deploy, no auth. **Development only. Never expose it.**
+`btb-dev` is a single-node server for trying contracts with the Phase 2 state database. It is the Phase 2 gate demo ("query a table by index and watch a UI update live"). The Phase 3 `btb dev` ([CLI.md](CLI.md)) uses it as a library and adds hot reload; the plain binary has no hot reload, no deploy, no auth. **Development only. Never expose it.**
 
 ```
 ./examples/todo/build.sh                      # builds examples/todo/todo.elf
@@ -34,6 +34,10 @@ Contracts cannot declare indexes yet. The dev server registers them on the host 
 ## State and limits
 
 One contract at a time, at the fixed address `[0xDE; 32]`, funded with 10^12 base units to pay storage deposits. The block height is a counter that goes up by one per committed mutation (starts at 1 on every run). Each call has a 50,000,000 gas limit and 1 MiB of VM memory. Crons and actions are not run.
+
+## Library API (used by `btb dev`)
+
+`Server::start(elf, bind, store, indexes)` starts a server. `server.reload(elf)` validates a new build and swaps it in while keeping all state (the `KvStore`, block height and subscriptions); on an invalid ELF the old contract keeps running. After a swap every open subscription re-runs against the new code and pushes its result if it changed (a stream whose query no longer exists ends). `server.set_page(Some(html))` serves a project's own page at `/` instead of the todo demo.
 
 ## Tests
 

@@ -17,9 +17,11 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `ROADMAP.md` | Six phases, deliverables as checkboxes, gates between phases |
 | `docs/ARCHITECTURE.md` | Network, consensus, state model, tech stack |
 | `docs/DEV_SERVER.md` | `btb-dev`: single-node dev server (HTTP, live queries over SSE), the Phase 2 gate demo |
+| `docs/CLI.md` | The `btb` command: `init`, `build`, `dev` (hot reload), `deploy` |
 | `docs/STATE.md` | Key layout, index encodings, table writes and queries in `btb-runtime` |
 | `docs/LANGUAGE.md` | Contract languages, Rust SDK, project layout |
 | `docs/ENCODING.md` | Canonical binary encoding of arguments and results (all languages) |
+| `docs/TS_SDK.md` | TypeScript client (`sdk-ts/`, `@btb/client`): codec, client, React hooks |
 | `docs/TOKENOMICS.md` | Fixed 1B BTB supply, fees, payment channels |
 | `docs/CROSS_CHAIN.md` | Chain signatures and vaults |
 | `docs/ORACLES.md` | Randomness, price feeds, HTTPS actions, reports for other chains |

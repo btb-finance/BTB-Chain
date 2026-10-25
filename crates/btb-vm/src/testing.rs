@@ -1,6 +1,7 @@
 //! In-memory `Host` for tests and tooling.
 
 use crate::host::{Address, Host};
+use crate::token::{TokenId, TokenInfo, TokenStore};
 use std::collections::BTreeMap;
 
 /// One table: rows by id, plus the next id to hand out (never decreases, so ids are not reused).
@@ -20,6 +21,54 @@ pub struct MemHost {
     pub read_only: bool,
     /// Address that `token_transfer` debits.
     pub contract: Address,
+    /// User tokens (see `token.rs`); separate from `balances` (native BTB).
+    pub tokens: BTreeMap<TokenId, TokenInfo>,
+    pub token_balances: BTreeMap<(TokenId, Address), u128>,
+    pub token_nonces: BTreeMap<Address, u64>,
+}
+
+impl TokenStore for MemHost {
+    fn contract(&self) -> Address {
+        self.contract
+    }
+    fn info(&mut self, id: &TokenId) -> Option<TokenInfo> {
+        self.tokens.get(id).cloned()
+    }
+    fn put_info(&mut self, id: &TokenId, info: &TokenInfo) {
+        self.tokens.insert(*id, info.clone());
+    }
+    fn balance(&mut self, id: &TokenId, holder: &Address) -> u128 {
+        self.token_balances
+            .get(&(*id, *holder))
+            .copied()
+            .unwrap_or(0)
+    }
+    fn put_balance(&mut self, id: &TokenId, holder: &Address, v: u128) {
+        if v == 0 {
+            self.token_balances.remove(&(*id, *holder));
+        } else {
+            self.token_balances.insert((*id, *holder), v);
+        }
+    }
+    fn nonce(&mut self, creator: &Address) -> u64 {
+        self.token_nonces.get(creator).copied().unwrap_or(0)
+    }
+    fn put_nonce(&mut self, creator: &Address, n: u64) {
+        self.token_nonces.insert(*creator, n);
+    }
+    fn holders(
+        &mut self,
+        id: &TokenId,
+        after: Option<&Address>,
+        max: usize,
+    ) -> Vec<(Address, u128)> {
+        self.token_balances
+            .range((*id, [0u8; 32])..=(*id, [0xFF; 32]))
+            .filter(|((_, a), _)| after.is_none_or(|x| a > x))
+            .take(max)
+            .map(|((_, a), b)| (*a, *b))
+            .collect()
+    }
 }
 
 impl Host for MemHost {
@@ -37,6 +86,9 @@ impl Host for MemHost {
     }
     fn caller(&self) -> Address {
         self.caller
+    }
+    fn contract_address(&self) -> Address {
+        self.contract
     }
     fn block_height(&self) -> u64 {
         self.height
@@ -82,6 +134,9 @@ impl Host for MemHost {
         self.tables
             .get_mut(table)
             .is_some_and(|t| t.rows.remove(&id).is_some())
+    }
+    fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
+        Some(self)
     }
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
         let Some(t) = self.tables.get(table) else {

@@ -9,6 +9,7 @@
 
 use crate::decode::Trap;
 use crate::gas;
+use crate::token::{self, CreateParams, TokenError, TokenId, TokenStore};
 use crate::vm::{Exit, Vm};
 
 /// Stable host-call numbers (value of a7). Never renumber; only add.
@@ -57,6 +58,57 @@ pub mod abi {
     /// fits in `out_cap`, so retry with a bigger buffer. A malformed request traps. `limit` is
     /// capped at `MAX_INDEX_SCAN_LIMIT`.
     pub const TABLE_INDEX_SCAN: u64 = 15;
+    /// `token_create(req_ptr, req_len, out_ptr) -> status`. Mutations only. `req` is the
+    /// `btb-codec` tuple `(name: String, symbol: String, decimals: u8, initial_supply: u128,
+    /// mint_authority: Option<Address>)` (see `token::CreateParams`). On `TOKEN_OK` writes the
+    /// 32-byte token id (`SHA256("btb.token.v1" || creating contract || nonce:u64be)`) to
+    /// `out_ptr`; the initial supply is credited to the creating contract. A malformed request
+    /// traps. Never touches native BTB.
+    pub const TOKEN_CREATE: u64 = 16;
+    /// `token_transfer_of(id_ptr, to_ptr, amount_ptr) -> status`. Mutations only. Moves the
+    /// `u128` LE amount at `amount_ptr` from the running contract to `to`.
+    pub const TOKEN_TRANSFER_OF: u64 = 17;
+    /// `token_balance_of(id_ptr, holder_ptr, out_ptr) -> status`. Read-only. On `TOKEN_OK`
+    /// writes the balance as 16 bytes `u128` LE to `out_ptr`.
+    pub const TOKEN_BALANCE_OF: u64 = 18;
+    /// `token_info(id_ptr, out_ptr, out_cap) -> len | NOT_FOUND`. Read-only. Same copy rule as
+    /// `storage_read`. The value is `token::TokenInfo` encoded with `btb-codec`.
+    pub const TOKEN_INFO: u64 = 19;
+    /// `token_holders(req_ptr, req_len, out_ptr, out_cap) -> total_len | NOT_FOUND`. Read-only.
+    /// Request: `id[32] || limit:u32 LE || cursor (empty, or the 32-byte address returned by the
+    /// previous page)`. Holders (non-zero balance) are paged in ascending ADDRESS order, at most
+    /// `MAX_TOKEN_HOLDERS_LIMIT` per page. Result: `u32 count, u32 cursor_len (0 or 32), count x
+    /// (address[32], balance u128 LE), cursor`. A non-empty cursor means more holders exist.
+    /// Copied only if it fits `out_cap`; retry with a bigger buffer. A malformed request traps.
+    pub const TOKEN_HOLDERS: u64 = 20;
+    /// `token_mint(id_ptr, to_ptr, amount_ptr) -> status`. Mutations only. Only the token's mint
+    /// authority (the running contract must be it); raises supply and `to`'s balance.
+    pub const TOKEN_MINT: u64 = 21;
+    /// `token_burn(id_ptr, amount_ptr) -> status`. Mutations only. Only the mint authority;
+    /// burns from the running contract's own balance and lowers supply.
+    pub const TOKEN_BURN: u64 = 22;
+
+    /// `contract_address(out_ptr)`: writes the 32-byte address of the running contract (the
+    /// address that owns its token balances and is matched against a token's mint authority).
+    pub const CONTRACT_ADDRESS: u64 = 23;
+
+    /// Largest `limit` honoured by `token_holders`.
+    pub const MAX_TOKEN_HOLDERS_LIMIT: u32 = crate::token::MAX_HOLDERS_LIMIT;
+
+    /// Status codes of the user-token calls (`TOKEN_NOT_FOUND`-style cases use these too).
+    pub const TOKEN_OK: u64 = 0;
+    /// Bad name, symbol or decimals.
+    pub const TOKEN_INVALID: u64 = 1;
+    /// Balance too low.
+    pub const TOKEN_INSUFFICIENT: u64 = 2;
+    /// Unknown token id.
+    pub const TOKEN_NO_TOKEN: u64 = 3;
+    /// Not the mint authority (or the token has none).
+    pub const TOKEN_UNAUTHORIZED: u64 = 4;
+    /// Supply, balance or nonce overflow.
+    pub const TOKEN_OVERFLOW: u64 = 5;
+    /// The host has no token ledger.
+    pub const TOKEN_UNSUPPORTED: u64 = 6;
 
     /// Largest `limit` honoured by `table_index_scan`.
     pub const MAX_INDEX_SCAN_LIMIT: u32 = 256;
@@ -194,6 +246,10 @@ pub trait Host {
     fn storage_write(&mut self, key: &[u8], value: &[u8]);
     fn storage_remove(&mut self, key: &[u8]);
     fn caller(&self) -> Address;
+    /// Address of the running contract. Hosts that do not track one report the zero address.
+    fn contract_address(&self) -> Address {
+        [0; 32]
+    }
     fn block_height(&self) -> u64;
     fn token_balance(&self, addr: &Address) -> u64;
     /// Move `amount` from the contract to `to`; false (no change) if the balance is too low.
@@ -211,6 +267,11 @@ pub trait Host {
     /// index storage (`btb-runtime`) override it.
     fn table_index_scan(&mut self, _scan: &IndexScan) -> IndexScanPage {
         IndexScanPage::default()
+    }
+    /// The user-token ledger (`token_*` calls other than native BTB). `None`: unsupported, the
+    /// calls then return `abi::TOKEN_UNSUPPORTED` (`NOT_FOUND` for the info and holder reads).
+    fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
+        None
     }
 }
 
@@ -230,6 +291,26 @@ fn addr(vm: &Vm, ptr: u64) -> Result<Address, Trap> {
     let mut a = [0u8; 32];
     a.copy_from_slice(vm.read_mem(ptr, 32)?);
     Ok(a)
+}
+
+fn token_id(vm: &Vm, ptr: u64) -> Result<TokenId, Trap> {
+    addr(vm, ptr)
+}
+
+/// A `u128` LE amount stored in guest memory.
+fn amount(vm: &Vm, ptr: u64) -> Result<u128, Trap> {
+    let mut a = [0u8; 16];
+    a.copy_from_slice(vm.read_mem(ptr, 16)?);
+    Ok(u128::from_le_bytes(a))
+}
+
+/// Status code of a token operation (`None`: the host has no ledger).
+fn status(r: Option<Result<(), TokenError>>) -> u64 {
+    match r {
+        None => abi::TOKEN_UNSUPPORTED,
+        Some(Ok(())) => abi::TOKEN_OK,
+        Some(Err(e)) => e.code(),
+    }
 }
 
 /// Read a guest buffer; `len` is checked against memory size before any allocation.
@@ -283,6 +364,11 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
             abi::CALLER => {
                 vm.charge_gas(gas::HOST_CALLER)?;
                 vm.write_mem(a0, &host.caller())?;
+                0
+            }
+            abi::CONTRACT_ADDRESS => {
+                vm.charge_gas(gas::HOST_CONTRACT_ADDRESS)?;
+                vm.write_mem(a0, &host.contract_address())?;
                 0
             }
             abi::BLOCK_HEIGHT => {
@@ -393,6 +479,117 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                     vm.write_mem(a2, &out)?;
                 }
                 out.len() as u64
+            }
+            abi::TOKEN_CREATE => {
+                check_write(host)?;
+                vm.charge_gas(cost(gas::HOST_TOKEN_CREATE, gas::TOKEN_BYTE, a1))?;
+                let req = buf(vm, a0, a1)?;
+                // Validate the output window before doing anything.
+                buf(vm, a2, 32)?;
+                let Some(params) = CreateParams::decode(&req) else {
+                    return Err(Trap::Abort("malformed token_create request".into()));
+                };
+                match host.tokens() {
+                    None => abi::TOKEN_UNSUPPORTED,
+                    Some(t) => match token::create(t, &params) {
+                        Ok(id) => {
+                            vm.write_mem(a2, &id)?;
+                            abi::TOKEN_OK
+                        }
+                        Err(e) => e.code(),
+                    },
+                }
+            }
+            abi::TOKEN_TRANSFER_OF => {
+                check_write(host)?;
+                vm.charge_gas(gas::HOST_TOKEN_TRANSFER_OF)?;
+                let (id, to, amount) = (token_id(vm, a0)?, addr(vm, a1)?, amount(vm, a2)?);
+                status(host.tokens().map(|t| token::transfer(t, &id, &to, amount)))
+            }
+            abi::TOKEN_BALANCE_OF => {
+                vm.charge_gas(gas::HOST_TOKEN_BALANCE_OF)?;
+                let (id, holder) = (token_id(vm, a0)?, addr(vm, a1)?);
+                // Validate the output window before doing anything.
+                buf(vm, a2, 16)?;
+                match host.tokens().map(|t| token::balance_of(t, &id, &holder)) {
+                    None => abi::TOKEN_UNSUPPORTED,
+                    Some(Err(e)) => e.code(),
+                    Some(Ok(b)) => {
+                        vm.write_mem(a2, &b.to_le_bytes())?;
+                        abi::TOKEN_OK
+                    }
+                }
+            }
+            abi::TOKEN_INFO => {
+                vm.charge_gas(gas::HOST_TOKEN_INFO)?;
+                let id = token_id(vm, a0)?;
+                // Validate the output window before doing anything.
+                buf(vm, a1, a2)?;
+                match host.tokens().and_then(|t| t.info(&id)) {
+                    None => abi::NOT_FOUND,
+                    Some(info) => {
+                        let v = info.encode();
+                        let n = (v.len() as u64).min(a2);
+                        vm.charge_gas(n.saturating_mul(gas::TOKEN_BYTE))?;
+                        vm.write_mem(a1, &v[..n as usize])?;
+                        v.len() as u64
+                    }
+                }
+            }
+            abi::TOKEN_HOLDERS => {
+                vm.charge_gas(cost(gas::HOST_TOKEN_HOLDERS, gas::TOKEN_BYTE, a1))?;
+                let req = buf(vm, a0, a1)?;
+                // Validate the output window before doing anything.
+                buf(vm, a2, a3)?;
+                let Some((id, limit, cursor)) = token::parse_holders_req(&req) else {
+                    return Err(Trap::Abort("malformed token_holders request".into()));
+                };
+                let page = host
+                    .tokens()
+                    .and_then(|t| token::holders(t, &id, cursor.as_ref(), limit).ok());
+                match page {
+                    None => abi::NOT_FOUND,
+                    Some((rows, next)) => {
+                        // The scan work is done either way, so it is always charged.
+                        vm.charge_gas(
+                            (rows.len() as u64)
+                                .saturating_mul(gas::TOKEN_HOLDER_ENTRY)
+                                .saturating_add(if next.is_some() {
+                                    32 * gas::TOKEN_BYTE
+                                } else {
+                                    0
+                                }),
+                        )?;
+                        let mut out = Vec::with_capacity(8 + rows.len() * 48 + 32);
+                        out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                        out.extend_from_slice(
+                            &(if next.is_some() { 32u32 } else { 0 }).to_le_bytes(),
+                        );
+                        for (a, b) in &rows {
+                            out.extend_from_slice(a);
+                            out.extend_from_slice(&b.to_le_bytes());
+                        }
+                        if let Some(n) = next {
+                            out.extend_from_slice(&n);
+                        }
+                        if out.len() as u64 <= a3 {
+                            vm.write_mem(a2, &out)?;
+                        }
+                        out.len() as u64
+                    }
+                }
+            }
+            abi::TOKEN_MINT => {
+                check_write(host)?;
+                vm.charge_gas(gas::HOST_TOKEN_MINT)?;
+                let (id, to, amount) = (token_id(vm, a0)?, addr(vm, a1)?, amount(vm, a2)?);
+                status(host.tokens().map(|t| token::mint(t, &id, &to, amount)))
+            }
+            abi::TOKEN_BURN => {
+                check_write(host)?;
+                vm.charge_gas(gas::HOST_TOKEN_BURN)?;
+                let (id, amount) = (token_id(vm, a0)?, amount(vm, a1)?);
+                status(host.tokens().map(|t| token::burn(t, &id, amount)))
             }
             abi::RETURN_DATA => {
                 vm.charge_gas(cost(gas::HOST_RETURN_DATA, gas::RETURN_BYTE, a1))?;

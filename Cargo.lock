@@ -45,6 +45,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "btb-cli"
+version = "0.1.0"
+dependencies = [
+ "btb-dev",
+ "btb-runtime",
+ "btb-vm",
+ "sha2",
+]
+
+[[package]]
 name = "btb-codec"
 version = "0.1.0"
 
@@ -98,6 +108,10 @@ dependencies = [
 [[package]]
 name = "btb-vm"
 version = "0.1.0"
+dependencies = [
+ "btb-codec",
+ "sha2",
+]
 
 [[package]]
 name = "bzip2-sys"

@@ -48,11 +48,13 @@ The full developer experience on one node, so developers can build real apps.
 
 **Deliverables**
 
-- [ ] `btb` CLI: `init`, `dev` (hot reload), `deploy`
-- [ ] TypeScript SDK with React hooks (`useQuery`, `useMutation`)
+- [x] `btb` CLI: `init`, `dev` (hot reload), `deploy`
+  - `crates/btb-cli`, see [docs/CLI.md](docs/CLI.md); `deploy` writes a local bundle until the chain exists (Phase 4)
+- [x] TypeScript SDK with React hooks (`useQuery`, `useMutation`)
 - [ ] Dashboard to browse contract tables like a database
 - [ ] Language server (autocomplete, errors, hover types)
-- [ ] Native token module (`Token.create`, transfers, holder queries)
+- [x] Native token module (`Token.create`, transfers, holder queries)
+  - host calls 16 to 23, `btb_sdk::token::Token`, [examples/launcher](examples/launcher), see [docs/TOKENOMICS.md](docs/TOKENOMICS.md#user-tokens)
 - [ ] Example apps: token launcher, simple DEX, NFT market
 
 **Gate:** an outside developer ships a working app and it feels like Convex.

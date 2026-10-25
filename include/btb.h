@@ -27,6 +27,14 @@
 #define BTB_TABLE_DELETE 13
 #define BTB_TABLE_SCAN 14
 #define BTB_TABLE_INDEX_SCAN 15
+#define BTB_TOKEN_CREATE 16
+#define BTB_TOKEN_TRANSFER_OF 17
+#define BTB_TOKEN_BALANCE_OF 18
+#define BTB_TOKEN_INFO 19
+#define BTB_TOKEN_HOLDERS 20
+#define BTB_TOKEN_MINT 21
+#define BTB_TOKEN_BURN 22
+#define BTB_CONTRACT_ADDRESS 23
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
@@ -34,6 +42,14 @@
 #define BTB_TRANSFER_INSUFFICIENT 1
 #define BTB_TABLE_OK 0
 #define BTB_TABLE_MISSING 1
+/* User-token status codes (calls 16..22; user tokens are separate from native BTB). */
+#define BTB_TOKEN_OK 0
+#define BTB_TOKEN_INVALID 1
+#define BTB_TOKEN_INSUFFICIENT 2
+#define BTB_TOKEN_NO_TOKEN 3
+#define BTB_TOKEN_UNAUTHORIZED 4
+#define BTB_TOKEN_OVERFLOW 5
+#define BTB_TOKEN_UNSUPPORTED 6
 
 /* Entry points: btb_<kind>_<name>(input, input_len). Name is [a-z0-9_], 1..64 bytes. */
 #define BTB_ENTRY(kind, name)                                                  \
@@ -133,6 +149,53 @@ static inline uint64_t btb_table_scan(const uint8_t *table, uint64_t table_len,
 static inline uint64_t btb_table_index_scan(const uint8_t *req, uint64_t req_len,
                                             uint8_t *out, uint64_t out_cap) {
   return btb_ecall5(BTB_TABLE_INDEX_SCAN, BTB_P(req), req_len, BTB_P(out), out_cap, 0);
+}
+/* Writes the 32-byte address of the running contract. */
+static inline void btb_contract_address(uint8_t out[32]) {
+  btb_ecall5(BTB_CONTRACT_ADDRESS, BTB_P(out), 0, 0, 0, 0);
+}
+
+/* ---- User tokens (see docs/TOKENOMICS.md). 32-byte token ids; u128 amounts are passed as
+ * pointers to 16 little-endian bytes. Every call returns a BTB_TOKEN_* status unless noted. */
+
+/* Mutations only. req is the btb-codec tuple (name: String, symbol: String, decimals: u8,
+ * initial_supply: u128, mint_authority: Option<Address>) (docs/ENCODING.md). On BTB_TOKEN_OK
+ * writes the 32-byte token id to id_out; the initial supply goes to this contract. */
+static inline uint64_t btb_token_create(const uint8_t *req, uint64_t req_len,
+                                        uint8_t id_out[32]) {
+  return btb_ecall5(BTB_TOKEN_CREATE, BTB_P(req), req_len, BTB_P(id_out), 0, 0);
+}
+/* Mutations only. Moves amount (16 bytes u128 LE) from this contract to `to`. */
+static inline uint64_t btb_token_transfer_of(const uint8_t id[32], const uint8_t to[32],
+                                             const uint8_t amount[16]) {
+  return btb_ecall5(BTB_TOKEN_TRANSFER_OF, BTB_P(id), BTB_P(to), BTB_P(amount), 0, 0);
+}
+/* Read-only. On BTB_TOKEN_OK writes the balance (16 bytes u128 LE) to out. */
+static inline uint64_t btb_token_balance_of(const uint8_t id[32], const uint8_t holder[32],
+                                            uint8_t out[16]) {
+  return btb_ecall5(BTB_TOKEN_BALANCE_OF, BTB_P(id), BTB_P(holder), BTB_P(out), 0, 0);
+}
+/* Read-only. Returns the full encoded info length or BTB_NOT_FOUND; the info is the btb-codec
+ * tuple (name, symbol, decimals, supply, mint_authority, creator). */
+static inline uint64_t btb_token_info(const uint8_t id[32], uint8_t *out, uint64_t out_cap) {
+  return btb_ecall5(BTB_TOKEN_INFO, BTB_P(id), BTB_P(out), out_cap, 0, 0);
+}
+/* Read-only. req = id[32] || limit u32 LE || cursor (none, or the 32-byte address from the
+ * previous page). Returns the full result length or BTB_NOT_FOUND; the result (u32 count,
+ * u32 cursor_len, count x (address[32], balance u128 LE), cursor) is copied only if it fits.
+ * Holders are ordered by address. */
+static inline uint64_t btb_token_holders(const uint8_t *req, uint64_t req_len, uint8_t *out,
+                                         uint64_t out_cap) {
+  return btb_ecall5(BTB_TOKEN_HOLDERS, BTB_P(req), req_len, BTB_P(out), out_cap, 0);
+}
+/* Mutations only. This contract must be the token's mint authority. */
+static inline uint64_t btb_token_mint(const uint8_t id[32], const uint8_t to[32],
+                                      const uint8_t amount[16]) {
+  return btb_ecall5(BTB_TOKEN_MINT, BTB_P(id), BTB_P(to), BTB_P(amount), 0, 0);
+}
+/* Mutations only. Burns from this contract's balance; it must be the mint authority. */
+static inline uint64_t btb_token_burn(const uint8_t id[32], const uint8_t amount[16]) {
+  return btb_ecall5(BTB_TOKEN_BURN, BTB_P(id), BTB_P(amount), 0, 0, 0);
 }
 
 #endif /* BTB_H */

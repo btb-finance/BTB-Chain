@@ -13,6 +13,7 @@ use crate::query::{self, Cursor, Order, QueryOptions};
 use crate::readset::ReadSet;
 use crate::tables::{TableError, Tables};
 use btb_vm::host::{Address, Host, IndexBound, IndexKey, IndexScan, IndexScanPage};
+use btb_vm::token::{TokenId, TokenInfo, TokenStore};
 use std::ops::Bound;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,8 @@ pub enum Fault {
     },
     /// Usage, deposit or balance arithmetic overflowed.
     DepositOverflow,
+    /// A stored user-token record did not decode.
+    CorruptToken,
 }
 
 fn index_value(k: &IndexKey) -> IndexValue {
@@ -202,7 +205,80 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
     }
 }
 
+impl<S: KvStore> TokenStore for RuntimeHost<'_, S> {
+    fn contract(&self) -> Address {
+        self.contract
+    }
+    fn info(&mut self, id: &TokenId) -> Option<TokenInfo> {
+        let r = self.kv.get(&layout::token_key(id));
+        let raw = self.kv(r)?;
+        let info = TokenInfo::decode(&raw);
+        if info.is_none() {
+            self.note(Fault::CorruptToken);
+        }
+        info
+    }
+    fn put_info(&mut self, id: &TokenId, info: &TokenInfo) {
+        let r = self.kv.put(&layout::token_key(id), &info.encode());
+        self.kv(r);
+    }
+    fn balance(&mut self, id: &TokenId, holder: &Address) -> u128 {
+        let r = self.kv.get(&layout::token_balance_key(id, holder));
+        self.kv(r)
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .map_or(0, u128::from_le_bytes)
+    }
+    fn put_balance(&mut self, id: &TokenId, holder: &Address, v: u128) {
+        let key = layout::token_balance_key(id, holder);
+        let r = if v == 0 {
+            self.kv.delete(&key)
+        } else {
+            self.kv.put(&key, &v.to_le_bytes())
+        };
+        self.kv(r);
+    }
+    fn nonce(&mut self, creator: &Address) -> u64 {
+        let r = self.kv.get(&layout::token_nonce_key(creator));
+        self.kv(r)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map_or(0, u64::from_le_bytes)
+    }
+    fn put_nonce(&mut self, creator: &Address, n: u64) {
+        let r = self
+            .kv
+            .put(&layout::token_nonce_key(creator), &n.to_le_bytes());
+        self.kv(r);
+    }
+    fn holders(
+        &mut self,
+        id: &TokenId,
+        after: Option<&Address>,
+        max: usize,
+    ) -> Vec<(Address, u128)> {
+        let prefix = layout::token_balance_prefix(id);
+        let end = layout::prefix_successor(&prefix);
+        let mut from = prefix.clone();
+        if let Some(a) = after {
+            from.extend_from_slice(a);
+            // Smallest key strictly greater than the cursor's own entry.
+            from.push(0);
+        }
+        let r = self.kv.scan(&from, end.as_deref(), false, max);
+        self.kv(r)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let a: Address = k.get(prefix.len()..)?.try_into().ok()?;
+                let b = u128::from_le_bytes(v.try_into().ok()?);
+                Some((a, b))
+            })
+            .collect()
+    }
+}
+
 impl<S: KvStore> Host for RuntimeHost<'_, S> {
+    fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
+        Some(self)
+    }
     fn read_only(&self) -> bool {
         self.read_only
     }
@@ -222,6 +298,9 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
     }
     fn caller(&self) -> Address {
         self.caller
+    }
+    fn contract_address(&self) -> Address {
+        self.contract
     }
     fn block_height(&self) -> u64 {
         self.height

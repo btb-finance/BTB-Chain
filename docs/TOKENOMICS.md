@@ -45,6 +45,17 @@ Contracts lock BTB per byte of state they store and get it back when the data is
 - prevents state bloat from cheap, permanent storage, and
 - takes BTB out of circulation as real usage grows.
 
+## User tokens
+
+Anyone can create their own fungible token with the native token module (`Token.create`, host calls 16 to 22, see [LANGUAGE.md](LANGUAGE.md#host-calls)). User tokens are **not BTB**: they have their own id, name, symbol, decimals, `u128` balances and supply, and no operation on them can mint, burn or move BTB. The fixed 1,000,000,000 BTB supply is unaffected; the tests check that native balances plus storage deposits are unchanged by token operations.
+
+- **Id.** `SHA256("btb.token.v1" || creating contract || nonce:u64be)`, where the nonce counts the tokens that contract has created. Deterministic and collision-free per creator.
+- **Create.** Name 1 to 64 bytes, symbol 1 to 12 ASCII letters or digits, decimals up to 38. The whole initial supply is credited to the creating contract, which distributes it with `transfer` (a faucet, a sale, an airdrop).
+- **Supply.** With no mint authority the supply is fixed forever. With one, only that address can `mint` and `burn` (burn takes from its own balance), every change uses checked math, and supply always equals the sum of balances.
+- **Transfers** move tokens from the running contract's own balance, like native `token_transfer`. A failed transfer or an abort leaves no trace.
+- **Holders** are queryable by anyone (`token_holders`), paged in ascending address order; accounts with a zero balance are not holders.
+- **Cost.** Creation and each call are paid in gas like any call. Token records are not yet part of the storage deposit; a deposit per token and holder entry is future work before open networks.
+
 ## Early security budget
 
 With no minting, validators earn only from fees. While usage is low, fees may not attract enough honest validators. A reserve pool carved from the genesis supply (10–20% proposed) can pay decreasing validator rewards over the first years without breaking the 1B cap.

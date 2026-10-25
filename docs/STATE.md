@@ -13,6 +13,9 @@ How `btb-runtime` stores everything in one ordered key-value keyspace. Source of
 | `0x05` balance | `05 A` | `u64` LE |
 | `0x08` usage | `08 A` | metered bytes the contract stores (`u64` LE) |
 | `0x09` deposit | `09 A` | BTB locked for those bytes (`u64` LE) |
+| `0x0A` token | `0A T` | user-token info: `btb-codec` tuple `(name, symbol, decimals, supply, mint_authority, creator)` |
+| `0x0B` token balance | `0B T A` | `u128` LE; absent when zero, so scanning `0B T` lists the holders in ascending address order |
+| `0x0C` token nonce | `0C A` | tokens created by contract `A` (`u64` LE); the next token id uses it |
 | `0x06` merkle node | `06 node_hash` | node encoding (see State commitment) |
 | `0x07` merkle root | `07 version:u64` | 32-byte root |
 
@@ -38,7 +41,7 @@ Index declarations are **temporary and host-side**: `Tables::register(contract, 
 
 ## Storage deposits
 
-Metered bytes are `key.len() + value.len()` of every storage (`0x01`), row (`0x02`) and index (`0x04`) entry of the contract. Counters, balances and the usage/deposit records are not metered. When a call finishes, `RuntimeHost` compares each written key with its committed value, sums the growth and shrinkage, and settles the net delta:
+Metered bytes are `key.len() + value.len()` of every storage (`0x01`), row (`0x02`) and index (`0x04`) entry of the contract. Counters, balances, user-token records (`0x0A` to `0x0C`) and the usage/deposit records are not metered. When a call finishes, `RuntimeHost` compares each written key with its committed value, sums the growth and shrinkage, and settles the net delta:
 
 - Growth locks `delta * DEPOSIT_PER_BYTE` (`layout::DEPOSIT_PER_BYTE`, 10 base units) from the **contract's own balance** into its deposit record, as TOKENOMICS says "the contract locks a deposit". The contract must hold the BTB; an app funds it by transferring to the contract.
 - Shrinkage refunds the proportional share of the deposit (`deposit * freed / usage`) to the **contract's balance**. Since the contract paid, it is also repaid.

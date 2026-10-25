@@ -236,6 +236,9 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     fn caller(&self) -> Address {
         self.0.caller()
     }
+    fn contract_address(&self) -> Address {
+        self.0.contract_address()
+    }
     fn block_height(&self) -> u64 {
         self.0.block_height()
     }
@@ -262,6 +265,9 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     }
     fn table_index_scan(&mut self, scan: &crate::host::IndexScan) -> crate::host::IndexScanPage {
         self.0.table_index_scan(scan)
+    }
+    fn tokens(&mut self) -> Option<&mut dyn crate::token::TokenStore> {
+        self.0.tokens()
     }
 }
 

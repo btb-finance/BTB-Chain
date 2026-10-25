@@ -22,6 +22,7 @@ pub mod host;
 #[cfg(all(feature = "runtime", target_os = "none"))]
 pub mod runtime;
 pub mod table;
+pub mod token;
 
 pub use btb_codec as codec;
 pub use btb_codec::{Address, Decode, DecodeError, Encode};
@@ -58,8 +59,11 @@ pub mod __private {
 /// Everything a contract usually needs.
 pub mod prelude {
     pub use crate::btb;
-    pub use crate::host::{abort, block_height, caller, token_balance, token_transfer, Key};
+    pub use crate::host::{
+        abort, block_height, caller, contract_address, token_balance, token_transfer, Key,
+    };
     pub use crate::table::Table;
+    pub use crate::token::Token;
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use btb_codec::Address;

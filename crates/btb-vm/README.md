@@ -35,8 +35,16 @@ Number in a7, args in a0..a5, result in a0. Gas (on top of the 1-gas ECALL) is c
 | 13 | `table_delete(table_ptr, table_len, id) -> 0 ok \| 1 missing` | 300 + 1/table byte |
 | 14 | `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count` (up to out_cap/8 ascending u64 LE ids >= start_id) | 250 + 1/table byte + 10/id returned |
 | 15 | `table_index_scan(req_ptr, req_len, out_ptr, out_cap) -> total_len` (read-only; allowed in queries; request and result layout in `abi::TABLE_INDEX_SCAN`) | 400 + 1/request byte + 40/id returned + 1/cursor byte returned |
+| 16 | `token_create(req_ptr, req_len, out_ptr) -> status` (user tokens; mutations only; `req` is the `btb-codec` tuple `(name, symbol, decimals: u8, initial_supply: u128, mint_authority: Option<Address>)`; writes the 32-byte token id) | 2000 + 1/request byte |
+| 17 | `token_transfer_of(id_ptr, to_ptr, amount_ptr) -> status` (mutations only; `amount_ptr` = 16 bytes `u128` LE; moves from the running contract) | 400 |
+| 18 | `token_balance_of(id_ptr, holder_ptr, out_ptr) -> status` (read-only; writes `u128` LE) | 100 |
+| 19 | `token_info(id_ptr, out_ptr, out_cap) -> len \| u64::MAX` (read-only; `btb-codec` tuple `(name, symbol, decimals, supply, mint_authority, creator)`) | 150 + 1/byte copied |
+| 20 | `token_holders(req_ptr, req_len, out_ptr, out_cap) -> total_len \| u64::MAX` (read-only; request `id[32] \|\| limit:u32 LE \|\| cursor`, holders ascending by address, limit capped at 256; layout in `abi::TOKEN_HOLDERS`) | 300 + 1/request byte + 30/holder returned + 1/cursor byte returned |
+| 21 | `token_mint(id_ptr, to_ptr, amount_ptr) -> status` (mutations only; mint authority only) | 500 |
+| 22 | `token_burn(id_ptr, amount_ptr) -> status` (mutations only; mint authority only; burns the contract's own balance) | 400 |
+| 23 | `contract_address(out_ptr)` (32 bytes) | 10 |
 
-`storage_read` copies at most `out_cap` bytes but returns the full length. Calls 2, 3 and 7 trap with `WriteInQuery` when `Host::read_only()` is true (queries). Calls 10, 12 and 13 also trap with `WriteInQuery`. Rows are opaque bytes (encoding comes later); `table_get` has `storage_read` copy semantics. Paginate `table_scan` by passing the last id + 1. Call 15 reads secondary indexes; hosts without index storage (`MemHost`) return no results for it (`MemHost` has no schemas), and `btb-runtime` implements it.
+`storage_read` copies at most `out_cap` bytes but returns the full length. Calls 2, 3, 7, 16, 17, 21 and 22 trap with `WriteInQuery` when `Host::read_only()` is true (queries). Calls 10, 12 and 13 also trap with `WriteInQuery`. Rows are opaque bytes (encoding comes later); `table_get` has `storage_read` copy semantics. Paginate `table_scan` by passing the last id + 1. Call 15 reads secondary indexes; hosts without index storage (`MemHost`) return no results for it (`MemHost` has no schemas), and `btb-runtime` implements it.
 
 ```
 cargo test -p btb-vm

@@ -1,0 +1,26 @@
+[package]
+name = "btb-cli"
+description = "The `btb` command line: init, build, dev (hot reload) and deploy for BTB contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "btb_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "btb"
+path = "src/main.rs"
+
+[dependencies]
+btb-vm = { path = "../btb-vm" }
+btb-runtime = { path = "../btb-runtime" }
+btb-dev = { path = "../btb-dev" }
+sha2 = "0.11.1"
+
+[features]
+default = []
+# Let `btb dev --data DIR` keep state in RocksDB (needs clang/libclang).
+rocksdb = ["btb-dev/rocksdb", "btb-runtime/rocksdb"]

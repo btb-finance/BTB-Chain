@@ -13,6 +13,12 @@
 //! | `0x05` balance | `05 A` | `u64` LE |
 //! | `0x08` usage | `08 A` | bytes of state the contract stores, `u64` LE |
 //! | `0x09` deposit | `09 A` | BTB locked for that state, `u64` LE |
+//! | `0x0A` token | `0A T` | `btb-codec` tuple `(name, symbol, decimals, supply, mint_authority, creator)` |
+//! | `0x0B` token balance | `0B T A` | `u128` LE, non-zero only (zero deletes the key) |
+//! | `0x0C` token nonce | `0C A` | tokens created by contract `A`, `u64` LE |
+//!
+//! `T` is the 32-byte token id. Scanning `0B T` yields the holders of a token in ascending
+//! address order. Token state is not metered (no storage deposit) and never touches `0x05`.
 //!
 //! Scanning `02 A len(table) table` yields rows in id order; scanning an index prefix yields
 //! row ids ordered by (index value, id). The row id is always the last 8 bytes of a row or
@@ -44,6 +50,9 @@ pub const TAG_INDEX: u8 = 4;
 pub const TAG_BALANCE: u8 = 5;
 pub const TAG_USAGE: u8 = 8;
 pub const TAG_DEPOSIT: u8 = 9;
+pub const TAG_TOKEN: u8 = 0x0A;
+pub const TAG_TOKEN_BALANCE: u8 = 0x0B;
+pub const TAG_TOKEN_NONCE: u8 = 0x0C;
 
 /// BTB (smallest unit) a contract locks per stored byte. A stored entry counts
 /// `key.len() + value.len()` bytes for storage keys (`0x01`), table rows (`0x02`) and index
@@ -172,6 +181,33 @@ pub fn balance_key(addr: &Address) -> Vec<u8> {
     let mut k = Vec::with_capacity(33);
     k.push(TAG_BALANCE);
     k.extend_from_slice(addr);
+    k
+}
+
+/// Info record of user token `id`.
+pub fn token_key(id: &[u8; 32]) -> Vec<u8> {
+    let mut k = vec![TAG_TOKEN];
+    k.extend_from_slice(id);
+    k
+}
+
+/// Prefix shared by every holder entry of user token `id`.
+pub fn token_balance_prefix(id: &[u8; 32]) -> Vec<u8> {
+    let mut k = vec![TAG_TOKEN_BALANCE];
+    k.extend_from_slice(id);
+    k
+}
+
+pub fn token_balance_key(id: &[u8; 32], holder: &Address) -> Vec<u8> {
+    let mut k = token_balance_prefix(id);
+    k.extend_from_slice(holder);
+    k
+}
+
+/// Number of user tokens a contract has created (the next token nonce).
+pub fn token_nonce_key(creator: &Address) -> Vec<u8> {
+    let mut k = vec![TAG_TOKEN_NONCE];
+    k.extend_from_slice(creator);
     k
 }
 

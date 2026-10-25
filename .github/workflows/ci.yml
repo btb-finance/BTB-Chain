@@ -90,3 +90,38 @@ jobs:
         run: |
           cargo test -p btb-runtime --features rocksdb
           cargo test -p btb-tests --features rocksdb --test rocks
+
+  sdk-ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+
+      # The integration test builds examples/todo and btb-dev, then talks to it over HTTP/SSE.
+      - name: Install Rust toolchain
+        working-directory: .
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal \
+            --component rust-src \
+            --target riscv64imac-unknown-none-elf
+          rustup default 1.97.0
+
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          workspaces: |
+            .
+            examples/todo
+
+      - uses: actions/setup-node@v4.1.0
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: sdk-ts/package-lock.json
+
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test

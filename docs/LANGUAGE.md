@@ -187,12 +187,22 @@ Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a
 | 13 | `table_delete(table_ptr, table_len, id) -> 0 ok \| 1 missing` | 300 + 1/table byte |
 | 14 | `table_scan(table_ptr, table_len, start_id, out_ptr, out_cap) -> count` (up to out_cap/8 ascending u64 LE ids >= start_id) | 250 + 1/table byte + 10/id returned |
 | 15 | `table_index_scan(req_ptr, req_len, out_ptr, out_cap) -> total_len` (read-only; allowed in queries; request and result layout in `abi::TABLE_INDEX_SCAN`) | 400 + 1/request byte + 40/id returned + 1/cursor byte returned |
+| 16 | `token_create(req_ptr, req_len, out_ptr) -> status` (user tokens; mutations only; `req` is the `btb-codec` tuple `(name, symbol, decimals: u8, initial_supply: u128, mint_authority: Option<Address>)`; writes the 32-byte token id) | 2000 + 1/request byte |
+| 17 | `token_transfer_of(id_ptr, to_ptr, amount_ptr) -> status` (mutations only; `amount_ptr` = 16 bytes `u128` LE; moves from the running contract) | 400 |
+| 18 | `token_balance_of(id_ptr, holder_ptr, out_ptr) -> status` (read-only; writes `u128` LE) | 100 |
+| 19 | `token_info(id_ptr, out_ptr, out_cap) -> len \| u64::MAX` (read-only; `btb-codec` tuple `(name, symbol, decimals, supply, mint_authority, creator)`) | 150 + 1/byte copied |
+| 20 | `token_holders(req_ptr, req_len, out_ptr, out_cap) -> total_len \| u64::MAX` (read-only; request `id[32] \|\| limit:u32 LE \|\| cursor`, holders ascending by address, limit capped at 256; layout in `abi::TOKEN_HOLDERS`) | 300 + 1/request byte + 30/holder returned + 1/cursor byte returned |
+| 21 | `token_mint(id_ptr, to_ptr, amount_ptr) -> status` (mutations only; mint authority only) | 500 |
+| 22 | `token_burn(id_ptr, amount_ptr) -> status` (mutations only; mint authority only; burns the contract's own balance) | 400 |
+| 23 | `contract_address(out_ptr)` (32 bytes) | 10 |
 
-Queries run in read-only mode: calls 2, 3, 7, 10, 12 and 13 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Randomness, cross-chain and action calls are added later with their own numbers and gas costs.
+Queries run in read-only mode: calls 2, 3, 7, 10, 12, 13, 16, 17, 21 and 22 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Randomness, cross-chain and action calls are added later with their own numbers and gas costs.
 
 `table_index_scan` (call 15) scans one secondary index of a table between two bounds (`unbounded`, `included` or `excluded`; typed values `u64`, `i64`, `u128`, `bytes`, `string`), ascending or descending, with a `limit` (capped at 256) and an opaque resume cursor, and returns row ids ordered by (value, id). The contract loads rows with `table_get`. It returns the full result length and copies only if it fits in `out_cap`, so retry with a bigger buffer. A malformed request traps. In Rust: `Table::index_eq("owner", Key::Bytes(&addr.0), limit, &cursor)` or `host::table_index_scan`. The scan is recorded in the call's read set as a key range, so a subscribed query re-runs exactly when an entry in that range changes.
 
 **Declaring indexes (temporary).** Contracts cannot declare indexes yet. For now the host registers them per table (`btb_runtime::Tables::register`; `btb-dev` takes `--index Table:index:addr@offset`). A table with no registered index returns no results. A declaration in the contract itself (and in its deploy manifest) replaces this later; see [DEV_SERVER.md](DEV_SERVER.md).
+
+**User tokens (calls 16 to 23).** `btb_sdk::token::Token` wraps them: `Token::create(name, symbol, decimals, initial_supply, mint_authority)`, `.transfer(&to, amount)`, `.balance_of(&holder)`, `.info()`, `.holders(cursor, limit)`, `.mint(&to, amount)`, `.burn(amount)`; `contract_address()` gives a contract its own address (for naming itself as mint authority). They are separate from native BTB (calls 6 and 7): creating a token never mints BTB. `status` is `0` ok, `1` invalid name/symbol/decimals, `2` insufficient balance, `3` unknown token, `4` not the mint authority, `5` overflow, `6` unsupported by the host. Semantic failures return a status and change nothing; a malformed request traps. Balances belong to addresses, and as with native `token_transfer`, a contract moves tokens only from its own balance. Holders are paged by **address** (ascending, non-zero balances only; the last address returned is the cursor), which stays stable while balances change; rank by balance in a contract-owned table if needed. In C see the `btb_token_*` wrappers in `include/btb.h`. Details: [TOKENOMICS.md](TOKENOMICS.md#user-tokens).
 
 Argument and result bytes use the canonical encoding specified in [ENCODING.md](ENCODING.md).
 

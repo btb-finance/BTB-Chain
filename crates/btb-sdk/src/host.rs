@@ -24,6 +24,14 @@ pub mod num {
     pub const TABLE_DELETE: u64 = 13;
     pub const TABLE_SCAN: u64 = 14;
     pub const TABLE_INDEX_SCAN: u64 = 15;
+    pub const TOKEN_CREATE: u64 = 16;
+    pub const TOKEN_TRANSFER_OF: u64 = 17;
+    pub const TOKEN_BALANCE_OF: u64 = 18;
+    pub const TOKEN_INFO: u64 = 19;
+    pub const TOKEN_HOLDERS: u64 = 20;
+    pub const TOKEN_MINT: u64 = 21;
+    pub const TOKEN_BURN: u64 = 22;
+    pub const CONTRACT_ADDRESS: u64 = 23;
     pub const NOT_FOUND: u64 = u64::MAX;
 }
 
@@ -100,6 +108,13 @@ pub fn storage_remove(key: &[u8]) {
 pub fn caller() -> Address {
     let mut a = [0u8; 32];
     ecall(num::CALLER, a.as_mut_ptr() as u64, 0, 0, 0, 0);
+    Address(a)
+}
+
+/// Address of this contract (its token balances live here; match it against a mint authority).
+pub fn contract_address() -> Address {
+    let mut a = [0u8; 32];
+    ecall(num::CONTRACT_ADDRESS, a.as_mut_ptr() as u64, 0, 0, 0, 0);
     Address(a)
 }
 
@@ -299,4 +314,126 @@ pub fn table_index_scan(
         ids,
         next_cursor: (!cur.is_empty()).then(|| cur.to_vec()),
     }
+}
+
+// ---- User tokens: raw wrappers. Prefer the typed `crate::token::Token`. ---------------------------
+
+/// `token_create` with an encoded `(name, symbol, decimals, supply, authority)` request; returns
+/// the new token id or the status code. Mutations only.
+pub fn token_create_raw(req: &[u8]) -> Result<[u8; 32], u64> {
+    let mut id = [0u8; 32];
+    match ecall(
+        num::TOKEN_CREATE,
+        p(req),
+        l(req),
+        id.as_mut_ptr() as u64,
+        0,
+        0,
+    ) {
+        0 => Ok(id),
+        e => Err(e),
+    }
+}
+
+/// Status code of `token_transfer_of` (0 ok). Mutations only.
+pub fn token_transfer_of_raw(id: &[u8; 32], to: &Address, amount: u128) -> u64 {
+    let a = amount.to_le_bytes();
+    ecall(num::TOKEN_TRANSFER_OF, p(id), p(&to.0), p(&a), 0, 0)
+}
+
+/// Balance of `holder` in token `id`, or the status code.
+pub fn token_balance_of_raw(id: &[u8; 32], holder: &Address) -> Result<u128, u64> {
+    let mut out = [0u8; 16];
+    match ecall(
+        num::TOKEN_BALANCE_OF,
+        p(id),
+        p(&holder.0),
+        out.as_mut_ptr() as u64,
+        0,
+        0,
+    ) {
+        0 => Ok(u128::from_le_bytes(out)),
+        e => Err(e),
+    }
+}
+
+/// Encoded token info (see `crate::token::TokenInfo`), or `None` for an unknown token.
+pub fn token_info_raw(id: &[u8; 32]) -> Option<Vec<u8>> {
+    read_with(|out, cap| ecall(num::TOKEN_INFO, p(id), out as u64, cap, 0, 0))
+}
+
+/// Holders `(address, balance)` of one page and the cursor for the next.
+pub type HolderRows = (Vec<(Address, u128)>, Option<Address>);
+
+/// One page of `token_holders`: `(address, balance)` ordered by address, and the cursor for the
+/// next page. `None` for an unknown token.
+pub fn token_holders_raw(
+    id: &[u8; 32],
+    cursor: Option<&Address>,
+    limit: u32,
+) -> Option<HolderRows> {
+    let mut req = Vec::with_capacity(68);
+    req.extend_from_slice(id);
+    req.extend_from_slice(&limit.min(256).to_le_bytes());
+    if let Some(c) = cursor {
+        req.extend_from_slice(&c.0);
+    }
+    let mut out = vec![0u8; 8 + 48 * limit.min(256) as usize + 32];
+    let mut total = ecall(
+        num::TOKEN_HOLDERS,
+        p(&req),
+        l(&req),
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+    );
+    if total == num::NOT_FOUND {
+        return None;
+    }
+    if total as usize > out.len() {
+        out = vec![0u8; total as usize];
+        // State cannot change between the two calls inside one function execution.
+        total = ecall(
+            num::TOKEN_HOLDERS,
+            p(&req),
+            l(&req),
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+            0,
+        );
+    }
+    let total = total as usize;
+    let u32_at = |o: usize| u32::from_le_bytes([out[o], out[o + 1], out[o + 2], out[o + 3]]);
+    let (count, clen) = (u32_at(0) as usize, u32_at(4) as usize);
+    if total != 8 + count * 48 + clen || clen > 32 {
+        abort("bad token holders result");
+    }
+    let rows = out[8..8 + count * 48]
+        .chunks_exact(48)
+        .map(|c| {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&c[..32]);
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&c[32..]);
+            (Address(a), u128::from_le_bytes(b))
+        })
+        .collect();
+    let next = (clen == 32).then(|| {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&out[8 + count * 48..total]);
+        Address(a)
+    });
+    Some((rows, next))
+}
+
+/// Status code of `token_mint` (0 ok). Mutations only; the running contract must be the authority.
+pub fn token_mint_raw(id: &[u8; 32], to: &Address, amount: u128) -> u64 {
+    let a = amount.to_le_bytes();
+    ecall(num::TOKEN_MINT, p(id), p(&to.0), p(&a), 0, 0)
+}
+
+/// Status code of `token_burn` (0 ok). Mutations only; burns from this contract's balance.
+pub fn token_burn_raw(id: &[u8; 32], amount: u128) -> u64 {
+    let a = amount.to_le_bytes();
+    ecall(num::TOKEN_BURN, p(id), p(&a), 0, 0, 0)
 }

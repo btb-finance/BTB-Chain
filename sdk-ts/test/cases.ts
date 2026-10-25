@@ -1,0 +1,36 @@
+import { t, type Codec } from "../src/index.js";
+
+/** Same names and values as crates/btb-tests/tests/ts_fixtures.rs. */
+export const cases: Record<string, { codec: Codec<any>; value: unknown }> = {
+  unit: { codec: t.unit, value: [] },
+  bool_true: { codec: t.bool, value: true },
+  bool_false: { codec: t.bool, value: false },
+  u8_255: { codec: t.u8, value: 255 },
+  u16_0102: { codec: t.u16, value: 0x0102 },
+  u32_01020304: { codec: t.u32, value: 0x01020304 },
+  u64_max: { codec: t.u64, value: 2n ** 64n - 1n },
+  u64_0102030405060708: { codec: t.u64, value: 0x0102030405060708n },
+  u128_1: { codec: t.u128, value: 1n },
+  u128_max: { codec: t.u128, value: 2n ** 128n - 1n },
+  i8_neg2: { codec: t.i8, value: -2 },
+  i16_min: { codec: t.i16, value: -32768 },
+  i32_neg1: { codec: t.i32, value: -1 },
+  i64_min: { codec: t.i64, value: -(2n ** 63n) },
+  i128_neg1: { codec: t.i128, value: -1n },
+  i128_min: { codec: t.i128, value: -(2n ** 127n) },
+  string_hi: { codec: t.string, value: "hi" },
+  string_empty: { codec: t.string, value: "" },
+  string_unicode: { codec: t.string, value: "héllo ✓ \u{1F600}" },
+  bytes_deadbeef: { codec: t.bytes, value: new Uint8Array([0xde, 0xad, 0xbe, 0xef]) },
+  option_some_5: { codec: t.option(t.u8), value: 5 },
+  option_none: { codec: t.option(t.u8), value: null },
+  vec_u16_1_2: { codec: t.vec(t.u16), value: [1, 2] },
+  vec_u8_7_8: { codec: t.vec(t.u8), value: [7, 8] },
+  array_u16_1_2: { codec: t.array(t.u16, 2), value: [1, 2] },
+  tuple_u8_bool: { codec: t.tuple(t.u8, t.bool), value: [1, true] },
+  address_ab: { codec: t.address, value: new Uint8Array(32).fill(0xab) },
+  composite: {
+    codec: t.struct({ id: t.u64, s: t.string, v: t.vec(t.option(t.i32)) }),
+    value: { id: 7n, s: "x", v: [-1, null] },
+  },
+};

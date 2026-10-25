@@ -6,3 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+btb-codec = { path = "../btb-codec" }
+sha2 = "0.11.1"

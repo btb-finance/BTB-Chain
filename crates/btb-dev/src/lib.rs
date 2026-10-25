@@ -28,7 +28,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -105,15 +105,22 @@ struct State<S: KvStore> {
 }
 
 struct Shared<S: KvStore> {
-    contract: Contract,
+    /// The running contract; swapped by `Server::reload` (state is kept).
+    contract: RwLock<Arc<Contract>>,
+    /// Page served at `/`; `None` serves the built-in todo demo.
+    page: RwLock<Option<String>>,
     tables: Tables,
     state: Mutex<State<S>>,
     stop: AtomicBool,
 }
 
+type ReloadFn = Arc<dyn Fn(&[u8]) -> Result<Vec<btb_vm::EntryPoint>, String> + Send + Sync>;
+
 pub struct Server {
     addr: SocketAddr,
     stop: Arc<dyn Fn() + Send + Sync>,
+    reload: ReloadFn,
+    page: Arc<dyn Fn(Option<String>) + Send + Sync>,
     thread: JoinHandle<()>,
 }
 
@@ -145,7 +152,8 @@ impl Server {
         let listener = TcpListener::bind(bind).map_err(|e| format!("bind: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared {
-            contract,
+            contract: RwLock::new(Arc::new(contract)),
+            page: RwLock::new(None),
             tables,
             state: Mutex::new(State {
                 occ: Occ::new(store),
@@ -169,16 +177,37 @@ impl Server {
                 }
             }
         });
+        let (sh_reload, sh_page) = (shared.clone(), shared.clone());
         let stop = Arc::new(move || {
             shared.stop.store(true, Ordering::SeqCst);
             // Wake the blocked accept.
             let _ = TcpStream::connect(addr);
         });
-        Ok(Server { addr, stop, thread })
+        let reload = Arc::new(move |elf: &[u8]| reload_contract(&sh_reload, elf));
+        let page = Arc::new(move |p| *sh_page.page.write().unwrap() = p);
+        Ok(Server {
+            addr,
+            stop,
+            reload,
+            page,
+            thread,
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Swap in a new build of the contract while keeping all state. The ELF is validated first
+    /// (an error leaves the old contract running). Every live subscription is then re-run
+    /// against the new code and pushes its result if it changed. Returns the entry points.
+    pub fn reload(&self, elf: &[u8]) -> Result<Vec<btb_vm::EntryPoint>, String> {
+        (self.reload)(elf)
+    }
+
+    /// Serve this HTML at `/` instead of the built-in todo page (`None` restores it).
+    pub fn set_page(&self, html: Option<String>) {
+        (self.page)(html)
     }
 
     /// Stop accepting; open event streams end within a second.
@@ -191,6 +220,42 @@ impl Server {
     pub fn join(self) {
         let _ = self.thread.join();
     }
+}
+
+fn reload_contract<S: KvStore + Send + 'static>(
+    sh: &Arc<Shared<S>>,
+    elf: &[u8],
+) -> Result<Vec<btb_vm::EntryPoint>, String> {
+    let contract = Contract::from_elf(elf).map_err(|e| format!("bad contract: {e:?}"))?;
+    let entries = contract.entry_points().to_vec();
+    let mut guard = sh.state.lock().unwrap();
+    *sh.contract.write().unwrap() = Arc::new(contract);
+    let st = &mut *guard;
+    let (height, mut dead) = (st.height, Vec::new());
+    let ids: Vec<SubId> = st.clients.keys().copied().collect();
+    for id in ids {
+        let client = &st.clients[&id];
+        let c = client.caller;
+        let store = st.occ.store();
+        let change = st.subs.refresh(id, |_, f, a| {
+            run(sh, store, FunctionKind::Query, f, a, c, height).map(|(o, _, r)| (o, r))
+        });
+        match change {
+            Ok(Some(ch)) => {
+                if client.tx.send(ch.result).is_err() {
+                    dead.push(id);
+                }
+            }
+            Ok(None) => {}
+            // The new code no longer serves this query: end the stream.
+            Err(_) => dead.push(id),
+        }
+    }
+    for id in dead {
+        st.subs.unsubscribe(id);
+        st.clients.remove(&id);
+    }
+    Ok(entries)
 }
 
 fn caller_of(s: &str) -> [u8; 32] {
@@ -320,8 +385,8 @@ fn run<S: KvStore>(
     height: u64,
 ) -> Result<(Vec<u8>, WriteBatch, ReadSet), (&'static str, String)> {
     let mut host = RuntimeHost::new(store, &sh.tables, CONTRACT, caller, height);
-    let out = sh
-        .contract
+    let contract = sh.contract.read().unwrap().clone();
+    let out = contract
         .call(kind, function, args, &mut host, GAS, MEM)
         .map_err(|e| call_error(&e))?;
     let (batch, reads) = host
@@ -347,7 +412,9 @@ fn handle<S: KvStore + Send + 'static>(
         Err(e) => return err_json(&mut conn, "400 Bad Request", &e),
     };
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
-        return respond(&mut conn, "200 OK", "text/html; charset=utf-8", TODO_HTML);
+        let page = sh.page.read().unwrap().clone();
+        let html = page.as_deref().unwrap_or(TODO_HTML);
+        return respond(&mut conn, "200 OK", "text/html; charset=utf-8", html);
     }
     let Some((kind, function)) = req.path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
         return err_json(&mut conn, "404 Not Found", "not found");

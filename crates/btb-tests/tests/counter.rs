@@ -217,6 +217,14 @@ fn sdk_host_call_numbers_match_the_vm() {
         (num::TABLE_DELETE, abi::TABLE_DELETE),
         (num::TABLE_SCAN, abi::TABLE_SCAN),
         (num::TABLE_INDEX_SCAN, abi::TABLE_INDEX_SCAN),
+        (num::TOKEN_CREATE, abi::TOKEN_CREATE),
+        (num::TOKEN_TRANSFER_OF, abi::TOKEN_TRANSFER_OF),
+        (num::TOKEN_BALANCE_OF, abi::TOKEN_BALANCE_OF),
+        (num::TOKEN_INFO, abi::TOKEN_INFO),
+        (num::TOKEN_HOLDERS, abi::TOKEN_HOLDERS),
+        (num::TOKEN_MINT, abi::TOKEN_MINT),
+        (num::TOKEN_BURN, abi::TOKEN_BURN),
+        (num::CONTRACT_ADDRESS, abi::CONTRACT_ADDRESS),
         (num::NOT_FOUND, abi::NOT_FOUND),
     ];
     for (a, b) in pairs {
