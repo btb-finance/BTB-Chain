@@ -2,7 +2,7 @@
 
 `crates/btb-node` is the binary that turns the pieces into a network: it runs one validator, wiring `btb-consensus` (the `Replica`) to `btb-chain` (the `Executor` and `Mempool`) over libp2p/QUIC, and serves a local JSON-RPC API.
 
-Status: a working multi-validator testnet node with persistent storage, evidence-to-slashing and block sync. Not done: a non-validator following the chain, a public faucet/explorer, state sync from snapshots (see [Limits](#limits)).
+Status: a working multi-validator testnet node with persistent storage, evidence-to-slashing and block sync. Also built: an embedded block explorer and a faucet ([TESTNET.md](TESTNET.md)). Not done: a non-validator following the chain, a public deployment, state sync from snapshots (see [Limits](#limits)).
 
 ## Run a local 4-validator testnet
 
@@ -106,8 +106,14 @@ The slashed validator is jailed, so the next epoch's set (chosen at the epoch's 
 | `btb_getBlock` | `[height or "latest"]` | header fields, state roots, transaction ids |
 | `btb_getBalance` | `[address]` | `{balance, nonce}` (balance as a string) |
 | `btb_query` | `[contract, function, args_hex?, caller?]` | `{output, gas_used}`, read-only via `Executor::query` on the head state |
-| `btb_getEpoch` | `[epoch?]` | validator set in consensus order, start height, anchor |
+| `btb_getEpoch` | `[epoch?]` | validator set in consensus order (operator, key, stake at epoch start, `jailed` now), start height, anchor |
+| `btb_getBlocks` | `[before?, limit?]` | newest-first block summaries (height, hash, time, tx count, proposer, gas, fees); `limit` at most 100 |
+| `btb_getTransaction` | `[tx_id]` | the transaction (kind, from, to, amount, function, nonce, gas limit) with block, index and receipt, or `null` |
+| `btb_getAccount` | `[address]` | balance, nonce, bonded and unbonding stake, validator info (jailed), whether it is a contract |
+| `btb_getAccountTxs` | `[address, limit?, before_height?]` | newest-first transactions that involve the account (sender, recipient or contract), with status and fee |
 | `btb_status` | `[]` | height, epoch, round (view), leader, peers, mempool, `last_commit_latency_ms` (submit to commit for transactions submitted at this node), consensus and network counters, evidence |
+
+`GET /explorer` serves the embedded block explorer page ([TESTNET.md](TESTNET.md)). The explorer methods read the block history: the block store keeps an account index (`'A' || address || height || tx index`, one entry per account a transaction involves, deleted with the block when a memory node prunes).
 
 `btb_getBlock` and `btb_getReceipt` read the block history below; for a height a memory node has pruned, `btb_getBlock` returns an error naming the range it keeps (a height not reached yet gives `null`). Queries run on the driver thread between consensus events, bounded by `query_gas`.
 

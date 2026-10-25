@@ -5,6 +5,7 @@
 pub mod blockstore;
 pub mod config;
 pub mod driver;
+pub mod explorer;
 pub mod hex;
 pub mod net;
 pub mod rpc;

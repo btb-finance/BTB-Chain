@@ -10,7 +10,14 @@
 //! | `btb_getBlock` | `[height or "latest"]` | block summary or `null` |
 //! | `btb_getBalance` | `[address_hex]` | `{balance, nonce}` |
 //! | `btb_query` | `[contract_hex, function, args_hex?, caller_hex?]` | `{output, gas_used}` |
+//! | `btb_getBlocks` | `[before?, limit?]` | newest-first block summaries |
+//! | `btb_getTransaction` | `[tx_id_hex]` | transaction fields plus receipt, or `null` |
+//! | `btb_getAccount` | `[address_hex]` | balance, nonce, stake, validator info |
+//! | `btb_getAccountTxs` | `[address_hex, limit?, before_height?]` | newest-first transactions |
+//! | `btb_getEpoch` | `[epoch?]` | validator set of an epoch |
 //! | `btb_status` | `[]` | node status |
+//!
+//! `GET /explorer` serves the embedded block explorer page (no external assets).
 //!
 //! DEV/TESTNET API: no authentication and no TLS, so it only binds to loopback. Put a proxy
 //! in front of it to expose it.
@@ -90,6 +97,10 @@ async fn handle(mut conn: TcpStream, tx: Sender<Input>) {
             Err(e) => ("500 Internal Server Error", json!({"error": e.message})),
         },
         ("GET", "/health") => ("200 OK", json!({"ok": true})),
+        ("GET", "/explorer") | ("GET", "/explorer/") => {
+            let _ = respond_html(&mut conn, crate::explorer::PAGE).await;
+            return;
+        }
         ("POST", "/") => ("200 OK", rpc_response(&tx, &body).await),
         _ => ("404 Not Found", json!({"error": "not found"})),
     };
@@ -127,6 +138,19 @@ async fn respond(conn: &mut TcpStream, status: &str, body: &Value) -> std::io::R
     );
     conn.write_all(head.as_bytes()).await?;
     conn.write_all(&body).await?;
+    conn.shutdown().await
+}
+
+async fn respond_html(conn: &mut TcpStream, page: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
+         Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'\r\n\
+         Connection: close\r\n\r\n",
+        page.len()
+    );
+    conn.write_all(head.as_bytes()).await?;
+    conn.write_all(page.as_bytes()).await?;
     conn.shutdown().await
 }
 

@@ -21,6 +21,7 @@
 
 use crate::blockstore::{BlockStore, StoredBlock, StoredReceipt};
 use crate::config::NodeParams;
+use crate::explorer::tx_json;
 use crate::hex;
 use crate::net::NetHandle;
 use crate::storage::{ExecLog, ExecMeta, FileSafety};
@@ -1305,6 +1306,122 @@ impl<S: KvStore> Driver<S> {
                     .map_err(|e| RpcError::app(format!("query failed: {e:?}")))?;
                 Ok(json!({"output": hex::encode(&out), "gas_used": gas}))
             }
+            "btb_getBlocks" => {
+                // [before?, limit?]: newest first, heights strictly below `before`.
+                let head = self
+                    .state
+                    .head()
+                    .map_err(|e| RpcError::app(e.to_string()))?
+                    .height;
+                let before = match arr.first() {
+                    None | Some(Value::Null) => head + 1,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or_else(|| RpcError::invalid_params("before must be a number"))?,
+                };
+                let limit = match arr.get(1) {
+                    None | Some(Value::Null) => 20,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or_else(|| RpcError::invalid_params("limit must be a number"))?
+                        .min(100),
+                };
+                let mut out = Vec::new();
+                let mut h = before.min(head + 1);
+                while h > 1 && (out.len() as u64) < limit {
+                    h -= 1;
+                    if let Some(b) = self.store.get(h) {
+                        out.push(block_summary(&b));
+                    } else if h < self.store.first() {
+                        break;
+                    }
+                }
+                Ok(json!({"head": head, "blocks": out}))
+            }
+            "btb_getTransaction" => {
+                let id = h32(0)?;
+                let Some((h, _, r)) = self.store.receipt(&id) else {
+                    return Ok(Value::Null);
+                };
+                let Some(b) = self.store.get(h) else {
+                    return Ok(Value::Null);
+                };
+                let index = b.tx_ids.iter().position(|t| *t == id);
+                let tx = b.transactions().into_iter().find(|t| t.id() == id);
+                let mut v = tx
+                    .as_ref()
+                    .map_or_else(|| json!({"id": hex::encode(&id)}), tx_json);
+                v["height"] = json!(h);
+                v["block_hash"] = json!(hex::encode(&b.hash));
+                v["timestamp"] = json!(b.header.timestamp);
+                v["index"] = json!(index);
+                v["receipt"] = receipt_json(&r, h, index.unwrap_or(0));
+                Ok(v)
+            }
+            "btb_getAccount" => {
+                let a = h32(0)?;
+                let e = |e: btb_runtime::KvError| RpcError::app(e.to_string());
+                let validator = self
+                    .state
+                    .validator(&a)
+                    .map_err(|e| RpcError::app(e.to_string()))?
+                    .map(|v| {
+                        json!({
+                            "consensus_key": hex::encode(&v.consensus_key),
+                            "jailed": v.jailed,
+                            "bonded": v.bonded.to_string(),
+                            "unbonding": v.unbonding.to_string(),
+                        })
+                    });
+                Ok(json!({
+                    "address": hex::encode(&a),
+                    "balance": self.state.balance(&a).map_err(e)?.to_string(),
+                    "nonce": self.state.nonce(&a).map_err(e)?,
+                    "staked": self.state.staked(&a).map_err(e)?.to_string(),
+                    "unbonding": self.state.unbonding(&a).map_err(e)?.to_string(),
+                    "validator": validator,
+                    "is_contract": self
+                        .state
+                        .contract(&a)
+                        .map_err(|e| RpcError::app(e.to_string()))?
+                        .is_some(),
+                }))
+            }
+            "btb_getAccountTxs" => {
+                // [address, limit?, before_height?]: newest first.
+                let a = h32(0)?;
+                let limit = match arr.get(1) {
+                    None | Some(Value::Null) => 25,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or_else(|| RpcError::invalid_params("limit must be a number"))?
+                        .min(100),
+                } as usize;
+                let before = match arr.get(2) {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .ok_or_else(|| RpcError::invalid_params("before must be a number"))?,
+                    ),
+                };
+                let mut out = Vec::new();
+                for (h, i) in self.store.account_txs(&a, before, limit) {
+                    let Some(b) = self.store.get(h) else { continue };
+                    let Some(tx) = b.transactions().into_iter().nth(i as usize) else {
+                        continue;
+                    };
+                    let mut v = tx_json(&tx);
+                    v["height"] = json!(h);
+                    v["timestamp"] = json!(b.header.timestamp);
+                    if let Some(r) = b.receipts.iter().find(|r| r.id == tx.id()) {
+                        v["status"] = json!(r.status);
+                        v["fee"] = json!(r.fee.to_string());
+                        v["gas_used"] = json!(r.gas_used);
+                    }
+                    out.push(v);
+                }
+                Ok(json!({"txs": out}))
+            }
             "btb_status" => self.status(),
             "btb_getEpoch" => {
                 let e = match arr.first() {
@@ -1328,6 +1445,13 @@ impl<S: KvStore> Driver<S> {
                             "key": hex::encode(&v.consensus_key),
                             "operator": hex::encode(&v.operator),
                             "stake": v.stake.to_string(),
+                            // Current state (a validator jailed after this epoch's set was fixed).
+                            "jailed": self
+                                .state
+                                .validator(&v.operator)
+                                .ok()
+                                .flatten()
+                                .map(|i| i.jailed),
                         })).collect::<Vec<_>>(),
                     }),
                 })
@@ -1441,6 +1565,18 @@ fn receipt_json(r: &StoredReceipt, height: u64, index: usize) -> Value {
     })
 }
 
+fn block_summary(b: &StoredBlock) -> Value {
+    json!({
+        "height": b.header.height,
+        "hash": hex::encode(&b.hash),
+        "timestamp": b.header.timestamp,
+        "tx_count": b.tx_ids.len(),
+        "proposer": b.consensus.proposer,
+        "gas_used": b.receipts.iter().map(|r| r.gas_used).sum::<u64>(),
+        "fees": b.receipts.iter().map(|r| r.fee).sum::<u64>().to_string(),
+    })
+}
+
 fn block_json(h: u64, b: &StoredBlock) -> Value {
     json!({
         "height": h,
@@ -1451,6 +1587,9 @@ fn block_json(h: u64, b: &StoredBlock) -> Value {
         "state_root_after": hex::encode(&b.state_root_after),
         "tx_root": hex::encode(&b.header.tx_root),
         "consensus_round": b.consensus_round,
+        "proposer": b.consensus.proposer,
+        "gas_used": b.receipts.iter().map(|r| r.gas_used).sum::<u64>(),
+        "fees": b.receipts.iter().map(|r| r.fee).sum::<u64>().to_string(),
         "transactions": b.tx_ids.iter().map(|i| hex::encode(i)).collect::<Vec<_>>(),
         "receipts": b.receipts.len(),
     })

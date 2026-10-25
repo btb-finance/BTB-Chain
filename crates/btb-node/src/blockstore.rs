@@ -10,6 +10,8 @@
 //!   deleted together with their receipt index entries.
 //!
 //! Keys: `'B' || height:u64 BE` the block record; `'T' || tx id` the (height, index) of a receipt;
+//! `'A' || address || height:u64 BE || tx index:u32 BE` (empty value) one entry per account a
+//! transaction involves (sender, recipient or contract), for the explorer's account history;
 //! `'P' || epoch:u64 BE` the epoch's closing proof; `'I' || consensus block id` the height of an
 //! executed block; `'U' || consensus block id` a block seen in a proposal that may not be
 //! committed yet (a short FIFO). The last two let a node answer consensus `SyncRequest`s for
@@ -20,8 +22,10 @@
 //! crash in between can leave one height without a record; reads and block sync treat a missing
 //! height as unavailable.
 
+use crate::explorer::counterparty;
+use crate::wire::Batch;
 use crate::wire::SyncResponse;
-use btb_chain::Header;
+use btb_chain::{Address, Header, Transaction};
 use btb_consensus::{Block as ConsensusBlock, Hash, Message};
 use btb_runtime::{KvStore, MemKv, WriteBatch};
 use std::collections::VecDeque;
@@ -95,7 +99,49 @@ impl R<'_> {
 
 const MAGIC: &[u8; 4] = b"BTR1";
 
+fn account_key(a: &Address, height: u64, index: u32) -> Vec<u8> {
+    let mut k = vec![b'A'];
+    k.extend_from_slice(a);
+    k.extend_from_slice(&height.to_be_bytes());
+    k.extend_from_slice(&index.to_be_bytes());
+    k
+}
+
 impl StoredBlock {
+    /// The block's transactions, decoded from the consensus payload. Empty when the executor
+    /// fell back to an empty block (then `tx_ids` is empty too) or the payload does not match.
+    pub fn transactions(&self) -> Vec<Transaction> {
+        if self.tx_ids.is_empty() {
+            return Vec::new();
+        }
+        match Batch::decode(&self.consensus.payload) {
+            Some(b)
+                if b.txs.len() == self.tx_ids.len()
+                    && b.txs.iter().zip(&self.tx_ids).all(|(t, i)| t.id() == *i) =>
+            {
+                b.txs
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// (account, tx index) for every account a transaction of this block involves.
+    fn touched(&self) -> Vec<(Address, u32)> {
+        let mut out: Vec<(Address, u32)> = Vec::new();
+        for (i, tx) in self.transactions().iter().enumerate() {
+            let mut add = |a: Address| {
+                if !out.contains(&(a, i as u32)) {
+                    out.push((a, i as u32));
+                }
+            };
+            add(tx.sender());
+            if let Some(c) = counterparty(tx) {
+                add(c);
+            }
+        }
+        out
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(MAGIC.to_vec());
         let h = &self.header;
@@ -280,6 +326,33 @@ impl BlockStore {
         (r.id == *id).then_some((height, index, r))
     }
 
+    /// Newest-first `(height, tx index)` of transactions involving `account`, strictly below
+    /// `before` (a height; `None`: from the newest), at most `limit`.
+    pub fn account_txs(
+        &self,
+        account: &Address,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Vec<(u64, u32)> {
+        let mut start = vec![b'A'];
+        start.extend_from_slice(account);
+        let mut end = start.clone();
+        match before {
+            Some(h) => end.extend_from_slice(&h.to_be_bytes()),
+            None => end.extend_from_slice(&[0xff; 12]),
+        }
+        let Ok(rows) = self.kv.scan(&start, Some(&end), true, limit) else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter_map(|(k, _)| {
+                let h = u64::from_be_bytes(k.get(33..41)?.try_into().ok()?);
+                let i = u32::from_be_bytes(k.get(41..45)?.try_into().ok()?);
+                Some((h, i))
+            })
+            .collect()
+    }
+
     /// Store an executed block (one atomic batch) and prune the memory backend.
     pub fn put(&mut self, b: &StoredBlock) -> Result<(), String> {
         let h = b.header.height;
@@ -291,6 +364,9 @@ impl BlockStore {
             batch.put(receipt_key(&r.id), loc);
         }
         batch.put(id_key(b'I', &b.consensus.id()), h.to_be_bytes().to_vec());
+        for (a, i) in b.touched() {
+            batch.put(account_key(&a, h, i), Vec::new());
+        }
         self.kv
             .commit(batch)
             .map_err(|e| format!("write block store: {e}"))?;
@@ -322,6 +398,9 @@ impl BlockStore {
         }
         if let Some(old) = self.get(h) {
             batch.delete(id_key(b'I', &old.consensus.id()));
+            for (a, i) in old.touched() {
+                batch.delete(account_key(&a, h, i));
+            }
         }
         batch.delete(block_key(h));
         self.kv
@@ -448,6 +527,64 @@ mod tests {
         assert!(s.receipt(&[3; 32]).is_none());
         let (h, i, r) = s.receipt(&[10; 32]).unwrap();
         assert_eq!((h, i, r.gas_used), (10, 0, 7));
+    }
+
+    #[test]
+    fn account_index_lists_newest_first_and_is_pruned() {
+        use crate::wire::Batch;
+        use btb_chain::{SigningKey, TxBody, TxKind};
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let me = btb_chain::account_address(&k.verifying_key().to_bytes());
+        let mut s = BlockStore::memory(4);
+        for h in 1..=6u64 {
+            let txs: Vec<Transaction> = (0..2)
+                .map(|n| {
+                    Transaction::sign(
+                        TxBody {
+                            chain_id: 7,
+                            nonce: h * 10 + n,
+                            kind: TxKind::Transfer {
+                                to: [h as u8; 32],
+                                amount: 1,
+                            },
+                        },
+                        &k,
+                    )
+                })
+                .collect();
+            let mut b = block(h);
+            b.tx_ids = txs.iter().map(Transaction::id).collect();
+            b.receipts.clear();
+            b.consensus.payload = Batch { timestamp: 1, txs }.encode();
+            b.consensus.payload_hash = ConsensusBlock::hash_payload(&b.consensus.payload);
+            s.put(&b).unwrap();
+        }
+        // heights 3..=6 are kept (bound 4)
+        let all = s.account_txs(&me, None, 100);
+        assert_eq!(
+            all,
+            vec![
+                (6, 1),
+                (6, 0),
+                (5, 1),
+                (5, 0),
+                (4, 1),
+                (4, 0),
+                (3, 1),
+                (3, 0)
+            ]
+        );
+        assert_eq!(s.account_txs(&me, Some(5), 3), vec![(4, 1), (4, 0), (3, 1)]);
+        // recipient of height 5's transfers sees them; others do not
+        assert_eq!(
+            s.account_txs(&[5; 32], None, 10),
+            vec![(5, 0), (5, 1)].into_iter().rev().collect::<Vec<_>>()
+        );
+        assert!(
+            s.account_txs(&[2; 32], None, 10).is_empty(),
+            "pruned with its block"
+        );
+        assert!(s.account_txs(&[77; 32], None, 10).is_empty());
     }
 
     #[test]

@@ -263,6 +263,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "btb-faucet"
+version = "0.1.0"
+dependencies = [
+ "btb-chain",
+ "btb-node",
+ "btb-runtime",
+ "rand 0.8.8",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+]
+
+[[package]]
 name = "btb-lsp"
 version = "0.1.0"
 dependencies = [

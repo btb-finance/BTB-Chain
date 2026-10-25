@@ -76,11 +76,13 @@ Consensus and networking across independent validators.
   - `crates/btb-node`: rust-libp2p QUIC (TLS 1.3 authenticates the peer id, which is the validator key), per-peer rate limits and bans, bounded frames, see [docs/NODE.md](docs/NODE.md)
 - [ ] Fast path for transactions touching only one owner's data
   - done at the execution level only: transactions whose account footprint is statically closed (transfer-only components) run without conflict tracking, tested against the sequential executor, see [CHAIN.md](docs/CHAIN.md#owner-only-fast-path-execution-level); the consensus-level fast path (confirmation without global ordering) is not built, so no tick
+  - design: [Design Proposal 0001](docs/proposals/0001-consensus-fast-path.md) (Draft): lane inside the BFT first, then certified transfers
 - [x] Parallel execution (Block-STM style)
   - `crates/btb-chain/src/parallel.rs`: multi-version memory, speculative execution, validation, re-execution, deterministic commit; byte-identical to the sequential executor on random blocks for 1, 2, 4 and 8 workers (`crates/btb-chain/tests/parallel.rs`); crons and end-of-block logic stay sequential, see [CHAIN.md](docs/CHAIN.md#parallel-execution); about 2.5x on 4 cores for conflict-free transfers, no gain on fully conflicting blocks
 - [x] Validator staking, rotation and slashing
   - `Stake`/`Unstake`/`RegisterValidator`/`SubmitEvidence` transactions, epochs with the top-N set fixed at each epoch end, unbonding, pro-rata rewards and double-sign slashing in `crates/btb-chain` ([CHAIN.md](docs/CHAIN.md#staking-epochs-and-slashing), [TOKENOMICS.md](docs/TOKENOMICS.md#validator-staking-and-slashing)); epoch changes in `btb-consensus` with the safety argument in [CONSENSUS.md](docs/CONSENSUS.md#epochs-and-validator-set-changes)
 - [ ] Public testnet with faucet and explorer
+  - faucet + explorer built; public deployment pending. `crates/btb-faucet` (rate limits, optional proof of work, nonce management), the `/explorer` page and read endpoints in `crates/btb-node`, `scripts/testnet-local.sh` and a Playwright smoke run against a local 4-validator net; no public network exists yet, see [docs/TESTNET.md](docs/TESTNET.md)
 
 **Gate:** testnet keeps finalizing when validators fail or misbehave.
 

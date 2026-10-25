@@ -1,0 +1,22 @@
+[package]
+name = "btb-faucet"
+description = "Testnet faucet: a small HTTP service that sends Transfers from a funded key through a btb-node RPC, with rate limits and optional proof of work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "btb-faucet"
+path = "src/main.rs"
+
+[dependencies]
+btb-chain = { path = "../btb-chain" }
+sha2 = "0.11.1"
+serde_json = "1"
+rand = "0.8"
+
+[dev-dependencies]
+btb-node = { path = "../btb-node" }
+btb-runtime = { path = "../btb-runtime" }
+tempfile = "3"

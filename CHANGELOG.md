@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Testnet tooling (not deployed): `crates/btb-faucet` (HTTP faucet with per-address and per-IP limits, optional proof of work, nonce retry), block explorer page at `/explorer` plus `btb_getBlocks`, `btb_getTransaction`, `btb_getAccount`, `btb_getAccountTxs` on `btb-node` (account index in the block store), `scripts/testnet-local.sh`, docs/TESTNET.md
 - `crates/btb-consensus`: deterministic, I/O-free Jolteon-style (2-chain HotStuff) BFT state machine with timeout certificates, stake-weighted quorums, leader schedules, crash-safe storage hook, equivocation evidence and a seeded network simulator (crashes, partitions, Byzantine replicas); see docs/CONSENSUS.md
 - `crates/btb-chain`: deterministic execution layer (Ed25519-signed Deploy/Call/Transfer transactions, genesis of the fixed supply with 9 decimals, block execution with gas, 80/20 fee pools, height-scheduled crons, supply invariant, mempool); see docs/CHAIN.md
 - Host call 15 `table_index_scan` (read-only, 400 gas + 1/request byte + 40/id + 1/cursor byte): contracts query a secondary index by range with order, limit and cursor; SDK `Table::index_eq`, `include/btb.h` constant

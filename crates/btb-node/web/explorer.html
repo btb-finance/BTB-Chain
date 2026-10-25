@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTB Explorer</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--mut:#6b7280;--line:#e5e7eb;--card:#f8fafc;--acc:#2563eb;--ok:#15803d;--bad:#dc2626}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--fg:#e6e8eb;--mut:#9aa3ad;--line:#262c33;--card:#171b21;--acc:#6ea0ff;--ok:#4ade80;--bad:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:16px;margin:0}header h1 a{color:inherit;text-decoration:none}
+#status{color:var(--mut)}#status.live{color:var(--ok)}
+nav a{margin-right:10px}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+form{display:flex;gap:6px;flex:1;min-width:220px;max-width:560px;margin-left:auto}
+input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;flex:1}
+button,select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}
+main{padding:16px;max-width:1100px;margin:0 auto}
+section{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:10px 12px;margin-bottom:14px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 8px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.card b{display:block;font-size:18px}.card span{color:var(--mut);font-size:12px}
+dl{margin:0;display:grid;grid-template-columns:max-content 1fr;gap:3px 14px}dt{color:var(--mut)}dd{margin:0;word-break:break-all}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.mono{font-family:ui-monospace,monospace;font-size:12px}
+.wrap{overflow-x:auto}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.bar{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+@keyframes flash{from{background:rgba(37,99,235,.25)}to{background:transparent}}
+tr.new{animation:flash 1.5s ease-out}
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="#/">BTB Explorer</a></h1>
+  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a></nav>
+  <span id="status">connecting</span>
+  <form id="search"><input id="q" placeholder="height, tx id or address" autocomplete="off" spellcheck="false"><button>Search</button></form>
+</header>
+<main id="view"></main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const UNITS = 1000000000n;
+let rpcId = 0;
+async function rpc(method, params) {
+  const r = await fetch('/', {method: 'POST', body: JSON.stringify({jsonrpc: '2.0', id: ++rpcId, method, params: params || []})});
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.result;
+}
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined && text !== null) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+function link(text, href, cls) { const a = el('a', text, cls); a.href = href; return a; }
+function short(h) { return h && h.length > 20 ? h.slice(0, 10) + '...' + h.slice(-6) : h; }
+function btb(units) {
+  const u = BigInt(units), whole = u / UNITS, frac = (u % UNITS).toString().padStart(9, '0').replace(/0+$/, '');
+  return whole.toLocaleString('en-US') + (frac ? '.' + frac : '') + ' BTB';
+}
+function when(ms) {
+  if (!ms) return '';
+  const age = Math.max(0, Date.now() - ms) / 1000;
+  const d = new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  return age < 120 ? Math.round(age) + ' s ago' : d;
+}
+function kv(rows) {
+  const dl = el('dl');
+  for (const [k, v] of rows) {
+    dl.append(el('dt', k));
+    const dd = el('dd');
+    if (v instanceof Node) dd.append(v); else { dd.textContent = v; dd.className = 'mono'; }
+    dl.append(dd);
+  }
+  return dl;
+}
+function sect(title, ...kids) { const s = el('section'); s.append(el('h2', title), ...kids); return s; }
+function table(head, rows) {
+  const t = el('table'), tr = el('tr');
+  for (const h of head) tr.append(el('th', h));
+  const th = el('thead'); th.append(tr); t.append(th);
+  const tb = el('tbody');
+  for (const r of rows) {
+    const row = el('tr'); if (r.cls) row.className = r.cls;
+    for (const c of r.cells) { const td = el('td'); if (c instanceof Node) td.append(c); else td.textContent = c; row.append(td); }
+    tb.append(row);
+  }
+  t.append(tb);
+  const w = el('div', undefined, 'wrap'); w.append(t); return w;
+}
+const addrLink = a => link(short(a), '#/account/' + a, 'mono');
+const txLink = t => link(short(t), '#/tx/' + t, 'mono');
+
+let timer = null, seen = new Set();
+function setView(...kids) { const v = $('view'); v.textContent = ''; v.append(...kids); }
+function fail(e) { setView(sect('Error', el('div', e.message, 'bad'))); }
+
+async function route() {
+  clearInterval(timer); timer = null;
+  const parts = location.hash.replace(/^#\/?/, '').split('/');
+  try {
+    switch (parts[0]) {
+      case 'block': return await blockView(parts[1]);
+      case 'tx': return await txView(parts[1]);
+      case 'account': return await accountView(parts[1]);
+      case 'validators': return await validatorsView(parts[1]);
+      default: return await home();
+    }
+  } catch (e) { fail(e); }
+}
+
+async function home() {
+  const cards = el('div', undefined, 'cards'), holder = el('div'), vals = el('div');
+  setView(sect('Chain', cards), sect('Latest blocks', holder), sect('Validators (current epoch)', vals));
+  seen = new Set();
+  let first = true;
+  async function tick() {
+    const [st, bl] = await Promise.all([rpc('btb_status'), rpc('btb_getBlocks', [null, 15])]);
+    $('status').textContent = 'live, height ' + st.height; $('status').className = 'live';
+    cards.textContent = '';
+    for (const [k, v] of [['height', st.height], ['epoch', st.epoch], ['chain id', st.chain_id], ['validators', st.validators], ['peers', st.peers], ['mempool', st.mempool]]) {
+      const c = el('div', undefined, 'card'); c.append(el('b', String(v)), el('span', k)); cards.append(c);
+    }
+    holder.textContent = '';
+    holder.append(table(['Height', 'Age', 'Txs', 'Proposer', 'Gas', 'Fees', 'Hash'], bl.blocks.map(b => ({
+      cls: !first && !seen.has(b.height) ? 'new' : '',
+      cells: [link(String(b.height), '#/block/' + b.height), when(b.timestamp), String(b.tx_count), '#' + b.proposer, String(b.gas_used), btb(b.fees), el('span', short(b.hash), 'mono')],
+    }))));
+    for (const b of bl.blocks) seen.add(b.height);
+    first = false;
+    if (!vals.firstChild) {
+      const ep = await rpc('btb_getEpoch', [st.epoch]);
+      if (ep) vals.append(validatorTable(ep));
+    }
+  }
+  await tick();
+  timer = setInterval(() => tick().catch(() => { $('status').textContent = 'disconnected'; $('status').className = ''; }), 1000);
+}
+
+async function blockView(h) {
+  const height = h === 'latest' ? 'latest' : Number(h);
+  const b = await rpc('btb_getBlock', [height]);
+  if (!b) throw new Error('block ' + h + ' not found');
+  const txs = await Promise.all(b.transactions.slice(0, 100).map(id => rpc('btb_getTransaction', [id])));
+  const nav = el('div', undefined, 'bar');
+  if (b.height > 1) nav.append(link('< previous', '#/block/' + (b.height - 1)));
+  nav.append(link('next >', '#/block/' + (b.height + 1)));
+  setView(
+    sect('Block ' + b.height, kv([
+      ['hash', b.hash], ['parent', link(b.parent_hash, '#/block/' + (b.height - 1), 'mono')], ['time', when(b.timestamp) + '  (' + b.timestamp + ' ms)'],
+      ['transactions', String(b.transactions.length)], ['proposer', '#' + b.proposer + ' (consensus round ' + b.consensus_round + ')'],
+      ['gas used', String(b.gas_used)], ['fees', btb(b.fees)], ['tx root', b.tx_root],
+      ['state root before', b.state_root_before], ['state root after', b.state_root_after],
+    ]), nav),
+    sect('Transactions', b.transactions.length ? table(['Tx', 'Kind', 'From', 'To', 'Amount', 'Status'], txs.map((t, i) => ({
+      cells: [txLink(b.transactions[i]), t ? t.kind || '' : '', t && t.from ? addrLink(t.from) : '', t && t.to ? addrLink(t.to) : '', t && t.amount ? btb(t.amount) : '', t ? statusEl(t.receipt) : ''],
+    }))) : el('div', 'no transactions', 'mut')));
+}
+
+function statusEl(r) {
+  if (!r) return '';
+  return el('span', r.status + (r.detail ? ' (' + r.detail + ')' : ''), r.status === 'success' ? 'ok' : 'bad');
+}
+
+async function txView(id) {
+  const t = await rpc('btb_getTransaction', [id]);
+  if (!t) throw new Error('transaction ' + id + ' not found (not yet in a block, or pruned)');
+  const r = t.receipt;
+  const rows = [['id', t.id], ['status', statusEl(r)], ['block', link(String(t.height), '#/block/' + t.height)], ['time', when(t.timestamp)],
+    ['kind', t.kind || 'unknown']];
+  if (t.from) rows.push(['from', link(t.from, '#/account/' + t.from, 'mono')]);
+  if (t.to) rows.push(['to', link(t.to, '#/account/' + t.to, 'mono')]);
+  if (t.amount) rows.push(['amount', btb(t.amount)]);
+  for (const k of ['function', 'args', 'name', 'validator', 'consensus_key', 'epoch', 'nonce', 'chain_id']) if (t[k] !== undefined) rows.push([k, String(t[k])]);
+  rows.push(['gas limit', String(t.gas_limit)], ['gas used', String(r.gas_used)], ['fee', btb(r.fee)]);
+  if (r.output) rows.push(['output', r.output]);
+  setView(sect('Transaction', kv(rows)));
+}
+
+async function accountView(a) {
+  if (!/^[0-9a-fA-F]{64}$/.test(a || '')) throw new Error('bad address (64 hex digits)');
+  const [acc, tx] = await Promise.all([rpc('btb_getAccount', [a]), rpc('btb_getAccountTxs', [a, 25])]);
+  const rows = [['address', acc.address], ['balance', btb(acc.balance)], ['nonce', String(acc.nonce)], ['staked', btb(acc.staked)], ['unbonding', btb(acc.unbonding)]];
+  if (acc.is_contract) rows.push(['type', 'contract']);
+  if (acc.validator) rows.push(['validator', (acc.validator.jailed ? 'jailed' : 'active') + ', consensus key ' + acc.validator.consensus_key]);
+  setView(sect('Account', kv(rows)), sect('Recent transactions', tx.txs.length ? table(['Tx', 'Block', 'Kind', 'From', 'To', 'Amount', 'Status'], tx.txs.map(t => ({
+    cells: [txLink(t.id), link(String(t.height), '#/block/' + t.height), t.kind, addrLink(t.from), t.to ? addrLink(t.to) : '', t.amount ? btb(t.amount) : '', el('span', t.status || '', t.status === 'success' ? 'ok' : 'bad')],
+  }))) : el('div', 'no transactions', 'mut')));
+}
+
+function validatorTable(ep) {
+  return table(['#', 'Operator', 'Consensus key', 'Stake', 'Status'], ep.validators.map((v, i) => ({
+    cells: [String(i), addrLink(v.operator), el('span', short(v.key), 'mono'), btb(v.stake), el('span', v.jailed ? 'jailed' : 'active', v.jailed ? 'bad' : 'ok')],
+  })));
+}
+
+async function validatorsView(e) {
+  const st = await rpc('btb_status');
+  const epoch = e === undefined ? st.epoch : Number(e);
+  const ep = await rpc('btb_getEpoch', [epoch]);
+  const nav = el('div', undefined, 'bar');
+  if (epoch > 0) nav.append(link('< epoch ' + (epoch - 1), '#/validators/' + (epoch - 1)));
+  if (epoch < st.epoch) nav.append(link('epoch ' + (epoch + 1) + ' >', '#/validators/' + (epoch + 1)));
+  if (!ep) return setView(sect('Epoch ' + epoch, el('div', 'no validator set stored for this epoch', 'mut'), nav));
+  setView(sect('Epoch ' + epoch, kv([['first block', String(ep.start_height + 1)], ['last block', String(ep.end_height)], ['validators', String(ep.validators.length)]]), nav),
+    sect('Validator set', validatorTable(ep)));
+}
+
+$('search').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const q = $('q').value.trim().replace(/^0x/, '');
+  if (!q) return;
+  try {
+    if (/^\d+$/.test(q)) { location.hash = '#/block/' + q; return; }
+    if (/^[0-9a-fA-F]{64}$/.test(q)) {
+      const t = await rpc('btb_getTransaction', [q]);
+      location.hash = t ? '#/tx/' + q.toLowerCase() : '#/account/' + q.toLowerCase();
+      return;
+    }
+    throw new Error('enter a block height, a 64-digit transaction id or an address');
+  } catch (e) { fail(e); }
+});
+window.addEventListener('hashchange', route);
+route();
+</script>
+</body>
+</html>

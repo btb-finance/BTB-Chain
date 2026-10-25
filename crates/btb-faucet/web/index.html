@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTB Faucet</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--mut:#6b7280;--line:#e5e7eb;--card:#f8fafc;--acc:#2563eb;--ok:#15803d;--bad:#dc2626}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--fg:#e6e8eb;--mut:#9aa3ad;--line:#262c33;--card:#171b21;--acc:#6ea0ff;--ok:#4ade80;--bad:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+main{max-width:560px;margin:0 auto;padding:24px 16px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:var(--mut);margin:0 0 16px}
+section{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:12px 14px;margin-bottom:14px}
+label{display:block;color:var(--mut);margin:8px 0 3px}
+input{width:100%;font:13px ui-monospace,monospace;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+button{margin-top:12px;font:inherit;color:#fff;background:var(--acc);border:0;border-radius:6px;padding:7px 16px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#msg{margin-top:12px;word-break:break-all}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+dl{margin:0;display:grid;grid-template-columns:max-content 1fr;gap:3px 12px}dt{color:var(--mut)}dd{margin:0;word-break:break-all;font:12px ui-monospace,monospace}
+</style>
+</head>
+<body>
+<main>
+  <h1>BTB testnet faucet</h1>
+  <p class="sub">Test coins have no value. Do not send mainnet funds anywhere near this page.</p>
+  <section>
+    <form id="f">
+      <label for="addr">Account address (64 hex digits)</label>
+      <input id="addr" autocomplete="off" spellcheck="false" placeholder="e.g. 3fa9...">
+      <label for="amt">Amount (BTB, optional)</label>
+      <input id="amt" inputmode="numeric" placeholder="default">
+      <button id="go">Request coins</button>
+    </form>
+    <div id="msg"></div>
+  </section>
+  <section><dl id="info"></dl></section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+function row(dl, k, v) { const a = document.createElement('dt'), b = document.createElement('dd'); a.textContent = k; b.textContent = v; dl.append(a, b); }
+function say(text, cls) { const m = $('msg'); m.textContent = text; m.className = cls || ''; }
+const hex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+const unhex = s => Uint8Array.from(s.match(/../g) || [], x => parseInt(x, 16));
+
+// Small synchronous SHA-256 (WebCrypto is not available on plain http origins).
+const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+function sha256(msg) {
+  const h = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const n = msg.length, total = (((n + 9 + 63) >> 6) << 6), buf = new Uint8Array(total);
+  buf.set(msg); buf[n] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(total - 4, (n * 8) >>> 0); dv.setUint32(total - 8, Math.floor(n / 0x20000000));
+  const w = new Uint32Array(64);
+  for (let o = 0; o < total; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + 4 * i);
+    for (let i = 16; i < 64; i++) {
+      const a = w[i-15], b = w[i-2];
+      const s0 = ((a>>>7)|(a<<25)) ^ ((a>>>18)|(a<<14)) ^ (a>>>3);
+      const s1 = ((b>>>17)|(b<<15)) ^ ((b>>>19)|(b<<13)) ^ (b>>>10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
+    }
+    let [a,b,c,d,e,f,g,hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e>>>6)|(e<<26)) ^ ((e>>>11)|(e<<21)) ^ ((e>>>25)|(e<<7));
+      const t1 = (hh + S1 + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+      const S0 = ((a>>>2)|(a<<30)) ^ ((a>>>13)|(a<<19)) ^ ((a>>>22)|(a<<10));
+      const t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+  }
+  const out = new Uint8Array(32), odv = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) odv.setUint32(4 * i, h[i]);
+  return out;
+}
+function zeroBits(d) { let n = 0; for (const b of d) { if (b === 0) { n += 8; continue; } return n + Math.clz32(b) - 24; } return n; }
+
+async function mine(challenge, addr, bits) {
+  const msg = new Uint8Array(56); msg.set(unhex(challenge), 0); msg.set(unhex(addr), 16);
+  const dv = new DataView(msg.buffer);
+  for (let nonce = 0; ; nonce++) {
+    dv.setUint32(48, nonce >>> 0, true); dv.setUint32(52, Math.floor(nonce / 4294967296), true);
+    if (zeroBits(sha256(msg)) >= bits) return nonce;
+    if (nonce % 20000 === 19999) { say('Working on the proof of work... ' + (nonce + 1) + ' tries', 'mut'); await new Promise(r => setTimeout(r)); }
+  }
+}
+
+let info = null;
+async function loadInfo() {
+  try {
+    info = await (await fetch('/info')).json();
+    const dl = $('info'); dl.textContent = '';
+    row(dl, 'faucet account', info.address);
+    row(dl, 'chain id', String(info.chain_id));
+    row(dl, 'faucet balance', info.balance === null ? 'node unreachable' : (BigInt(info.balance) / 1000000000n).toLocaleString('en-US') + ' BTB');
+    row(dl, 'default / max', info.default_amount_btb + ' / ' + info.max_amount_btb + ' BTB');
+    row(dl, 'limit', '1 per address per ' + Math.round(info.address_cooldown_secs / 3600) + ' h, ' + info.ip_max + ' per IP per ' + Math.round(info.ip_window_secs / 3600) + ' h');
+    if (info.pow_bits) row(dl, 'proof of work', info.pow_bits + ' bits');
+  } catch (e) { say('cannot reach the faucet: ' + e.message, 'bad'); }
+}
+
+$('f').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const addr = $('addr').value.trim().replace(/^0x/, '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(addr)) { say('Enter a 64-digit hex account address.', 'bad'); return; }
+  $('go').disabled = true;
+  try {
+    const body = {address: addr};
+    if ($('amt').value.trim()) body.amount = $('amt').value.trim();
+    if (info && info.pow_bits) {
+      say('Getting a challenge...', 'mut');
+      const c = await (await fetch('/challenge')).json();
+      if (c.error) throw new Error(c.error);
+      body.pow = {challenge: c.challenge, nonce: await mine(c.challenge, addr, c.bits)};
+    }
+    say('Sending...', 'mut');
+    const r = await fetch('/drip', {method: 'POST', body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error + (j.retry_after ? ' (try again in ' + j.retry_after + ' s)' : ''));
+    say('Sent ' + j.amount_btb + ' BTB in transaction ' + j.tx_id + '. Waiting for the block...', 'ok');
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      const s = await (await fetch('/tx/' + j.tx_id)).json();
+      if (s.status && s.status !== 'pending') { say('Confirmed in block ' + s.height + ' (' + s.status + '). Transaction ' + j.tx_id, s.status === 'success' ? 'ok' : 'bad'); break; }
+    }
+  } catch (e) { say(e.message, 'bad'); }
+  $('go').disabled = false;
+  loadInfo();
+});
+loadInfo();
+</script>
+</body>
+</html>
