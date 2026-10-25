@@ -4,13 +4,16 @@ use crate::decode::{decode, AluOp, BranchOp, Instr, LoadOp, StoreOp, Trap};
 use crate::gas;
 
 /// Why `run` returned without a trap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
     /// ECALL executed; the host reads the call number from a7 (x17) and arguments from a0..a6,
     /// then calls `run` again to resume after the ECALL.
     Ecall,
     /// EBREAK executed; the program halted normally.
     Halt,
+    /// The guest called the `return_data` host call (produced by `host::run_with_host`, never by
+    /// `run`); carries the returned bytes.
+    Return(Vec<u8>),
 }
 
 /// A deterministic RV64IM machine with flat little-endian memory starting at address 0.
@@ -60,6 +63,17 @@ impl Vm {
     }
     pub fn memory(&self) -> &[u8] {
         &self.mem
+    }
+
+    /// Charge `n` gas (used for host calls). On `OutOfGas` nothing is charged.
+    pub fn charge_gas(&mut self, n: u64) -> Result<(), Trap> {
+        match self.gas_used.checked_add(n) {
+            Some(g) if g <= self.gas_limit => {
+                self.gas_used = g;
+                Ok(())
+            }
+            _ => Err(Trap::OutOfGas),
+        }
     }
 
     fn range(&self, addr: u64, len: u64) -> Result<usize, Trap> {

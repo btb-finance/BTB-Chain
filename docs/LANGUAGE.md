@@ -141,3 +141,21 @@ No custom compiler is needed for Rust, C or Zig: their existing RISC-V backends 
 - Proven in production by Nervos CKB and Polkadot's PolkaVM, both open source in Rust.
 
 See [PRIOR_ART.md](PRIOR_ART.md) for how other chains approach languages and VMs.
+
+## Host calls
+
+Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a5, result in a0. Each call charges gas before it runs. Current calls (Phase 1, implemented in `crates/btb-vm/src/host.rs`):
+
+| # | Call | Gas |
+| - | ---- | --- |
+| 1 | `storage_read(key_ptr, key_len, out_ptr, out_cap) -> len or u64::MAX` | 200 + 1/key byte + 1/byte copied |
+| 2 | `storage_write(key_ptr, key_len, val_ptr, val_len)` | 500 + 4/(key+val) byte |
+| 3 | `storage_remove(key_ptr, key_len)` | 300 + 1/key byte |
+| 4 | `caller(out_ptr)` | 10 |
+| 5 | `block_height()` | 5 |
+| 6 | `token_balance(addr_ptr)` | 50 |
+| 7 | `token_transfer(to_ptr, amount) -> 0 ok or 1 insufficient` | 300 |
+| 8 | `return_data(ptr, len)` | 10 + 1/byte |
+| 9 | `abort(ptr, len)` | 10 + 1/byte |
+
+Queries run in read-only mode: calls 2, 3 and 7 trap with `WriteInQuery`. Bad guest pointers trap; unknown numbers trap. Table, randomness, cross-chain and action calls are added later with their own numbers and gas costs.
