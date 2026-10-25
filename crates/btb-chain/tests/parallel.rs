@@ -2,7 +2,7 @@
 //!
 //! The sequential executor is the oracle. Random blocks (hot accounts, counter, token, dex and
 //! todo calls, failing and invalid transactions, deploys followed by calls in the same block,
-//! transfers to the fee pools) run on the oracle and on parallel executors with 1, 2, 4 and 8
+//! transfers to the fee pools, payment-channel open, top-up, close, timeout and forged vouchers) run on the oracle and on parallel executors with 1, 2, 4 and 8
 //! workers (twice, fast path on and off); receipts, state roots and in the end the whole store
 //! must match byte for byte.
 
@@ -11,6 +11,7 @@ use btb_chain::*;
 use btb_codec::Address as CodecAddress;
 use btb_runtime::MemKv;
 use btb_vm::FunctionKind;
+use btb_voucher::{SignedVoucher, Voucher};
 use support::*;
 
 struct Lcg(u64);
@@ -27,6 +28,7 @@ impl Lcg {
     }
 }
 
+static CHANNEL_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const RICH: u64 = 10 * UNITS_PER_BTB;
 const WALLETS: usize = 14;
 
@@ -148,7 +150,26 @@ fn setup(rigs: &mut [Rig], w: &mut [Wallet]) -> World {
     }
 }
 
-fn random_block(rng: &mut Lcg, w: &mut [Wallet], c: &World, mode: usize) -> Vec<Transaction> {
+/// Channels opened so far: (payer wallet, channel id, payee wallet).
+type Chans = Vec<(usize, [u8; 32], usize)>;
+
+fn voucher(w: &[Wallet], p: usize, id: [u8; 32], amount: u64, nonce: u64) -> SignedVoucher {
+    Voucher {
+        chain_id: CHAIN_ID,
+        channel_id: id,
+        amount,
+        nonce,
+    }
+    .sign(&w[p].key)
+}
+
+fn random_block(
+    rng: &mut Lcg,
+    w: &mut [Wallet],
+    c: &World,
+    chans: &mut Chans,
+    mode: usize,
+) -> Vec<Transaction> {
     let n = 4 + rng.below(36);
     let hot = [w[1].addr(), w[2].addr(), w[3].addr()];
     let mut txs = Vec::new();
@@ -161,7 +182,7 @@ fn random_block(rng: &mut Lcg, w: &mut [Wallet], c: &World, mode: usize) -> Vec<
             // transfer-only block: hot recipients and disjoint pairs (fast path candidates)
             rng.below(3)
         } else {
-            rng.below(24)
+            rng.below(31)
         };
         let tx = match k {
             0 => w[i].transfer(to_hot, amt),
@@ -231,6 +252,44 @@ fn random_block(rng: &mut Lcg, w: &mut [Wallet], c: &World, mode: usize) -> Vec<
             20 if rng.below(4) == 0 => w[i].transfer(validator_pool(), 1_000), // pool: fallback
             20 => w[i].call(c.counter, "nope", &()), // no such function
             21 => w[i].transfer(w[i].addr(), 5), // self transfer
+            24 => {
+                // open a channel (its id is known from the payer and its nonce)
+                let id = channel_id(&w[i].addr(), w[i].nonce);
+                chans.push((i, id, j));
+                w[i].sign(TxKind::Channel(ChannelOp::Open {
+                    payee: w[j].addr(),
+                    deposit: amt,
+                    expiry_blocks: 1 + rng.next() % 4,
+                }))
+            }
+            25..=30 if chans.is_empty() => w[i].transfer(to_hot, amt),
+            25..=30 => {
+                let (p, id, q) = chans[rng.below(chans.len())];
+                let claim = rng.next() % (2 * amt);
+                match k {
+                    25 => w[p].sign(TxKind::Channel(ChannelOp::TopUp {
+                        channel: id,
+                        amount: amt,
+                    })),
+                    26 | 27 => {
+                        let v = voucher(w, p, id, claim, rng.next());
+                        w[q].sign(TxKind::Channel(ChannelOp::Close { voucher: v }))
+                    }
+                    28 => {
+                        let v = (rng.below(2) == 0).then(|| voucher(w, p, id, claim, 1));
+                        w[p].sign(TxKind::Channel(ChannelOp::StartClose {
+                            channel: id,
+                            voucher: v,
+                        }))
+                    }
+                    29 => w[p].sign(TxKind::Channel(ChannelOp::Finalize { channel: id })),
+                    _ => {
+                        // forged: signed by a wallet that is not the payer
+                        let v = voucher(w, (p + 1) % WALLETS, id, claim, 1);
+                        w[q].sign(TxKind::Channel(ChannelOp::Close { voucher: v }))
+                    }
+                }
+            }
             _ => w[i].call(c.counter, "increment", &(1u64,)),
         };
         txs.push(tx);
@@ -251,11 +310,21 @@ fn run_seed(seed: u64, blocks: usize) -> Vec<Rig> {
     let mut rigs = rigs(&g);
     let c = setup(&mut rigs, &mut w);
     let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut chans = Chans::new();
     for b in 0..blocks {
         resync(&rigs, &mut w);
         let mode = usize::from(b % 4 != 0);
-        let txs = random_block(&mut rng, &mut w, &c, mode);
-        step(&mut rigs, txs);
+        let txs = random_block(&mut rng, &mut w, &c, &mut chans, mode);
+        let kinds: Vec<bool> = txs
+            .iter()
+            .map(|t| matches!(t.body.kind, TxKind::Channel(_)))
+            .collect();
+        let rec = step(&mut rigs, txs);
+        for (r, is) in rec.iter().zip(kinds) {
+            if is && r.status == Status::Success {
+                CHANNEL_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         for r in &rigs {
             assert_eq!(
                 r.net.state.total_supply().unwrap(),
@@ -288,6 +357,8 @@ fn parallel_equals_sequential_on_random_blocks() {
     assert!(conflicts > 50, "re-executions: {conflicts}");
     assert!(fast > 100, "fast-path txs: {fast}");
     assert!(fell_back > 0, "pool-touching blocks must fall back");
+    let ok = CHANNEL_OK.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(ok > 20, "successful channel txs: {ok}");
 }
 
 /// Everyone pays the same hot account and calls the same counter: maximal conflicts, and the

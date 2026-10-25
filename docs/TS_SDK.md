@@ -38,6 +38,14 @@ const stop = client.subscribe("list_mine", t.unit, [], Todos, (rows) => console.
 
 `subscribe` uses `EventSource` when the runtime has one and a `fetch` stream reader otherwise (Node), reconnecting after 1 s on dropped streams. Errors are `BtbError` with the HTTP `status` and the server's message.
 
+## Hosting nodes and proofs
+
+The same client talks to a hosting node ([HOSTING.md](HOSTING.md)); the contract is part of the URL: `new BtbClient({ url: "http://host:8788/c/<contract hex>" })`. `query` and `subscribe` are unchanged; `mutation` fails with status 501 (send a signed transaction to a validator).
+
+- `client.queryWithProof(name, argsType, args, resultType)` returns `{ result, height, incomplete, proof }`: the result plus Merkle proofs of the storage keys the query read. `incomplete` is true when it also scanned ranges, which a proof cannot cover.
+- `client.proof(keys, height?)` fetches a bundle for contract storage keys (default: the newest version whose next block is provably committed).
+- `await verifyProof(bundle, { trustedRoot?, expect? })` (async, uses WebCrypto) checks every entry against the bundle's state root and the header of the next block, and throws `ProofError` otherwise. It returns the proven `(key, value)` pairs. `trustedRoot` (for example a validator's `state_root_after` for that height) pins the root; without it the root is only the host's claim. The quorum evidence in the bundle is checked by the Rust verifier (`btb_host::proof::verify_bundle`), not here. What is and is not provable: [HOSTING.md](HOSTING.md#proofs).
+
 ## In a plain page (no bundler)
 
 `btb dev` serves only `web/index.html`, so the example pages inline the built client (`sdk-ts/dist`) in a `<script>` that defines a global `btb`; `node examples/sync-sdk.mjs` refreshes it ([examples/README-web.md](../examples/README-web.md)). Pages use `new btb.BtbClient({ url: location.origin, caller })` and `btb.t`.

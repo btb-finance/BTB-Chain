@@ -7,14 +7,17 @@
 //! transactions. See `docs/CHAIN.md`.
 
 pub mod block;
+pub mod channel;
 pub mod exec;
 pub mod mempool;
 pub(crate) mod parallel;
+pub mod site;
 pub mod staking;
 pub mod state;
 pub mod tx;
 
 pub use block::{Block, Header};
+pub use channel::{channel_id, Channel, ChannelError, ChannelOp};
 pub use exec::{BlockError, ExecMode, Executor, Invalid, Origin, Receipt, Revert, Status};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
 pub use parallel::ParStats;
@@ -51,6 +54,11 @@ pub const STAKE_GAS: u64 = 10_000;
 pub const UNSTAKE_GAS: u64 = 10_000;
 pub const REGISTER_VALIDATOR_GAS: u64 = 20_000;
 pub const EVIDENCE_GAS: u64 = 100_000;
+/// Payment channels: open, top-up and finalize cost `CHANNEL_GAS`; a voucher check adds a signature verification.
+pub const CHANNEL_GAS: u64 = 10_000;
+pub const CHANNEL_VOUCHER_GAS: u64 = 30_000;
+/// Blocks the payee has to submit a higher voucher after the payer starts a timeout close.
+pub const CHANNEL_CHALLENGE_BLOCKS: u64 = 600;
 
 pub(crate) fn sha256(parts: &[&[u8]]) -> Hash {
     let mut h = Sha256::new();

@@ -539,6 +539,7 @@ impl Byzantine {
                 rate_per_sec: 1e9,
                 rate_burst: 1e9,
                 delay: Duration::ZERO,
+                followers: None,
             },
             sink,
         )
@@ -886,6 +887,7 @@ impl RawPeer {
                 rate_per_sec: 1e9,
                 rate_burst: 1e9,
                 delay: Duration::ZERO,
+                followers: None,
             },
             sink,
         )

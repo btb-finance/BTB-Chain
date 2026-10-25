@@ -226,6 +226,12 @@ pub struct NodeParams {
     pub rate_burst: f64,
     /// Testing only: delay every inbound message by this many milliseconds to emulate a WAN.
     pub test_one_way_delay_ms: u64,
+    /// Serve block sync to non-validator followers (hosting nodes). `None` (the default):
+    /// only validators are served. See `docs/HOSTING.md`.
+    pub serve_followers: Option<crate::net::FollowerPolicy>,
+    /// How often a node whose chain stalled asks a peer for blocks, in milliseconds. `None`:
+    /// the driver's default (1 s). A hosting node that follows a live chain sets it low.
+    pub sync_poll_ms: Option<u64>,
 }
 
 impl NodeParams {
@@ -242,6 +248,8 @@ impl NodeParams {
             rate_per_sec: 2_000.0,
             rate_burst: 4_000.0,
             test_one_way_delay_ms: 0,
+            serve_followers: None,
+            sync_poll_ms: None,
         }
     }
 
@@ -273,6 +281,31 @@ impl NodeParams {
             p.rpc = Some(addr);
         }
         p.data_dir = path_of("data_dir");
+        // "serve_followers": true, or {"max_peers": 32, "rate_per_sec": 10, "rate_burst": 20}
+        match v.get("serve_followers") {
+            Some(Value::Bool(true)) => p.serve_followers = Some(Default::default()),
+            Some(o @ Value::Object(_)) => {
+                let mut f = crate::net::FollowerPolicy::default();
+                if let Some(n) = o.get("max_peers").and_then(Value::as_u64) {
+                    f.max_peers = n as usize;
+                }
+                if let Some(n) = o.get("rate_per_sec").and_then(Value::as_f64) {
+                    f.rate_per_sec = n;
+                }
+                if let Some(n) = o.get("rate_burst").and_then(Value::as_f64) {
+                    f.rate_burst = n;
+                }
+                if f.max_peers == 0 || f.rate_per_sec <= 0.0 || f.rate_burst < 1.0 {
+                    return Err(
+                        "serve_followers: max_peers, rate_per_sec, rate_burst must be positive"
+                            .into(),
+                    );
+                }
+                p.serve_followers = Some(f);
+            }
+            _ => {}
+        }
+        p.sync_poll_ms = v.get("sync_poll_ms").and_then(Value::as_u64);
         let num = |k: &str, d: u64| v.get(k).and_then(Value::as_u64).unwrap_or(d);
         p.timing = Timing {
             tick_ms: num("tick_ms", p.timing.tick_ms),

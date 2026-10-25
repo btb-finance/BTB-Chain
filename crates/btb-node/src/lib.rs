@@ -62,6 +62,17 @@ impl Node {
         params: NodeParams,
         state: ChainState<S>,
     ) -> Result<Node, String> {
+        Self::start_with_hook(params, state, None)
+    }
+
+    /// Like [`Node::start`], with a hook the driver thread calls after every executed block
+    /// (see `driver::BlockHook`). A node whose key is not in the validator set follows the
+    /// chain by block sync and executes it, which is what a hosting node does.
+    pub fn start_with_hook<S: KvStore + Send + 'static>(
+        params: NodeParams,
+        state: ChainState<S>,
+        hook: Option<driver::BlockHook>,
+    ) -> Result<Node, String> {
         let set = params.genesis.validator_set()?;
         let keys: Vec<[u8; 32]> = (0..set.len() as u32)
             .map(|i| set.get(i).expect("in range").key)
@@ -108,6 +119,7 @@ impl Node {
                 rate_per_sec: params.rate_per_sec,
                 rate_burst: params.rate_burst,
                 delay: Duration::from_millis(params.test_one_way_delay_ms),
+                followers: params.serve_followers,
             },
             sink,
         )?;
@@ -119,7 +131,7 @@ impl Node {
         let net2 = net.clone();
         let thread = std::thread::Builder::new()
             .name("btb-driver".into())
-            .spawn(move || driver::run(params, state, rx, net2, ready_tx))
+            .spawn(move || driver::run(params, state, rx, net2, ready_tx, hook))
             .map_err(|e| format!("spawn driver: {e}"))?;
         match ready_rx.recv() {
             Ok(Ok(())) => {}
@@ -142,6 +154,28 @@ impl Node {
     pub fn call(&self, method: &str, params: Value) -> RpcResult {
         let rt = self.rt.as_ref().expect("running");
         rt.block_on(rpc::call(&self.tx, method, params))
+    }
+
+    /// Run `f` on the driver thread against the chain state and return its result. It runs
+    /// between two blocks, so it sees a consistent head, and it blocks block execution while it
+    /// runs: keep it short. `S` must be the store the node was started with.
+    pub fn with_chain<S, R, F>(&self, f: F) -> Result<R, String>
+    where
+        S: KvStore + Send + 'static,
+        R: Send + 'static,
+        F: FnOnce(&mut ChainState<S>) -> R + Send + 'static,
+    {
+        let (tx, rx) = channel();
+        let job: driver::StateJob = Box::new(move |any| {
+            if let Some(state) = any.downcast_mut::<ChainState<S>>() {
+                let _ = tx.send(f(state));
+            }
+        });
+        self.tx
+            .send(Input::Job(job))
+            .map_err(|_| "node is shutting down".to_string())?;
+        rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|_| "node did not run the job (wrong store type or shutting down)".to_string())
     }
 
     pub fn net(&self) -> &net::NetHandle {

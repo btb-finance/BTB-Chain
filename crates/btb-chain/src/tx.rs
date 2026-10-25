@@ -13,8 +13,10 @@
 //! Unstake  (tag 4): amount:u64
 //! RegisterValidator (tag 5): consensus_key[32] || network_addr:bytes
 //! SubmitEvidence    (tag 6): epoch:u64 || evidence
+//! Site              (tag 9): sub:u8 || fields (`site.rs`: 0 publish, 1 remove)
 //! evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleVote)
 //!          | 1 || proposer:u32 || round:u64 || (id[32] || sig[64]) x2  (DoubleProposal)
+//! Channel  (tag 8): sub:u8 || fields   (see `channel.rs`: open 0, top-up 1, close 2, start-close 3, finalize 4)
 //! manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes:[string]
 //! ```
 //!
@@ -194,6 +196,10 @@ pub enum TxKind {
         epoch: u64,
         evidence: Evidence,
     },
+    /// A payment-channel operation (`crate::channel`).
+    Channel(crate::channel::ChannelOp),
+    /// Publish or remove a static site file of a contract (`crate::site`, deployer only).
+    Site(crate::site::SiteOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -323,6 +329,14 @@ impl Encode for TxBody {
                 epoch.encode_to(out);
                 encode_evidence(evidence, out);
             }
+            TxKind::Channel(op) => {
+                8u8.encode_to(out);
+                op.encode_to(out);
+            }
+            TxKind::Site(op) => {
+                9u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
     }
 }
@@ -362,6 +376,14 @@ impl TxBody {
             6 => TxKind::SubmitEvidence {
                 epoch: u64::decode_from(r)?,
                 evidence: decode_evidence(r)?,
+            },
+            8 => match crate::channel::ChannelOp::decode_from(r)? {
+                Ok(op) => TxKind::Channel(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            9 => match crate::site::SiteOp::decode_from(r)? {
+                Ok(op) => TxKind::Site(op),
+                Err(t) => return Err(TxError::BadTag(t)),
             },
             t => return Err(TxError::BadTag(t)),
         };
@@ -464,6 +486,8 @@ impl Transaction {
             TxKind::Unstake { .. } => UNSTAKE_GAS,
             TxKind::RegisterValidator { .. } => REGISTER_VALIDATOR_GAS,
             TxKind::SubmitEvidence { .. } => EVIDENCE_GAS,
+            TxKind::Channel(op) => op.gas(),
+            TxKind::Site(op) => op.gas(),
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }

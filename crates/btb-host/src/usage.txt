@@ -1,0 +1,9 @@
+btb-host: a BTB Chain hosting node (follows the chain, serves queries, subscriptions, sites and proofs)
+
+  --genesis <file>           genesis.json of the chain (required)
+  --validator <multiaddr>    validator to sync from, ending in /p2p/<peer id> (repeatable, required)
+  --http <addr>              HTTP bind address (default 127.0.0.1:8788)
+  --default-contract <hex>   contract served at /query/<fn> and /subscribe/<fn>
+  --listen <multiaddr>       libp2p listen address (default /ip4/127.0.0.1/udp/0/quic-v1)
+  --serve-followers          serve block sync to other hosting nodes
+  --poll-ms <n>              block poll interval when caught up (default 100)

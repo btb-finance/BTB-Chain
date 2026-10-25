@@ -17,6 +17,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `ROADMAP.md` | Six phases, deliverables as checkboxes, gates between phases |
 | `docs/ARCHITECTURE.md` | Network, consensus, state model, tech stack |
 | `docs/DEV_SERVER.md` | `btb-dev`: single-node dev server (HTTP, live queries over SSE), the Phase 2 gate demo |
+| `docs/HOSTING.md` | `btb-host`: hosting nodes that follow the chain without trusting peers; queries, subscriptions, static sites and Merkle proofs on answers |
 | `docs/CLI.md` | The `btb` command: `init`, `build`, `dev` (hot reload), `deploy` |
 | `docs/CONSENSUS.md` | `btb-consensus`: Jolteon-style 2-chain BFT, safety rules (voting, locking, commit), leader schedule, equivocation evidence, simulator |
 | `docs/STATE.md` | Key layout, index encodings, table writes and queries in `btb-runtime` |
@@ -48,7 +49,8 @@ crates/
 ├── btb-consensus/ # deterministic, I/O-free BFT state machine (HotStuff family) + simulator
 ├── btb-chain/     # transactions, genesis, block execution, fees, crons, mempool
 ├── btb-dev/       # single-node dev server (HTTP + SSE), Phase 2 demo
-├── btb-node/      # consensus, networking, hosting gateway
+├── btb-node/      # consensus, networking, JSON-RPC
+├── btb-host/      # hosting node: verified follower, queries, SSE, sites, Merkle proofs
 ├── btb-faucet/    # testnet faucet (HTTP, rate limits, nonce management)
 ├── btb-cli/       # `btb init`, `btb dev`, `btb deploy`
 └── btb-lsp/       # language server: BTB diagnostics, hover, completion

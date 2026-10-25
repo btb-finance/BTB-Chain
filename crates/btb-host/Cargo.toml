@@ -1,0 +1,26 @@
+[package]
+name = "btb-host"
+description = "BTB Chain hosting node: follows the chain without trusting peers and serves queries, subscriptions, static sites and Merkle proofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "btb-host"
+path = "src/main.rs"
+
+[dependencies]
+btb-node = { path = "../btb-node" }
+btb-chain = { path = "../btb-chain" }
+btb-runtime = { path = "../btb-runtime" }
+btb-consensus = { path = "../btb-consensus" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+sha2 = "0.11.1"
+serde_json = "1"
+rand = "0.8"
+
+[dev-dependencies]
+btb-codec = { path = "../btb-codec" }
+btb-vm = { path = "../btb-vm" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

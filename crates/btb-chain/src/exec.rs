@@ -77,6 +77,10 @@ pub enum Revert {
     Fault(String),
     /// A staking transaction was refused (nothing changed).
     Stake(StakeError),
+    /// A payment-channel transaction was refused (nothing changed).
+    Channel(crate::channel::ChannelError),
+    /// A site transaction was refused (nothing changed).
+    Site(crate::site::SiteError),
     Vm(String),
 }
 
@@ -148,6 +152,7 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
     let fee = tx.gas_limit().checked_mul(cfg.gas_price)?;
     match &tx.body.kind {
         TxKind::Transfer { amount, .. } | TxKind::Stake { amount, .. } => fee.checked_add(*amount),
+        TxKind::Channel(op) => fee.checked_add(op.debit()),
         _ => Some(fee),
     }
 }
@@ -218,7 +223,16 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::BadSignature);
             }
         }
-        TxKind::SubmitEvidence { .. } => {
+        TxKind::SubmitEvidence { .. } | TxKind::Channel(_) => {
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::Site(op) => {
+            // Too big or malformed files never enter a block.
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
             if !tx.verify_signature() {
                 return Err(Invalid::BadSignature);
             }
@@ -583,6 +597,47 @@ impl<S: KvStore> Ctx<'_, S> {
                     )?;
                     Ok(o.slashed.to_le_bytes().to_vec())
                 })?
+            }
+            TxKind::Channel(op) => {
+                let (chain, height) = (self.cfg.chain_id, self.height);
+                let r = crate::channel::apply(
+                    &mut self.overlay,
+                    chain,
+                    &sender,
+                    &tx.public_key,
+                    tx.body.nonce,
+                    height,
+                    op,
+                );
+                match r {
+                    Ok(output) => Done {
+                        gas_used: tx.intrinsic_gas(),
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::channel::Fail::Tx(e)) => Done {
+                        gas_used: tx.intrinsic_gas(),
+                        output: Vec::new(),
+                        result: Err(Revert::Channel(e)),
+                    },
+                    Err(crate::channel::Fail::State(e)) => return Err(e),
+                }
+            }
+            TxKind::Site(op) => {
+                let gas_used = tx.intrinsic_gas();
+                match crate::site::apply(&mut self.overlay, &sender, op) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::site::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Site(e)),
+                    },
+                    Err(crate::site::Fail::State(e)) => return Err(e),
+                }
             }
             TxKind::Call {
                 contract,
@@ -967,6 +1022,21 @@ impl Executor {
         args: &[u8],
         caller: &Address,
     ) -> Result<(Vec<u8>, u64), Revert> {
+        self.query_tracked(state, contract, function, args, caller)
+            .map(|(out, gas, _)| (out, gas))
+    }
+
+    /// Like [`Executor::query`], also returning everything the query read: the keys and key
+    /// ranges whose change can change the answer (hosting nodes use it to re-run
+    /// subscriptions and to prove key reads).
+    pub fn query_tracked<S: KvStore>(
+        &self,
+        state: &mut ChainState<S>,
+        contract: &Address,
+        function: &str,
+        args: &[u8],
+        caller: &Address,
+    ) -> Result<(Vec<u8>, u64, btb_runtime::ReadSet), Revert> {
         let fault = |e: StateError| Revert::Fault(e.0);
         let height = state.head().map_err(fault)?.height;
         let rec = state
@@ -984,7 +1054,12 @@ impl Executor {
             state.config.query_gas,
             state.config.vm_memory as usize,
         ) {
-            Ok(o) => Ok((o.output, o.gas_used)),
+            Ok(o) => {
+                let (_, reads) = host
+                    .finish_tracked()
+                    .map_err(|f| Revert::Fault(format!("{f:?}")))?;
+                Ok((o.output, o.gas_used, reads))
+            }
             Err(CallError::Trap { trap, .. }) => Err(match trap {
                 Trap::OutOfGas => Revert::OutOfGas,
                 Trap::Abort(m) => Revert::Abort(m),

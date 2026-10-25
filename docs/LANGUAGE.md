@@ -68,7 +68,7 @@ pub fn increment(by: u64) -> u64 { /* host::storage_get / storage_set */ 0 }
 ```
 
 - `#[btb::query]`, `#[btb::mutation]`, `#[btb::cron]`, `#[btb::action]` export `btb_<kind>_<name>` (name `[a-z0-9_]`, at most 64). Arguments are decoded as the tuple of the parameters and the return value is encoded and passed to `return_data` ([ENCODING.md](ENCODING.md)). No return type means no output. Bad arguments abort the call. At most 8 arguments; no generics, `async` or `self`.
-- `#[btb::cron]` accepts `every = "1h"` but the schedule is not used yet (scheduler: Phase 2).
+- `#[btb::cron(every = "N blocks")]` (1 to 4294967296) also exports a marker symbol `btb_every_<N>_<name>`; `btb deploy` reads it into the manifest's `crons` (function, every_blocks), which the chain schedules from the deploy height ([CHAIN.md](CHAIN.md#cron-jobs)). Time units such as `"1h"` are rejected at compile time because the chain schedules by block height only. A cron without `every` has no schedule and never runs.
 - `#[btb::table]` makes the struct encode as the tuple of its fields and implements `btb_sdk::table::Table` (table name = struct name). `#[primary]`, `#[index]` and the generated `by_<field>` lookups in the DEX example below are not implemented; row ids come from `insert`.
 - Host calls are wrapped in `btb_sdk::host`: `storage_get/set/remove`, `caller`, `block_height`, `token_balance`, `token_transfer`, `return_data`, `abort`, `table_*`. They only work inside the VM; on other targets they panic.
 - `use btb_sdk::prelude::*` is available, but `Result<T>`, `ensure!`, `Ratio` and `TokenId` in the example below are design sketches that do not exist yet.
@@ -113,7 +113,7 @@ pub fn swap(pool: u64, amount_in: u128, min_out: u128) -> Result<u128> {
     Ok(out)
 }
 
-#[btb::cron(every = "1h")]
+#[btb::cron(every = "3600 blocks")]
 pub fn record_price_history() -> Result<()> {
     // snapshot prices for charts
     Ok(())

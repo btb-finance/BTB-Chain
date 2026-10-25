@@ -225,6 +225,7 @@ dependencies = [
  "btb-consensus",
  "btb-runtime",
  "btb-vm",
+ "btb-voucher",
  "ed25519-dalek 2.2.0",
  "sha2 0.11.1",
 ]
@@ -273,6 +274,23 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
+]
+
+[[package]]
+name = "btb-host"
+version = "0.1.0"
+dependencies = [
+ "btb-chain",
+ "btb-codec",
+ "btb-consensus",
+ "btb-node",
+ "btb-runtime",
+ "btb-vm",
+ "ed25519-dalek 2.2.0",
+ "rand 0.8.8",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
 ]
 
 [[package]]
@@ -339,6 +357,8 @@ dependencies = [
  "btb-runtime",
  "btb-sdk",
  "btb-vm",
+ "btb-voucher",
+ "ed25519-dalek 2.2.0",
 ]
 
 [[package]]
@@ -346,6 +366,14 @@ name = "btb-vm"
 version = "0.1.0"
 dependencies = [
  "btb-codec",
+ "sha2 0.11.1",
+]
+
+[[package]]
+name = "btb-voucher"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
  "sha2 0.11.1",
 ]
 

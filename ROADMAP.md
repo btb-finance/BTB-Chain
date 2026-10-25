@@ -92,10 +92,13 @@ Everything that makes BTB a decentralized cloud.
 
 **Deliverables**
 
-- [ ] Cron jobs and scheduled functions (prepaid balances, per-block scheduled-gas cap)
-- [ ] Hosting nodes: queries, subscriptions, websites, Merkle proofs on answers
-- [ ] Payment channels and signed vouchers for per-request fees
+- [x] Cron jobs and scheduled functions (prepaid balances, per-block scheduled-gas cap)
+  - `#[btb::cron(every = "N blocks")]` flows into the deploy bundle `crons`; the chain runs it from the contract balance, pauses when empty and defers fairly under the cap ([CHAIN.md](docs/CHAIN.md#cron-jobs)); building the `Deploy` transaction from a bundle comes with `btb deploy` to a network (Phase 4)
+- [x] Hosting nodes: queries, subscriptions, websites, Merkle proofs on answers ([design](docs/HOSTING.md); `crates/btb-host`, no fees or storage-node files yet)
+- [x] Payment channels and signed vouchers for per-request fees
+  - `TxKind::Channel` (open, top-up, payee close, payer timeout close with a challenge period) in `btb-chain`, locked funds in the supply invariant, parallel-equivalence tested; `btb-voucher` crate and `sdk-ts/src/voucher.ts` with a cross-language fixture ([CHAIN.md](docs/CHAIN.md#payment-channels)); hosting nodes that sell requests against vouchers come with the hosting-node item
 - [ ] Fee split for mutations (executor / relay host)
+  - the 80/20 split is accounted in `btb-chain`, but the relay share only accumulates in `relay_pool()`: paying it needs a signed `relayer` field and a hosting-node registry, see the design note in [CHAIN.md](docs/CHAIN.md#fees)
 - [ ] Storage nodes ([design](docs/SCALING.md)): erasure-coded file pieces, random piece assignment, storage challenges, automatic repair
 - [ ] Edge caching for popular content
 - [ ] Native DEX module with batch auctions (front-running protection)

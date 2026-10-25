@@ -12,6 +12,8 @@ btb-codec = { path = "../btb-codec" }
 btb-sdk = { path = "../btb-sdk" }
 btb-runtime = { path = "../btb-runtime" }
 btb-dev = { path = "../btb-dev" }
+btb-voucher = { path = "../btb-voucher" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 
 [features]
 default = []

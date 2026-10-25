@@ -189,7 +189,51 @@ pub struct Built {
     pub elf_path: PathBuf,
     pub elf: Vec<u8>,
     pub entry_points: Vec<EntryPoint>,
+    /// `(function, every_blocks)` from the `#[btb::cron(every = "N blocks")]` marker symbols.
+    pub crons: Vec<(String, u64)>,
 }
+
+/// Cron schedules from the `btb_every_<N>_<name>` marker symbols, sorted by function.
+/// Each must name an existing cron entry point and be within the chain's limits.
+pub fn cron_schedules(elf: &[u8], entries: &[EntryPoint]) -> Result<Vec<(String, u64)>, String> {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    let syms = btb_vm::elf::export_list(elf).map_err(|e| format!("invalid contract: {e:?}"))?;
+    for (sym, _) in syms {
+        let Some(rest) = sym.strip_prefix("btb_every_") else {
+            continue;
+        };
+        let (n, name) = rest
+            .split_once('_')
+            .ok_or_else(|| format!("bad schedule symbol {sym:?}"))?;
+        let every: u64 = n
+            .parse()
+            .map_err(|_| format!("bad schedule symbol {sym:?}"))?;
+        if !(1..=MAX_CRON_EVERY).contains(&every) {
+            return Err(format!(
+                "cron {name:?}: every must be 1..={MAX_CRON_EVERY} blocks"
+            ));
+        }
+        if !entries
+            .iter()
+            .any(|e| e.name == name && format!("{:?}", e.kind) == "Cron")
+        {
+            return Err(format!("schedule for {name:?} but no cron entry point"));
+        }
+        if out.iter().any(|(f, _)| f == name) {
+            return Err(format!("cron {name:?} scheduled twice"));
+        }
+        out.push((name.to_string(), every));
+    }
+    if out.len() > MAX_CRONS {
+        return Err(format!("at most {MAX_CRONS} scheduled crons"));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Same limits as `btb-chain`'s `Manifest::validate`.
+const MAX_CRON_EVERY: u64 = 1 << 32;
+const MAX_CRONS: usize = 16;
 
 /// Run `cargo build --release` for the RISC-V target (same environment as the examples'
 /// build.sh), copy the ELF to `target/btb/<name>.elf` and validate it with the VM's loader.
@@ -222,11 +266,14 @@ pub fn build(project: &Path) -> Result<Built, String> {
     fs::create_dir_all(&out_dir).map_err(io)?;
     let elf_path = out_dir.join(format!("{name}.elf"));
     fs::write(&elf_path, &elf).map_err(io)?;
+    let entry_points = contract.entry_points().to_vec();
+    let crons = cron_schedules(&elf, &entry_points)?;
     Ok(Built {
         name,
         elf_path,
         elf,
-        entry_points: contract.entry_points().to_vec(),
+        entry_points,
+        crons,
     })
 }
 
@@ -276,6 +323,11 @@ pub fn manifest_json(b: &Built, indexes: &[IndexSpec]) -> String {
             )
         })
         .collect();
+    let crons: Vec<String> = b
+        .crons
+        .iter()
+        .map(|(f, n)| format!("{{\"function\": {}, \"every_blocks\": {n}}}", json_str(f)))
+        .collect();
     let idx: Vec<String> = indexes
         .iter()
         .map(|i| {
@@ -292,12 +344,13 @@ pub fn manifest_json(b: &Built, indexes: &[IndexSpec]) -> String {
         })
         .collect();
     format!(
-        "{{\n  \"name\": {},\n  \"elf\": {},\n  \"size\": {},\n  \"code_hash\": {},\n  \"hash_algorithm\": \"sha256\",\n  \"entry_points\": [\n{}\n  ],\n  \"indexes\": [{}{}{}]\n}}\n",
+        "{{\n  \"name\": {},\n  \"elf\": {},\n  \"size\": {},\n  \"code_hash\": {},\n  \"hash_algorithm\": \"sha256\",\n  \"entry_points\": [\n{}\n  ],\n  \"crons\": [{}],\n  \"indexes\": [{}{}{}]\n}}\n",
         json_str(&b.name),
         json_str(&format!("{}.elf", b.name)),
         b.elf.len(),
         json_str(&sha256_hex(&b.elf)),
         entries.join(",\n"),
+        crons.join(", "),
         if idx.is_empty() { "" } else { "\n" },
         idx.join(",\n"),
         if idx.is_empty() { "" } else { "\n  " },

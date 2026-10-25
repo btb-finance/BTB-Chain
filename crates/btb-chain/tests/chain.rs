@@ -360,6 +360,42 @@ fn cron_gas_cap_defers_extra_runs_to_the_next_block() {
 }
 
 #[test]
+fn cron_cap_is_fair_every_deferred_cron_runs_in_turn() {
+    let mut a = Wallet::new(1);
+    let mut cfg = ChainConfig::new(CHAIN_ID);
+    cfg.cron_gas_block_cap = cfg.cron_gas_limit; // one cron per block, three always due
+    let mut n = Net::new(MemKv::new(), &genesis_with(&[&a], RICH, cfg));
+    let mut m = manifest("counter");
+    m.crons = vec![("tick".into(), 1)];
+    let r = n.run(vec![
+        a.deploy(elf("counter"), m.clone()),
+        a.deploy(elf("counter"), m.clone()),
+        a.deploy(elf("counter"), m),
+    ]);
+    let cs: Vec<_> = r.iter().map(deployed).collect();
+    let mut fund: Vec<_> = cs.iter().map(|c| a.transfer(*c, 100_000_000)).collect();
+    let mut seen = Vec::new();
+    let mut first = n.run(std::mem::take(&mut fund));
+    seen.extend(first.drain(3..));
+    seen.extend(n.empty_blocks(8));
+    // 9 blocks, one run each, and never the same contract twice before the others ran.
+    assert_eq!(seen.len(), 9);
+    let who: Vec<_> = seen
+        .iter()
+        .map(|r| match &r.origin {
+            Origin::Cron { contract, .. } => *contract,
+            o => panic!("{o:?}"),
+        })
+        .collect();
+    for w in who.windows(3) {
+        assert!(w[0] != w[1] && w[1] != w[2] && w[0] != w[2], "{who:?}");
+    }
+    // The same order repeats on a fresh run (deterministic).
+    assert_eq!(who[..3], who[3..6]);
+    assert_eq!(who[..3], who[6..9]);
+}
+
+#[test]
 fn gas_exhaustion_charges_fee_and_reverts() {
     let mut a = Wallet::new(1);
     let mut n = net(&[&a], RICH);
@@ -603,10 +639,10 @@ fn tx_and_block_wire_roundtrip_and_rejects_garbage() {
         assert!(Transaction::decode(&wire[..wire.len() - 1]).is_err());
     }
     let mut bad_tag = txs[2].encode();
-    bad_tag[16] = 9;
+    bad_tag[16] = 200;
     assert!(matches!(
         Transaction::decode(&bad_tag),
-        Err(TxError::BadTag(9))
+        Err(TxError::BadTag(200))
     ));
     let blk = Block::new(3, [1; 32], 5, [2; 32], txs);
     assert_eq!(Block::decode(&blk.encode()).unwrap(), blk);

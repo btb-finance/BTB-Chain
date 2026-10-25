@@ -2,7 +2,7 @@
 
 `crates/btb-node` is the binary that turns the pieces into a network: it runs one validator, wiring `btb-consensus` (the `Replica`) to `btb-chain` (the `Executor` and `Mempool`) over libp2p/QUIC, and serves a local JSON-RPC API.
 
-Status: a working multi-validator testnet node with persistent storage, evidence-to-slashing and block sync. Also built: an embedded block explorer and a faucet ([TESTNET.md](TESTNET.md)). Not done: a non-validator following the chain, a public deployment, state sync from snapshots (see [Limits](#limits)).
+Status: a working multi-validator testnet node with persistent storage, evidence-to-slashing and block sync. Also built: an embedded block explorer and a faucet ([TESTNET.md](TESTNET.md)). Not done: a public deployment, state sync from snapshots (see [Limits](#limits)).
 
 ## Run a local 4-validator testnet
 
@@ -29,6 +29,8 @@ Without `--features rocksdb` the node keeps chain state in memory and **refuses 
 | `reporter_key_file` | optional `{"secret": hex}` of the account that signs and pays for `SubmitEvidence` (default: the validator key's own account) |
 | `data_dir` | see above |
 | `tick_ms` (20), `round_timeout_ms` (2000), `idle_block_ms` (250) | timing |
+| `serve_followers` | optional: serve block sync to non-validators, see [Serving followers](#serving-followers) |
+| `sync_poll_ms` | optional: how long a stalled node waits before asking for blocks (default 1000) |
 
 ## Networking
 
@@ -58,7 +60,17 @@ A laggard normally catches up through the ended consensus instances of its epoch
 - The verified blocks are executed in order, the epoch switches as usual when the last block of an epoch executes (a consensus instance that block sync overtook is dropped), and the node asks again at once. Near the chain's tip a response proves nothing yet (the newest blocks lack their certificate); the node's own consensus instance takes over there.
 - `btb_status` `sync`: `requests`, `blocks_synced`, `served`, `rejected`, `unsolicited`.
 
-A node that is no longer in the allowed set of the peers it asks (removed from the validator set by slashing or low stake, then absent for long) is disconnected by them; following the chain as a non-validator is not done.
+A node that is no longer in the allowed set of the peers it asks (removed from the validator set by slashing or low stake, then absent for long) is disconnected by them, unless they serve followers (below).
+
+### Serving followers
+
+A node whose key is not in the validator set ("observing only") follows the chain by block sync alone: it executes every verified block and rebuilds the state. That is what a hosting node does ([HOSTING.md](HOSTING.md); `btb-host` embeds this driver and adds HTTP). Validators serve such followers only if the operator opts in with `"serve_followers"` in `node.json` (`true`, or `{"max_peers": 32, "rate_per_sec": 10, "rate_burst": 20}`; library: `NodeParams::serve_followers`, `net::FollowerPolicy`). Off by default.
+
+- A follower is any peer with an ed25519 identity. Up to `max_peers` stay connected; further ones are disconnected (counted in `net.dropped_follower`).
+- A follower may send **block sync requests and nothing else**. Any other frame is dropped and counts as a strike (a peer with 20 strikes in 10 s is banned for 30 s). Followers are never sent consensus traffic, are not in the broadcast set, and cannot submit transactions.
+- Each follower has its own token bucket (`rate_per_sec` sustained, `rate_burst` burst; a request costs 1), stricter than the validators' (2,000/s). A sync answer is at most a few MiB built from the block store, so the limit bounds the work a follower can ask for.
+- The answers are verified by the follower itself (`sync::verify`), so serving it needs no trust in either direction. `btb_status` shows `net.followers` and `net.dropped_follower`; `sync.served` counts answers to validators and followers alike.
+- `sync_poll_ms` (node.json, library `NodeParams::sync_poll_ms`) shortens the "no commit for 1 s" wait before a node asks for blocks and the 300 ms request gap; hosting nodes set it to 100.
 
 ### Crash safety
 
@@ -149,7 +161,7 @@ Manual check, 4 processes built with `--features rocksdb` (`init-testnet`, epoch
 
 ## Limits
 
-- Epoch changes work for validators that stay in the set. A node that is not in an epoch's set only observes: it does not follow the chain as a non-validator, so joining a running network at a boundary still needs state sync from a snapshot, which does not exist. Block sync has no bound on how far a *validator* can be behind, but it needs peers that kept the history (RocksDB nodes keep all of it; memory nodes 4096 heights) and a replay of every block.
+- Epoch changes work for validators that stay in the set. A node that is not in an epoch's set only observes: it follows the chain by block sync (a hosting node), but joining a running network at a boundary without replaying from genesis still needs state sync from a snapshot, which does not exist. Block sync has no bound on how far a *validator* can be behind, but it needs peers that kept the history (RocksDB nodes keep all of it; memory nodes 4096 heights) and a replay of every block.
 - The closing proof of an epoch is built from tail blocks the node saw and from its replica's newest QC; a node that never saw them (and did not receive the epoch through block sync) cannot serve the last block of that epoch to others, who then ask another peer.
 - A failed or lost `SubmitEvidence` is not retried; another validator's report, or the offender's next offence, covers it. The evidence window is the unbonding period.
 - The block history is not atomic with chain state: a crash can leave one height missing. Peers' network addresses are configured by hand in `peers`; new validators' addresses are not discovered.

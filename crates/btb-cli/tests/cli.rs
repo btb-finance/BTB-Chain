@@ -275,3 +275,22 @@ fn scaffolded_rust_analyzer_settings_make_cargo_check_work() {
     assert!(out.contains("btb-sdk-macros") || out.contains("btb_sdk_macros"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cron_every_flows_from_macro_into_deploy_manifest() {
+    let (dir, root) = new_project("cron");
+    let src = root.join("src/main.rs");
+    let orig = std::fs::read_to_string(&src).unwrap();
+    let extra = "\n#[btb::cron(every = \"50 blocks\")]\npub fn sweep() {}\n\n#[btb::cron]\npub fn manual() {}\n";
+    std::fs::write(&src, format!("{orig}{extra}")).unwrap();
+    let (b, dir_out) = deploy(&root).unwrap();
+    assert_eq!(b.crons, vec![("sweep".to_string(), 50)]);
+    let manifest = std::fs::read_to_string(dir_out.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains("\"crons\": [{\"function\": \"sweep\", \"every_blocks\": 50}]"),
+        "{manifest}"
+    );
+    // The unscheduled cron is still an entry point, just without a schedule.
+    assert!(manifest.contains("{\"kind\": \"cron\", \"name\": \"manual\"}"));
+    let _ = std::fs::remove_dir_all(dir);
+}

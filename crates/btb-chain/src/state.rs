@@ -10,8 +10,9 @@
 //! | `0x21` contract | `21 C` | `(code, manifest, deployer, deploy_height)` |
 //! | `0x24` cron | `24 due:u64be C function` | `every_blocks`, `u64` LE |
 //! | `0x25` meta | `25 01` / `25 02` | config / head `(height, hash, timestamp)` |
+//! | `0x32` site file | `32 C path` | `SHA-256(content) \|\| content` (`site.rs`) |
 //!
-//! Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
+//! Payment channels add `0x30`/`0x31` (see `channel.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
 //! entries (accounts, contracts, the fee pools and the slash vault share them); storage
 //! deposits are its `0x09` entries; bonded stake is `0x26` and unbonding stake `0x27`.
 
@@ -346,7 +347,8 @@ pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
     Ok(sum_tag(kv, layout::TAG_BALANCE)?
         + sum_tag(kv, layout::TAG_DEPOSIT)?
         + sum_tag(kv, staking::TAG_STAKE)?
-        + sum_tag(kv, staking::TAG_UNBOND)?)
+        + sum_tag(kv, staking::TAG_UNBOND)?
+        + sum_tag(kv, crate::channel::TAG_LOCKED)?)
 }
 
 /// Register a manifest's indexes into `tables` for `contract`.

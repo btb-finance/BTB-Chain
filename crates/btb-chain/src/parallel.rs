@@ -510,6 +510,7 @@ fn run_workers<T: Send>(
 /// | `Deploy` | sender, the new contract address |
 /// | `Stake`, `Unstake`, `RegisterValidator` | sender |
 /// | `SubmitEvidence` | sender, the slash vault |
+/// | `Channel` | sender (settlements also pay the payee: always the sequential path) |
 /// | `Call` | sender, the contract (a contract may also move tokens to other accounts) |
 ///
 /// Transactions that share an account are joined (union-find). A component is *confined*

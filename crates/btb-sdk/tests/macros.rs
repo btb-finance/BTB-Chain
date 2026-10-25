@@ -68,7 +68,7 @@ pub fn add(a: u64, b: u64) -> u64 {
 #[btb::mutation]
 pub fn nothing() {}
 
-#[btb::cron(every = "1h")]
+#[btb::cron(every = "3600 blocks")]
 pub fn hourly() {}
 
 #[btb::action]
@@ -83,4 +83,10 @@ fn annotated_functions_stay_callable() {
     nothing();
     hourly();
     assert_eq!(fetch(String::new()), None);
+}
+
+#[test]
+fn cron_every_exports_a_schedule_marker() {
+    // The marker is a plain symbol `btb_every_<blocks>_<name>` that `btb deploy` reads.
+    let _: extern "C" fn() = btb_every_3600_hourly;
 }

@@ -45,6 +45,7 @@ BTB Chain is a decentralized cloud: core validators keep the chain in agreement,
 - Sync state from validators and attach Merkle proofs so answers can be verified.
 - Relay mutations to validators and earn a share of their gas.
 - Anyone can run one; BTB scales traffic by adding hosting nodes without slowing consensus.
+- Implemented as `crates/btb-host`: [HOSTING.md](HOSTING.md).
 
 ### Storage nodes and edge nodes
 

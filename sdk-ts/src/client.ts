@@ -1,4 +1,5 @@
 import { type Codec, decode, encode, fromHex, toHex } from "./codec.js";
+import type { ProofBundle } from "./proof.js";
 
 export class BtbError extends Error {
   constructor(
@@ -77,6 +78,52 @@ export class BtbClient {
   /** Run a mutation; resolves with its result once committed. */
   mutation<A extends unknown[], R>(name: string, argsType: Codec<A>, args: A, resultType: Codec<R>): Promise<R> {
     return this.call("mutation", name, argsType, args, resultType);
+  }
+
+  /**
+   * Run a query on a hosting node and get the result together with Merkle proofs of the storage
+   * keys it read (`?proof=1`). Check them with `verifyProof`. `incomplete` is true when the query
+   * also scanned key ranges, which a proof cannot cover (docs/HOSTING.md).
+   */
+  async queryWithProof<A extends unknown[], R>(
+    name: string,
+    argsType: Codec<A>,
+    args: A,
+    resultType: Codec<R>,
+  ): Promise<{ result: R; height: number; incomplete: boolean; proof: ProofBundle }> {
+    const base = this.target("query", name, encode(argsType, args));
+    const url = `${base}${base.includes("?") ? "&" : "?"}proof=1`;
+    let res: Response;
+    try {
+      res = await this.fetchFn(url, { method: "GET" });
+    } catch (e) {
+      throw new BtbError(`network error: ${(e as Error).message}`);
+    }
+    const text = await res.text();
+    if (!res.ok) throw new BtbError(errorMessage(text, res.status), res.status);
+    const j = JSON.parse(text) as { result: string; height: number; incomplete: boolean; proof: ProofBundle };
+    return { result: decode(resultType, fromHex(j.result)), height: j.height, incomplete: j.incomplete, proof: j.proof };
+  }
+
+  /**
+   * Fetch a proof bundle for storage keys of the contract this client points at (a hosting node
+   * URL ending in `/c/<contract>`). `height` picks the state version; by default the newest one
+   * whose next block is provably committed.
+   */
+  async proof(keys: Uint8Array[], height?: number): Promise<ProofBundle> {
+    const m = /^(.*)\/c\/([0-9a-fA-F]{64})$/.exec(this.url);
+    if (!m) throw new BtbError("proof() needs a hosting node url ending in /c/<contract>");
+    const q = new URLSearchParams({ key: keys.map(toHex).join(",") });
+    if (height !== undefined) q.set("height", String(height));
+    let res: Response;
+    try {
+      res = await this.fetchFn(`${m[1]}/proof/${m[2]}?${q}`, { method: "GET" });
+    } catch (e) {
+      throw new BtbError(`network error: ${(e as Error).message}`);
+    }
+    const text = await res.text();
+    if (!res.ok) throw new BtbError(errorMessage(text, res.status), res.status);
+    return JSON.parse(text) as ProofBundle;
   }
 
   /**

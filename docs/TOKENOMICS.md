@@ -32,6 +32,8 @@ Paying for each query with an on-chain transaction would require consensus and d
 
 The payer signs every voucher, so a host can never claim more than it actually served.
 
+**On-chain rules** (details in [CHAIN.md](CHAIN.md#payment-channels)). A channel is unidirectional, payer to one payee. A voucher carries the chain id, the channel id and the *cumulative* amount, signed by the payer, so the highest voucher replaces all lower ones and a voucher is useless on another chain or in another channel. The payee closes with its best voucher at any time and receives that amount; the rest of the deposit returns to the payer. If the payee goes silent, the payer can start a timeout close after the channel's expiry; the payee then has a challenge period to submit a higher voucher, which wins, and after it the recorded amount (zero if none) is paid and the remainder refunded. BTB locked in channels is part of the supply invariant; nothing is minted or burned. Off chain, `btb-voucher` (Rust) and `@btb/client` (TypeScript) create and verify vouchers and keep the running totals on both sides, refusing anything that does not strictly grow.
+
 **Who signs:** by default the app pays through a session key with a spending limit, so end users never see fees — like a normal website. Wallets can optionally pay directly with an auto-approve allowance.
 
 ## Pricing

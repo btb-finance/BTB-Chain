@@ -44,7 +44,7 @@ Same limits as the dev server: one contract, no auth, development only. Never ex
 There is no chain yet, so `deploy` builds and writes a **deploy bundle** to `target/btb/deploy/`:
 
 - `<name>.elf`, the contract;
-- `manifest.json`: `name`, `elf`, `size`, `code_hash` (SHA-256 of the ELF, lowercase hex), `hash_algorithm`, `entry_points` (`{kind, name}`) and `indexes`.
+- `manifest.json`: `name`, `elf`, `size`, `code_hash` (SHA-256 of the ELF, lowercase hex), `hash_algorithm`, `entry_points` (`{kind, name}`), `crons` (`{function, every_blocks}`, from `#[btb::cron(every = "N blocks")]`) and `indexes`.
 
 It then prints the hash and a note that deploying to a network arrives in Phase 4, when the same bundle becomes the deploy transaction payload.
 

@@ -90,6 +90,16 @@ impl RpcError {
 
 pub type RpcResult = Result<Value, RpcError>;
 
+/// Work for the driver thread that needs the chain state (see `Node::with_chain`). The state
+/// is passed as `&mut dyn Any` because `Input` is not generic over the store; the closure
+/// downcasts to the `ChainState<S>` it knows.
+pub type StateJob = Box<dyn FnOnce(&mut dyn std::any::Any) + Send>;
+
+/// Called on the driver thread after every executed block, with the chain state and the stored
+/// block (header, consensus block, receipts, state root). A hosting node refreshes its
+/// subscriptions and indexes here.
+pub type BlockHook = Box<dyn FnMut(&mut dyn std::any::Any, &StoredBlock) + Send>;
+
 pub enum Input {
     Net([u8; 32], Inbound),
     Rpc {
@@ -97,6 +107,8 @@ pub enum Input {
         params: Value,
         reply: tokio::sync::oneshot::Sender<RpcResult>,
     },
+    /// Run a closure on the driver thread against the chain state.
+    Job(StateJob),
     Shutdown,
 }
 
@@ -123,7 +135,7 @@ struct PendingEvidence {
 /// Ended consensus instances kept to help laggards finish their epoch.
 const KEEP_ENDED_EPOCHS: usize = 8;
 
-struct Driver<S: KvStore> {
+struct Driver<S: KvStore + 'static> {
     /// The running consensus instance of `epoch` (None if this node is not in the set).
     replica: Option<Replica>,
     epoch: u64,
@@ -172,6 +184,10 @@ struct Driver<S: KvStore> {
     last_commit_at: Option<Instant>,
     evidence: Vec<String>,
     fatal: Option<String>,
+    hook: Option<BlockHook>,
+    /// Stall time before asking for blocks, and the spacing of requests (`NodeParams::sync_poll_ms`).
+    sync_stall: Duration,
+    sync_gap: Duration,
 }
 
 fn now_ms() -> u64 {
@@ -181,15 +197,17 @@ fn now_ms() -> u64 {
 }
 
 /// Run the driver loop on the current thread until `Shutdown`. `ready` gets the startup result.
-pub fn run<S: KvStore>(
+pub fn run<S: KvStore + 'static>(
     params: NodeParams,
     state: ChainState<S>,
     rx: Receiver<Input>,
     net: NetHandle,
     ready: Sender<Result<(), String>>,
+    hook: Option<BlockHook>,
 ) {
     match Driver::new(&params, state, net) {
         Ok(mut d) => {
+            d.hook = hook;
             let _ = ready.send(Ok(()));
             d.main_loop(&rx);
         }
@@ -199,7 +217,7 @@ pub fn run<S: KvStore>(
     }
 }
 
-impl<S: KvStore> Driver<S> {
+impl<S: KvStore + 'static> Driver<S> {
     fn new(p: &NodeParams, state: ChainState<S>, net: NetHandle) -> Result<Self, String> {
         if state.config().chain_id != p.genesis.chain_id {
             return Err("chain state belongs to a different chain id than the genesis".into());
@@ -259,6 +277,11 @@ impl<S: KvStore> Driver<S> {
             last_commit_at: None,
             evidence: Vec::new(),
             fatal: None,
+            hook: None,
+            sync_stall: p.sync_poll_ms.map_or(SYNC_STALL, Duration::from_millis),
+            sync_gap: p
+                .sync_poll_ms
+                .map_or(SYNC_GAP, |m| Duration::from_millis(m).min(SYNC_GAP)),
         };
         d.begin_epoch(epoch)?;
         Ok(d)
@@ -477,6 +500,7 @@ impl<S: KvStore> Driver<S> {
                 let r = self.rpc(&method, &params, received);
                 let _ = reply.send(r);
             }
+            Input::Job(job) => job(&mut self.state),
             Input::Shutdown => {}
         }
     }
@@ -714,6 +738,9 @@ impl<S: KvStore> Driver<S> {
             consensus: block,
         };
         self.store.put(&stored)?;
+        if let Some(hook) = self.hook.as_mut() {
+            hook(&mut self.state, &stored);
+        }
         if is_epoch_end {
             // The epoch's last block is final only together with the blocks that certify it;
             // keep that proof so block sync can serve this epoch to laggards.
@@ -948,7 +975,7 @@ impl<S: KvStore> Driver<S> {
             return;
         }
         let since = self.last_commit_at.unwrap_or(self.started);
-        if since.elapsed() < SYNC_STALL {
+        if since.elapsed() < self.sync_stall {
             return;
         }
         let now = Instant::now();
@@ -962,7 +989,7 @@ impl<S: KvStore> Driver<S> {
         if self
             .sync
             .last_req
-            .is_some_and(|t| now.duration_since(t) < SYNC_GAP)
+            .is_some_and(|t| now.duration_since(t) < self.sync_gap)
         {
             return;
         }
@@ -1530,6 +1557,8 @@ impl<S: KvStore> Driver<S> {
                 "dropped_rate": self.net.stats.dropped_rate.load(std::sync::atomic::Ordering::Relaxed),
                 "dropped_banned": self.net.stats.dropped_banned.load(std::sync::atomic::Ordering::Relaxed),
                 "dropped_unknown_peer": self.net.stats.dropped_unknown_peer.load(std::sync::atomic::Ordering::Relaxed),
+                "followers": self.net.stats.followers.load(std::sync::atomic::Ordering::Relaxed),
+                "dropped_follower": self.net.stats.dropped_follower.load(std::sync::atomic::Ordering::Relaxed),
             },
         }))
     }

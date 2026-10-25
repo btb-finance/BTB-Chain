@@ -7,6 +7,11 @@
 //! * **Messages.** Each message is one request on a fresh QUIC stream, acknowledged with one
 //!   byte. Broadcast is a send to every connected validator (the validator count is small;
 //!   consensus vote broadcast is already all-to-all).
+//! * **Followers.** A node that is not a validator (a hosting node) may ask for block sync, and
+//!   only that, when the operator opted in (`FollowerPolicy`): up to `max_peers` such peers stay
+//!   connected, each with its own, stricter rate limit, and any frame other than a sync request
+//!   is dropped and counts as a strike. They are never sent consensus traffic. The answers they
+//!   get are proofs they check themselves (`sync::verify`), so serving them needs no trust.
 //! * **Bounds.** Frames are capped at `MAX_FRAME` (checked before allocation), each peer has a
 //!   token bucket, outbound requests in flight per peer are capped, and a peer that keeps
 //!   sending malformed frames is banned for a while.
@@ -28,6 +33,32 @@ use tokio::sync::mpsc;
 
 /// Where parsed inbound frames go: `(validator key of the authenticated sender, frame)`.
 pub type Sink = Arc<dyn Fn([u8; 32], Inbound) + Send + Sync>;
+
+/// Opt-in service for non-validator nodes that follow the chain by block sync.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FollowerPolicy {
+    /// Most follower peers connected at once; further ones are disconnected.
+    pub max_peers: usize,
+    /// Per follower: sustained cost per second and burst (a sync request costs 1).
+    pub rate_per_sec: f64,
+    pub rate_burst: f64,
+}
+
+impl Default for FollowerPolicy {
+    fn default() -> Self {
+        FollowerPolicy {
+            max_peers: 32,
+            rate_per_sec: 10.0,
+            rate_burst: 20.0,
+        }
+    }
+}
+
+/// The Ed25519 key inside an ed25519 peer id.
+pub fn key_of_peer(id: &PeerId) -> Option<[u8; 32]> {
+    let pk = libp2p::identity::PublicKey::try_decode_protobuf(id.as_ref().digest()).ok()?;
+    pk.try_into_ed25519().ok().map(|k| k.to_bytes())
+}
 
 const PROTOCOL: &str = "/btb/msg/1";
 const MAX_INFLIGHT_PER_PEER: usize = 512;
@@ -132,6 +163,10 @@ pub struct NetStats {
     pub dropped_malformed: AtomicU64,
     pub dropped_banned: AtomicU64,
     pub dropped_backpressure: AtomicU64,
+    /// Connected follower (non-validator) peers.
+    pub followers: AtomicUsize,
+    /// Frames from followers that were not sync requests, plus followers refused for lack of room.
+    pub dropped_follower: AtomicU64,
 }
 
 /// Cheap handle to a running network task.
@@ -177,6 +212,8 @@ pub struct NetParams {
     pub rate_burst: f64,
     /// Testing only: inbound messages are delivered this long after arrival.
     pub delay: Duration,
+    /// Serve block sync to non-validator peers (`None`: only validators are talked to).
+    pub followers: Option<FollowerPolicy>,
 }
 
 struct Bucket {
@@ -258,6 +295,8 @@ pub fn start(
         req_peer: HashMap::new(),
         conns: HashMap::new(),
         rate: (p.rate_per_sec, p.rate_burst),
+        policy: p.followers,
+        follower_keys: HashMap::new(),
         delay: p.delay,
         delayed: VecDeque::new(),
     };
@@ -298,6 +337,9 @@ struct NetTask {
     req_peer: HashMap<OutboundRequestId, PeerId>,
     conns: HashMap<PeerId, usize>,
     rate: (f64, f64),
+    policy: Option<FollowerPolicy>,
+    /// Connected follower peers and their keys (only filled when `policy` is set).
+    follower_keys: HashMap<PeerId, [u8; 32]>,
     delay: Duration,
     delayed: VecDeque<(Instant, [u8; 32], Inbound)>,
 }
@@ -425,8 +467,10 @@ impl NetTask {
                     if *n == 1 {
                         self.handle.stats.connected.fetch_add(1, Ordering::Relaxed);
                     }
+                } else if self.admit_follower(peer_id) {
+                    *self.conns.entry(peer_id).or_default() += 1;
                 } else {
-                    // Not a validator: nothing to talk about.
+                    // Not a validator and not a welcome follower: nothing to talk about.
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
             }
@@ -435,7 +479,16 @@ impl NetTask {
                     *n = n.saturating_sub(1);
                     if *n == 0 {
                         self.conns.remove(&peer_id);
-                        self.handle.stats.connected.fetch_sub(1, Ordering::Relaxed);
+                        if let Some(key) = self.follower_keys.remove(&peer_id) {
+                            self.handle.stats.followers.fetch_sub(1, Ordering::Relaxed);
+                            self.buckets.remove(&peer_id);
+                            self.strikes.remove(&peer_id);
+                            if !self.ids.contains_key(&peer_id) {
+                                self.peer_of.remove(&key);
+                            }
+                        } else {
+                            self.handle.stats.connected.fetch_sub(1, Ordering::Relaxed);
+                        }
                         self.inflight.remove(&peer_id);
                         self.req_peer.retain(|_, p| *p != peer_id);
                     }
@@ -457,6 +510,32 @@ impl NetTask {
         }
     }
 
+    /// Whether `peer` (not a validator) may stay connected as a follower; registers it if so.
+    fn admit_follower(&mut self, peer: PeerId) -> bool {
+        if self.policy.is_none() {
+            return false;
+        }
+        if self.follower_keys.contains_key(&peer) {
+            return true; // a second connection of an admitted follower
+        }
+        let now = Instant::now();
+        let full = self.follower_keys.len() >= self.policy.map_or(0, |p| p.max_peers);
+        let Some(key) = key_of_peer(&peer) else {
+            return false;
+        };
+        if full || self.banned.get(&peer).is_some_and(|u| *u > now) {
+            self.handle
+                .stats
+                .dropped_follower
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.follower_keys.insert(peer, key);
+        self.peer_of.insert(key, peer);
+        self.handle.stats.followers.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     fn strike(&mut self, peer: PeerId) {
         let now = Instant::now();
         let s = self.strikes.entry(peer).or_insert(Strikes {
@@ -473,11 +552,21 @@ impl NetTask {
         if s.count >= STRIKE_LIMIT {
             self.strikes.remove(&peer);
             self.banned.insert(peer, now + BAN);
+            if self.follower_keys.contains_key(&peer) {
+                // A banned follower is also cut off, not just ignored.
+                let _ = self.swarm.disconnect_peer_id(peer);
+            }
         }
     }
 
     fn on_request(&mut self, peer: PeerId, data: Vec<u8>) {
-        let Some(&idx) = self.ids.get(&peer) else {
+        let is_validator = self.ids.contains_key(&peer);
+        let Some(idx) = self
+            .ids
+            .get(&peer)
+            .or_else(|| self.follower_keys.get(&peer))
+            .copied()
+        else {
             self.handle
                 .stats
                 .dropped_unknown_peer
@@ -492,7 +581,10 @@ impl NetTask {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let (rate, burst) = self.rate;
+        let (rate, burst) = match (is_validator, self.policy) {
+            (false, Some(p)) => (p.rate_per_sec, p.rate_burst),
+            _ => self.rate,
+        };
         let b = self.buckets.entry(peer).or_insert(Bucket {
             tokens: burst,
             last: now,
@@ -517,6 +609,15 @@ impl NetTask {
             self.strike(peer);
             return;
         };
+        if !is_validator && !matches!(msg, Inbound::SyncReq(_)) {
+            // Followers get block sync and nothing else.
+            self.handle
+                .stats
+                .dropped_follower
+                .fetch_add(1, Ordering::Relaxed);
+            self.strike(peer);
+            return;
+        }
         if self.delay.is_zero() {
             (self.inbound)(idx, msg);
         } else {

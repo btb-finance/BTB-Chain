@@ -25,8 +25,10 @@ pub fn mutation(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry("mutation", attr, item)
 }
 
-/// A mutation run on a schedule. Accepts an optional `every = "1h"`, which is validated as a
-/// string but not yet used (the scheduler comes in Phase 2).
+/// A mutation run on a schedule. Accepts an optional `every = "N blocks"` (1 to 2^32), which
+/// also exports a marker symbol `btb_every_<N>_<name>` that `btb deploy` reads into the
+/// manifest's `crons`. Without `every` the cron has no schedule and never runs.
+/// Wall-clock units are rejected: the chain schedules by block height only.
 #[proc_macro_attribute]
 pub fn cron(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry("cron", attr, item)
@@ -50,6 +52,7 @@ fn entry(kind: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
+    let mut every_blocks = None;
     if !attr.is_empty() {
         if kind != "cron" {
             return Err(syn::Error::new(
@@ -57,7 +60,8 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
                 "this attribute takes no arguments",
             ));
         }
-        let _: syn::Ident = syn::parse2::<CronArgs>(attr)?.every;
+        let lit = syn::parse2::<CronArgs>(attr)?.every;
+        every_blocks = Some(parse_every(&lit)?);
     }
     let sig = &func.sig;
     if sig.asyncness.is_some() || !sig.generics.params.is_empty() || sig.variadic.is_some() {
@@ -121,6 +125,14 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
             ::btb_sdk::__private::return_value(&__result);
         },
     };
+    let marker = every_blocks.map(|n| {
+        let sym = format_ident!("btb_every_{}_{}", n, name);
+        quote! {
+            #[doc(hidden)]
+            #[no_mangle]
+            pub extern "C" fn #sym() {}
+        }
+    });
     Ok(quote! {
         #func
 
@@ -131,21 +143,44 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
             #decode
             #body
         }
+
+        #marker
     })
 }
 
+/// Largest schedule the chain accepts (`MAX_CRON_EVERY` in `btb-chain`).
+const MAX_EVERY: u64 = 1 << 32;
+
+/// `"N blocks"` (or `"1 block"`) to a block count in `1..=2^32`.
+fn parse_every(lit: &LitStr) -> syn::Result<u64> {
+    let v = lit.value();
+    let err = |m: &str| syn::Error::new(lit.span(), m.to_string());
+    let (num, unit) = v.trim().split_once(' ').ok_or_else(|| {
+        err("expected `every = \"N blocks\"` (the chain schedules by block height)")
+    })?;
+    if unit.trim() != "blocks" && unit.trim() != "block" {
+        return Err(err(
+            "only block counts are supported: `every = \"N blocks\"`; time units need a block time",
+        ));
+    }
+    match num.parse::<u64>() {
+        Ok(n) if (1..=MAX_EVERY).contains(&n) => Ok(n),
+        _ => Err(err("every must be 1 to 4294967296 blocks")),
+    }
+}
+
 struct CronArgs {
-    every: syn::Ident,
+    every: LitStr,
 }
 
 impl syn::parse::Parse for CronArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let every: syn::Ident = input.parse()?;
-        if every != "every" {
-            return Err(syn::Error::new(every.span(), "expected `every = \"...\"`"));
+        let key: syn::Ident = input.parse()?;
+        if key != "every" {
+            return Err(syn::Error::new(key.span(), "expected `every = \"...\"`"));
         }
         input.parse::<syn::Token![=]>()?;
-        let _: LitStr = input.parse()?;
+        let every: LitStr = input.parse()?;
         Ok(CronArgs { every })
     }
 }

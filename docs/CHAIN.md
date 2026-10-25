@@ -31,6 +31,8 @@ Stake    (3): validator_key[32] || amount:u64
 Unstake  (4): amount:u64
 RegisterValidator (5): consensus_key[32] || network_addr:bytes
 SubmitEvidence    (6): epoch:u64 || evidence
+Channel  (8): op:u8 || fields   (0 Open: payee[32] || deposit:u64 || expiry_blocks:u64 | 1 TopUp: channel[32] || amount:u64 | 2 Close: voucher[120] | 3 StartClose: channel[32] || has_voucher:u8 [|| voucher[120]] | 4 Finalize: channel[32])
+Site     (9): op:u8 || fields   (0 Publish: contract[32] || path:string || content:bytes | 1 Remove: contract[32] || path:string)
 evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2        (DoubleVote)
          | 1 || proposer:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleProposal)
 manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes:[string]
@@ -39,7 +41,7 @@ manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes
 - **Call kinds.** `kind` is 0 query, 1 mutation, 2 cron, 3 action. All four decode, but only **mutation** is valid in a transaction; query, cron and action are rejected as `Invalid::KindNotAllowed`. Queries never go through consensus (run them with `Executor::query` against the head state), actions are not transactions, and crons are scheduled-only: users cannot invoke them by hand, so a cron (for example a payout) runs only on its schedule, with `caller() == contract_address()`.
 - **Signature.** Ed25519 (`ed25519-dalek`, strict verification) over `SHA256("btb.tx.sig.v1" || body)`. The body contains the chain id and nonce, so a signature is valid for one chain and one nonce only.
 - **Transaction id.** `SHA256("btb.tx.id.v1" || wire bytes)`.
-- **Manifest.** `crons` lists `(function, every_blocks)`: the `cron` entry point `function` runs every `every_blocks` blocks, `every = "N blocks"` (1 to 2^32; at most 16). `indexes` are table index declarations in the same temporary form as `btb dev --index` (`Table:index:addr@offset` or `Table:index:u64@offset`, see [DEV_SERVER.md](DEV_SERVER.md)); the chain registers them from state, so a restarted node rebuilds them. This is a binary struct, not the CLI's `manifest.json`; converting a deploy bundle to a `Deploy` transaction (and adding cron schedules to the bundle) is for the CLI to do when `btb deploy` targets a chain.
+- **Manifest.** `crons` lists `(function, every_blocks)`: the `cron` entry point `function` runs every `every_blocks` blocks, `every = "N blocks"` (1 to 2^32; at most 16). `indexes` are table index declarations in the same temporary form as `btb dev --index` (`Table:index:addr@offset` or `Table:index:u64@offset`, see [DEV_SERVER.md](DEV_SERVER.md)); the chain registers them from state, so a restarted node rebuilds them. This is a binary struct, not the CLI's `manifest.json`; the CLI bundle's `manifest.json` already carries `crons` (`{function, every_blocks}`), taken from `#[btb::cron(every = "N blocks")]` ([LANGUAGE.md](LANGUAGE.md)); converting a bundle to a `Deploy` transaction is for the CLI to do when `btb deploy` targets a chain.
 - **Limits.** Code up to 1 MiB, arguments up to 1 MiB, function names up to 64 bytes.
 
 ## Validity, nonces and failure
@@ -66,6 +68,8 @@ Gas is the VM's gas plus an intrinsic part charged before the VM runs:
 | Deploy | `DEPLOY_BASE_GAS` 50,000 + `DEPLOY_BYTE_GAS` 100 per byte of code (always charged in full, also if the deploy reverts) |
 | Stake / Unstake | `STAKE_GAS` / `UNSTAKE_GAS` 10,000 |
 | RegisterValidator | `REGISTER_VALIDATOR_GAS` 20,000 |
+| Channel (open, top-up, finalize) / (close, start-close) | `CHANNEL_GAS` 10,000 / `CHANNEL_VOUCHER_GAS` 30,000 (one signature check) |
+| Site (publish / remove) | `SITE_GAS` 20,000 + `SITE_BYTE_GAS` 100 per content byte (publish) / `SITE_GAS` (remove); charged in full also when refused |
 | SubmitEvidence | `EVIDENCE_GAS` 100,000 (two signature checks; charged also when the evidence is refused) |
 | Call | `CALL_BASE_GAS` 2,000 + `CALL_BYTE_GAS` 2 per byte of function name and arguments, plus the VM gas of the call, up to `gas_limit` |
 
@@ -78,7 +82,9 @@ Stored contract code is paid for by deploy gas, not by a storage deposit (a depo
 | User transaction (deploy, call, transfer) | 80% (the rounding remainder) | 20% (`RELAY_SHARE_BPS` = 2,000) |
 | Cron run | 100% | none |
 
-This implements the "80/20 proposed" mutation split of [TOKENOMICS.md](TOKENOMICS.md) as accounting only. The **validator pool is paid out at every epoch end** to the epoch's validators, pro rata by stake (see [Staking, epochs and slashing](#staking-epochs-and-slashing)). The relay pool still just accumulates: who the relay hosts are belongs to Phase 5.
+This implements the "80/20 proposed" mutation split of [TOKENOMICS.md](TOKENOMICS.md) as accounting only. The **validator pool is paid out at every epoch end** to the epoch's validators, pro rata by stake (see [Staking, epochs and slashing](#staking-epochs-and-slashing)). The relay pool still just accumulates (see the design note below).
+
+**Design note: paying the relay pool (not implemented).** Nothing in a transaction says which hosting node relayed it, so the 20% cannot be attributed. Paying it needs (1) an optional `relayer: Address` field in the signed transaction body (the relay host that accepted it from the user and put it in the mempool; the sender signs it, so a proposer cannot steal the attribution), (2) at execution, crediting `fee * RELAY_SHARE_BPS / 10000` to that address instead of `relay_pool()` (falling back to the validator pool when absent or when the relayer is not a registered hosting node, so the fee is never burned), and (3) a hosting-node registry to check against, which belongs to the Phase 5 hosting-node item. Parallel mode stays valid only if relayer credits are applied after the block like the pool credits (they commute). This changes the transaction encoding and so needs a Design Proposal; until then `relay_pool()` is accounting only.
 
 ## Staking, epochs and slashing
 
@@ -115,11 +121,28 @@ Then, in one step: `slash_bps` of the offender's bonded stake and of **each unbo
 
 **Rewards.** At the epoch end the whole validator pool balance is distributed to the epoch's seats that are not jailed, pro rata by their stake in the set (`pool * stake / total`, floor). The rounding remainder is less than one unit per validator; it is given one unit each to the first validators in set order, so the payouts sum to **exactly** the pool. Payouts are credited to the operators' balances; nothing is minted. If every seat is jailed the pool carries over.
 
+## Payment channels
+
+Unidirectional channels for per-request fees ([TOKENOMICS.md](TOKENOMICS.md#payment-channels-for-per-request-fees)). Code: `crates/btb-chain/src/channel.rs`; vouchers: `crates/btb-voucher` (Rust) and `sdk-ts/src/voucher.ts`. All five operations are one transaction kind, `TxKind::Channel(ChannelOp)` (wire tag 8, sub-tag as in the table above).
+
+- **Open { payee, deposit, expiry_blocks }.** Moves `deposit` from the sender (the *payer*) into the channel. The channel id is `SHA256("btb.channel.v1" || payer || tx_nonce:u64le)` (the receipt output). The payer may time out from height `open_height + expiry_blocks`. Refused: zero deposit, payer = payee, `expiry_blocks` outside `1..=2^32`.
+- **TopUp { channel, amount }.** Payer only; adds to the deposit; not while a timeout close is running.
+- **Close { voucher }.** Payee only, at any time (also after expiry, and during a challenge period). Pays the voucher's cumulative `amount` to the payee and the rest of the deposit to the payer, then deletes the channel. `amount` above the deposit is refused (`ExceedsDeposit`). A second close finds no channel (`NoSuchChannel`), so a lower voucher replayed after a higher one pays nothing. If a timeout close recorded an amount, the payee gets the larger of the two.
+- **StartClose { channel, voucher? }.** Payer only, from the expiry height on. Starts a challenge period of `CHANNEL_CHALLENGE_BLOCKS` (600) blocks. The payer may record a voucher it knows of (checked like a `Close`); without one the recorded amount is 0.
+- **Finalize { channel }.** Payer or payee, once the challenge period is over: pays the recorded amount to the payee and the rest to the payer. During the period the payee can `Close` with a higher voucher, which wins; from the deadline on only `Finalize` is accepted (`ChallengeOver`), so the payee must claim in time.
+- **Voucher.** `(chain_id, channel_id, amount, nonce)` signed Ed25519 (strict) by the payer's account key over `SHA256("btb.voucher.v1" || chain_id:u64le || channel_id || amount:u64le || nonce:u64le)`. The chain checks the chain id (`WrongChain`), the channel id (`WrongChannel`), the signature against the key in the opening transaction (`BadSignature`) and the amount against the deposit. The on-chain rule is "highest amount wins"; `nonce` is the off-chain counter used by `Spender`/`Ledger` (and `VoucherSpender`/`VoucherLedger` in TypeScript) to reject replayed or reordered vouchers.
+- **State.** `0x30` channel record `(payer, payer_key, payee, expiry_height, closing)`, `0x31` locked deposit (`u64` LE). `0x31` is summed into the supply invariant; every refusal is a revert (`Revert::Channel(ChannelError)`: nonce used, fee charged, nothing else changes). Node API: `ChainState::channel(id)`, `channels_locked()`.
+- **Not done.** Channels are not yet shared with hosting nodes through a registry, a payee cannot batch several channels in one transaction, and the challenge length is a constant rather than a genesis parameter.
+
+## Site files
+
+`TxKind::Site(SiteOp)` (wire tag 9, `crates/btb-chain/src/site.rs`) lets a contract's **deployer** publish static website files that hosting nodes serve ([HOSTING.md](HOSTING.md#websites)). `Publish { contract, path, content }` creates or replaces `0x32 | contract | path -> SHA-256(content) || content`; `Remove { contract, path }` deletes it. Paths are 1 to 128 bytes of `[A-Za-z0-9._~-]` segments separated by single `/`; files are at most 96 KiB and a contract has at most 256 (large files belong on storage nodes, which do not exist yet). A sender that is not the deployer, an unknown contract, a full contract or a missing file to remove is refused with `Revert::Site(..)` after the fee is charged; nothing changes. Malformed paths and oversize files are `Invalid::TooLarge` and never enter a block. The transaction touches no balance but the sender's fee, so in parallel mode it takes the generic (multi-version) path like every non-transfer. No BTB moves, so the supply invariant is unaffected.
+
 ## Genesis and the supply invariant
 
 `GenesisConfig { config, timestamp, allocations }` lists every balance. The allocations must sum to **exactly** `TOTAL_SUPPLY` with no address twice, or `from_genesis` fails. This is the only place BTB is created. The final allocation (reserve pool, grants, vesting) is still open in TOKENOMICS.md; the config just takes whatever list is decided.
 
-After every block the executor sums all balances (accounts, contracts, the fee pools and the slash vault), all storage deposits, all bonded stake and all unbonding stake, and requires the sum to equal `TOTAL_SUPPLY`. If not, `execute_block` returns `BlockError::SupplyInvariant` and writes nothing. Nothing in the crate mints: transfers, fees, deposits, staking, rewards and slashing only move existing units. User tokens (`Token.create`, host calls 16 to 23) are separate and are not part of this sum. The check scans all balances, O(accounts) per block; `Executor::check_supply` can switch it off for benchmarks.
+After every block the executor sums all balances (accounts, contracts, the fee pools and the slash vault), all storage deposits, all bonded stake, all unbonding stake and all BTB locked in payment channels, and requires the sum to equal `TOTAL_SUPPLY`. If not, `execute_block` returns `BlockError::SupplyInvariant` and writes nothing. Nothing in the crate mints: transfers, fees, deposits, staking, channels, rewards and slashing only move existing units. User tokens (`Token.create`, host calls 16 to 23) are separate and are not part of this sum. The check scans all balances, O(accounts) per block; `Executor::check_supply` can switch it off for benchmarks.
 
 ## Blocks
 
@@ -165,7 +188,7 @@ Contract code runs in `btb-vm` with the call's gas limit. A reverted call's writ
 
 ### Owner-only fast path (execution level)
 
-A transaction's *account footprint* is known from the transaction alone: `Transfer` touches the sender and the recipient, `Deploy` the sender and the new contract address, `Stake`/`Unstake`/`RegisterValidator` the sender, `SubmitEvidence` the sender and the slash vault, `Call` the sender and the contract. Transactions that share an account are joined into components. A component is **confined** (owner-only) when it contains only `Transfer`s and none of its accounts is a fee pool or the slash vault: everything it reads or writes is the nonce and balance of its own accounts. Confined components are independent of each other and of every other transaction, so each runs on one worker in block order, directly on the committed state, with no multi-version memory, no read tracking for scheduling and no validation. (Plain `Transfer` touches two accounts, so "owner-only" here means "closed over a known set of accounts", not "one account".)
+A transaction's *account footprint* is known from the transaction alone: `Transfer` touches the sender and the recipient, `Deploy` the sender and the new contract address, `Stake`/`Unstake`/`RegisterValidator` the sender, `SubmitEvidence` the sender and the slash vault, `Channel` the sender (settlements also pay the payee and the payer, which is why channel transactions are never on the fast path), `Call` the sender and the contract. Transactions that share an account are joined into components. A component is **confined** (owner-only) when it contains only `Transfer`s and none of its accounts is a fee pool or the slash vault: everything it reads or writes is the nonce and balance of its own accounts. Confined components are independent of each other and of every other transaction, so each runs on one worker in block order, directly on the committed state, with no multi-version memory, no read tracking for scheduling and no validation. (Plain `Transfer` touches two accounts, so "owner-only" here means "closed over a known set of accounts", not "one account".)
 
 Because a contract call can move tokens to or read the balance of any account, the footprint of a `Call` is only a lower bound. The fast path therefore checks itself after the run: each confined transaction must have read and written only its footprint keys, and no dynamic transaction may have read or written (or scanned over) a confined account. If either fails, or a pool is touched, the block runs sequentially. Fallback depends only on the block and the state, so every node takes the same path and the result is the same anyway.
 
@@ -194,7 +217,7 @@ A deploy schedules each manifest cron for height `deploy_height + every`. At eac
 - The cron runs with `caller() == contract_address()`, `cron_gas_limit` gas and the contract's balance as its payer. The fee goes 100% to the validator pool.
 - The next run is scheduled for `current_height + every` (a late cron does not catch up in a burst).
 - **Paused.** If the contract's balance is below `cron_gas_limit * gas_price` nothing runs and the receipt is `Status::Paused`; the schedule continues, so funding the contract resumes it.
-- **Per-block cap.** A cron starts only if the cron gas already used in the block plus `cron_gas_limit` fits `cron_gas_block_cap`, and at most `max_crons_per_block` are considered. The rest stay due and run first in the next block.
+- **Per-block cap.** A cron starts only if the cron gas already used in the block plus `cron_gas_limit` fits `cron_gas_block_cap`, and at most `max_crons_per_block` are considered. The rest stay due and run first in the next block. This is fair: the order is by due height first, a run reschedules to `height + every` (behind everything already waiting), and a paused cron also moves back, so with more due crons than the cap allows every one runs in turn (tested with three `every = 1` crons and room for one per block) and no cron can be starved by a busier contract.
 - A failing cron reverts its changes and still pays for the gas it used.
 
 Cron receipts follow the transaction receipts; their id is `SHA256("btb.cron.v1" || height || contract || function)`.
@@ -215,6 +238,7 @@ No floats, clocks, thread timing or hash-map iteration order reach state (parall
 
 - A consensus-level fast path (ordering-free confirmation of owner-only transactions), and parallel crons / end-of-block logic.
 - A fee market (a per-gas bid) and payout of the relay pool.
+- Channel parameters (challenge length) in the genesis config, and batched settlement of many channels.
 - Delegation (stake behind someone else's validator), un-jailing, reward weighting by proposals and uptime, and slashing for downtime.
 - A storage deposit for contract code and for user-token records.
 - Randomness beacon, price feeds and other oracle inputs to execution.

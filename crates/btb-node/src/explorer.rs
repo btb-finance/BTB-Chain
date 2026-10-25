@@ -22,6 +22,8 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Unstake { .. } => "unstake",
         TxKind::RegisterValidator { .. } => "register_validator",
         TxKind::SubmitEvidence { .. } => "submit_evidence",
+        TxKind::Channel(_) => "channel",
+        TxKind::Site(_) => "site",
     }
 }
 
@@ -71,6 +73,23 @@ pub fn tx_json(tx: &Transaction) -> Value {
         TxKind::SubmitEvidence { epoch, .. } => {
             o.insert("epoch".into(), json!(epoch));
         }
+        TxKind::Channel(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
+        TxKind::Site(op) => {
+            let (what, contract, path) = match op {
+                btb_chain::site::SiteOp::Publish { contract, path, .. } => {
+                    ("publish", contract, path)
+                }
+                btb_chain::site::SiteOp::Remove { contract, path } => ("remove", contract, path),
+            };
+            o.insert("op".into(), json!(what));
+            o.insert("contract".into(), json!(hex::encode(contract)));
+            o.insert("path".into(), json!(path));
+        }
     }
     v
 }
@@ -80,6 +99,8 @@ pub fn counterparty(tx: &Transaction) -> Option<[u8; 32]> {
     match &tx.body.kind {
         TxKind::Transfer { to, .. } => Some(*to),
         TxKind::Call { contract, .. } => Some(*contract),
+        TxKind::Site(btb_chain::site::SiteOp::Publish { contract, .. })
+        | TxKind::Site(btb_chain::site::SiteOp::Remove { contract, .. }) => Some(*contract),
         _ => None,
     }
 }
