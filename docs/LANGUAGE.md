@@ -54,7 +54,7 @@ Running `btb dev` compiles the `btb/` folder, starts a local chain, hot-reloads 
 
 ## What works today (Phase 1)
 
-The SDK is the `btb-sdk` crate (`no_std`, plus `alloc`). The working examples are `examples/counter`, `examples/token` (fungible token in contract storage) and `examples/dex` (constant-product AMM, 0.3% fee) and `examples/todo` (a per-user list read through an index, the Phase 2 demo), built for `riscv64imac-unknown-none-elf` and run in `btb-vm` by `crates/btb-tests`.
+The SDK is the `btb-sdk` crate (`no_std`, plus `alloc`). The working examples are `examples/counter`, `examples/token` (fungible token in contract storage) and `examples/dex` (constant-product AMM, 0.3% fee) `examples/todo` (a per-user list read through an index, the Phase 2 demo), `examples/launcher` (user tokens and a faucet) and `examples/nft` (NFTs and an escrow-based market), built for `riscv64imac-unknown-none-elf` and run in `btb-vm` by `crates/btb-tests`.
 
 ```rust
 use btb_sdk::btb;

@@ -1,0 +1,26 @@
+{
+  "name": "btb-vscode",
+  "displayName": "BTB Chain",
+  "description": "BTB-specific diagnostics, hover and completion for contract sources (runs btb-lsp next to rust-analyzer)",
+  "version": "0.1.0",
+  "publisher": "btb-chain",
+  "license": "MIT",
+  "private": true,
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./extension.js",
+  "activationEvents": ["workspaceContains:**/.cargo/config.toml", "onLanguage:rust"],
+  "extensionDependencies": ["rust-lang.rust-analyzer"],
+  "contributes": {
+    "configuration": {
+      "title": "BTB Chain",
+      "properties": {
+        "btb.lsp.path": {
+          "type": "string",
+          "default": "btb-lsp",
+          "description": "Path to the btb-lsp binary (build with `cargo build -p btb-lsp`)."
+        },
+        "btb.lsp.enable": { "type": "boolean", "default": true }
+      }
+    }
+  }
+}

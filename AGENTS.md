@@ -19,6 +19,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `docs/DEV_SERVER.md` | `btb-dev`: single-node dev server (HTTP, live queries over SSE), the Phase 2 gate demo |
 | `docs/CLI.md` | The `btb` command: `init`, `build`, `dev` (hot reload), `deploy` |
 | `docs/STATE.md` | Key layout, index encodings, table writes and queries in `btb-runtime` |
+| `docs/LSP.md` | rust-analyzer setup and `btb-lsp` (BTB-specific diagnostics, hover, completion) |
 | `docs/LANGUAGE.md` | Contract languages, Rust SDK, project layout |
 | `docs/ENCODING.md` | Canonical binary encoding of arguments and results (all languages) |
 | `docs/TS_SDK.md` | TypeScript client (`sdk-ts/`, `@btb/client`): codec, client, React hooks |
@@ -41,7 +42,8 @@ crates/
 ├── btb-runtime/   # kv store, tables, indexes, queries, subscriptions, scheduler
 ├── btb-dev/       # single-node dev server (HTTP + SSE), Phase 2 demo
 ├── btb-node/      # consensus, networking, hosting gateway
-└── btb-cli/       # `btb init`, `btb dev`, `btb deploy`
+├── btb-cli/       # `btb init`, `btb dev`, `btb deploy`
+└── btb-lsp/       # language server: BTB diagnostics, hover, completion
 ```
 
 ## Core concepts to keep consistent

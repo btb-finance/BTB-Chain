@@ -8,6 +8,7 @@
 //! - `GET /subscribe/<name>`: Server-Sent Events; one event with the current result, then one
 //!   more whenever a commit changes the result (`SubscriptionManager`).
 //! - `GET /`: the todo demo page.
+//! - `GET /dashboard` and `GET /admin/...`: read-only table browser (see `admin`).
 //!
 //! Arguments: `?args=<hex of btb-codec bytes>`, or a POST body that is either that hex or (with
 //! `Content-Type: application/json`) a flat JSON array, see `demo`. Results are hex, or JSON with
@@ -15,7 +16,10 @@
 //! headers): 64 hex characters are the address, any other text is hashed with SHA-256. There is
 //! no authentication; never expose this server.
 
+mod admin;
 mod demo;
+
+pub use admin::parse_fields;
 
 use btb_runtime::{
     layout, IndexDef, IndexValue, KvStore, Occ, OccError, ReadSet, RuntimeHost, SubId,
@@ -102,6 +106,8 @@ struct State<S: KvStore> {
     subs: SubscriptionManager,
     clients: BTreeMap<SubId, Client>,
     height: u64,
+    /// Dashboard event streams (`/admin/events`).
+    admin: Vec<Sender<String>>,
 }
 
 struct Shared<S: KvStore> {
@@ -110,9 +116,16 @@ struct Shared<S: KvStore> {
     /// Page served at `/`; `None` serves the built-in todo demo.
     page: RwLock<Option<String>>,
     tables: Tables,
+    /// Index declarations (the dashboard needs their value kinds).
+    indexes: Vec<IndexSpec>,
+    /// Field-type hints per table for the dashboard (`Table` -> `["addr", "bool", ...]`).
+    fields: RwLock<BTreeMap<String, Vec<String>>>,
     state: Mutex<State<S>>,
     stop: AtomicBool,
 }
+
+/// Dashboard field hints: `(table, field types)`.
+pub type FieldHints = Vec<(String, Vec<String>)>;
 
 type ReloadFn = Arc<dyn Fn(&[u8]) -> Result<Vec<btb_vm::EntryPoint>, String> + Send + Sync>;
 
@@ -121,6 +134,7 @@ pub struct Server {
     stop: Arc<dyn Fn() + Send + Sync>,
     reload: ReloadFn,
     page: Arc<dyn Fn(Option<String>) + Send + Sync>,
+    fields: Arc<dyn Fn(FieldHints) + Send + Sync>,
     thread: JoinHandle<()>,
 }
 
@@ -155,11 +169,14 @@ impl Server {
             contract: RwLock::new(Arc::new(contract)),
             page: RwLock::new(None),
             tables,
+            indexes,
+            fields: RwLock::new(BTreeMap::new()),
             state: Mutex::new(State {
                 occ: Occ::new(store),
                 subs: SubscriptionManager::new(),
                 clients: BTreeMap::new(),
                 height: 1,
+                admin: Vec::new(),
             }),
             stop: AtomicBool::new(false),
         });
@@ -177,7 +194,7 @@ impl Server {
                 }
             }
         });
-        let (sh_reload, sh_page) = (shared.clone(), shared.clone());
+        let (sh_reload, sh_page, sh_fields) = (shared.clone(), shared.clone(), shared.clone());
         let stop = Arc::new(move || {
             shared.stop.store(true, Ordering::SeqCst);
             // Wake the blocked accept.
@@ -185,11 +202,15 @@ impl Server {
         });
         let reload = Arc::new(move |elf: &[u8]| reload_contract(&sh_reload, elf));
         let page = Arc::new(move |p| *sh_page.page.write().unwrap() = p);
+        let fields = Arc::new(move |f: FieldHints| {
+            *sh_fields.fields.write().unwrap() = f.into_iter().collect();
+        });
         Ok(Server {
             addr,
             stop,
             reload,
             page,
+            fields,
             thread,
         })
     }
@@ -208,6 +229,12 @@ impl Server {
     /// Serve this HTML at `/` instead of the built-in todo page (`None` restores it).
     pub fn set_page(&self, html: Option<String>) {
         (self.page)(html)
+    }
+
+    /// Field-type hints for the dashboard, `(table, ["addr", "bool", "string"])` (see
+    /// [`parse_fields`]). Replaces earlier hints.
+    pub fn set_fields(&self, fields: FieldHints) {
+        (self.fields)(fields)
     }
 
     /// Stop accepting; open event streams end within a second.
@@ -416,6 +443,30 @@ fn handle<S: KvStore + Send + 'static>(
         let html = page.as_deref().unwrap_or(TODO_HTML);
         return respond(&mut conn, "200 OK", "text/html; charset=utf-8", html);
     }
+    if req.method == "GET" && req.path == "/dashboard" {
+        return respond(
+            &mut conn,
+            "200 OK",
+            "text/html; charset=utf-8",
+            admin::DASHBOARD_HTML,
+        );
+    }
+    if req.path == "/admin" || req.path.starts_with("/admin/") {
+        if req.method != "GET" {
+            return err_json(
+                &mut conn,
+                "405 Method Not Allowed",
+                "admin is read-only: use GET",
+            );
+        }
+        if req.path == "/admin/events" {
+            return admin_events(sh, &mut conn);
+        }
+        return match admin::route(sh, &req) {
+            Ok(body) => respond(&mut conn, "200 OK", "application/json", &body),
+            Err((s, m)) => err_json(&mut conn, s, &m),
+        };
+    }
     let Some((kind, function)) = req.path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
         return err_json(&mut conn, "404 Not Found", "not found");
     };
@@ -534,6 +585,10 @@ fn mutation<S: KvStore + Send + 'static>(
         }
     };
     st.height += 1;
+    if !committed.batch.is_empty() {
+        let ev = admin::commit_event(st.height, &committed.batch);
+        st.admin.retain(|tx| tx.send(ev.clone()).is_ok());
+    }
     // Push changed results of affected subscriptions (a subscription runs as its own caller).
     let mut dead = Vec::new();
     for id in st.subs.affected(&committed.batch) {
@@ -639,4 +694,45 @@ fn subscribe<S: KvStore + Send + 'static>(
     st.subs.unsubscribe(id);
     st.clients.remove(&id);
     result
+}
+
+/// `GET /admin/events`: one `data:` event per commit that wrote anything, with the tables it
+/// touched. The first event is the current height.
+fn admin_events<S: KvStore + Send + 'static>(
+    sh: &Arc<Shared<S>>,
+    conn: &mut TcpStream,
+) -> std::io::Result<()> {
+    let (tx, rx) = channel();
+    let height = {
+        let mut st = sh.state.lock().unwrap();
+        st.admin.push(tx);
+        st.height
+    };
+    conn.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    )?;
+    write!(
+        conn,
+        "data: {{\"height\":{height},\"tables\":[],\"storage\":false,\"tokens\":false,\"accounts\":false}}\n\n"
+    )?;
+    conn.flush()?;
+    let mut idle = 0;
+    while !sh.stop.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ev) => {
+                idle = 0;
+                write!(conn, "data: {ev}\n\n")?;
+                conn.flush()?;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                idle += 1;
+                if idle % 60 == 0 {
+                    conn.write_all(b": ping\n\n")?;
+                    conn.flush()?;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
 }

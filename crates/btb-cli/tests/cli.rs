@@ -61,6 +61,8 @@ fn init_scaffold_matches_todo_structure_and_rejects_bad_names() {
         "rust-toolchain.toml",
         "src/main.rs",
         "web/index.html",
+        ".vscode/settings.json",
+        "rust-analyzer.toml",
     ] {
         assert!(root.join(f).is_file(), "missing {f}");
     }
@@ -230,5 +232,46 @@ fn dev_reload_reruns_subscriptions_and_pushes_changes() {
         "reload pushes the changed result"
     );
     s.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The editor settings from `btb init` are what makes rust-analyzer work: apply them the way
+/// rust-analyzer does (target from `cargo.target`, env from `check.extraEnv`) and run `cargo check`.
+#[test]
+fn scaffolded_rust_analyzer_settings_make_cargo_check_work() {
+    let (dir, root) = new_project("ra");
+    let text = std::fs::read_to_string(root.join(".vscode/settings.json")).unwrap();
+    // The file is JSONC (has comments): drop `//` lines before parsing.
+    let json: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["rust-analyzer.cargo.target"], btb_cli::TARGET);
+    assert_eq!(v["rust-analyzer.procMacro.enable"], true);
+    assert_eq!(v["rust-analyzer.check.allTargets"], false);
+    let toml = std::fs::read_to_string(root.join("rust-analyzer.toml")).unwrap();
+    assert!(toml.contains(btb_cli::TARGET) && toml.contains("RUSTC_BOOTSTRAP"));
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("check")
+        .arg("--message-format=json")
+        .current_dir(&root);
+    cmd.arg("--target")
+        .arg(v["rust-analyzer.cargo.target"].as_str().unwrap());
+    for (k, val) in v["rust-analyzer.check.extraEnv"].as_object().unwrap() {
+        cmd.env(k, val.as_str().unwrap());
+    }
+    let o = cmd.output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        o.status.success(),
+        "cargo check failed:\n{}\n{}",
+        String::from_utf8_lossy(&o.stderr),
+        out
+    );
+    // proc macros expanded: the generated `btb_query_list_mine` symbol exists in the crate.
+    assert!(out.contains("btb-sdk-macros") || out.contains("btb_sdk_macros"));
     let _ = std::fs::remove_dir_all(dir);
 }

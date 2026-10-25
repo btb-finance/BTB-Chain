@@ -17,6 +17,7 @@ Flags: `--port N` (default 8787, 0 = any free port), `--index Table:index:addr@o
 | `POST /mutation/<name>` | Runs a mutation as an optimistic transaction (up to 3 retries), commits it, then re-runs every subscribed query whose read set was touched |
 | `GET /query/<name>` | Runs a query once |
 | `GET /subscribe/<name>` | Server-Sent Events. First event: the current result. Then one event each time a commit changes the result (`SubscriptionManager`: read-set invalidation, re-run, compare fingerprints) |
+| `GET /dashboard`, `GET /admin/...` | Read-only table browser and JSON API, see [Dashboard](#dashboard-and-admin-endpoints) |
 | `GET /` | The todo demo page (`examples/todo/web/index.html`, embedded in the binary) |
 
 Failures return JSON `{"error": "..."}`: 400 (abort or bad arguments), 404 (no such function), 405, 409 (conflict after retries), 500 (storage fault). A failed call changes nothing and pushes nothing.
@@ -39,6 +40,42 @@ One contract at a time, at the fixed address `[0xDE; 32]`, funded with 10^12 bas
 
 `Server::start(elf, bind, store, indexes)` starts a server. `server.reload(elf)` validates a new build and swaps it in while keeping all state (the `KvStore`, block height and subscriptions); on an invalid ELF the old contract keeps running. After a swap every open subscription re-runs against the new code and pushes its result if it changed (a stream whose query no longer exists ends). `server.set_page(Some(html))` serves a project's own page at `/` instead of the todo demo.
 
+## Dashboard and admin endpoints
+
+`GET /dashboard` serves a single embedded page (inline CSS and JS, no build step, no CDN) that browses the loaded contract like a database. `btb dev` serves it too. It shows:
+
+- **Contract**: address, block height, BTB balance, bytes of state stored (usage), the locked storage deposit, number of storage keys, and the Merkle root. The dev server does not maintain a Merkle tree, so the root is reported as `not tracked` (the `version` is the block height).
+- **Tables**: discovered from the key layout (every `0x02` row prefix and `0x03` counter of the contract) with row counts. Click a table for its rows, paged (10/25/100), ascending or descending by id. Each row shows raw hex and, if a field hint exists, decoded values.
+- **Indexes**: the registered indexes of the selected table. Pick one and enter a value (an address as 64 hex characters, or a `u64`) to see the matching rows, or leave it empty to list index entries (order-preserving encoded value in hex, row id).
+- **Storage keys** (`0x01`) with hex and text, and **tokens** created by the contract with their top holders.
+- **Live**: the page opens `GET /admin/events`; when a commit touches the selected table the rows reload, and the list, counts and info refresh on every commit.
+
+**Field hints** tell the dashboard how to decode rows with the [ENCODING.md](ENCODING.md) rules. The row is a tuple of the listed types: `addr bool string bytes u8 u16 u32 u64 u128 i8 i16 i32 i64 i128`. Set them with `--fields Table:addr,bool,string` (repeatable; with none, the todo demo gets `Todo:addr,bool,string`), or in a `btb dev` project:
+
+```toml
+[package.metadata.btb]
+indexes = ["Note:owner:addr@0"]
+fields = ["Note:addr,bool,string"]
+```
+
+A row that does not match its hint (wrong type or trailing bytes) shows `decode_error` next to its hex. Without a hint only hex is shown. Library: `Server::set_fields(...)`, `parse_fields(...)`.
+
+### `/admin` JSON API (read-only, development only)
+
+Every endpoint is `GET` and returns JSON; other methods return 405. There is no authentication; never expose the server. `limit` is 1..500 (default 25), `cursor` is the opaque hex `next_cursor` of the previous page (`null` when there is no more), `order` is `asc` or `desc`. Row ids and amounts above 32 bits are strings in `decoded`.
+
+| Request | Returns |
+| --- | --- |
+| `/admin/overview` (also `/admin/tables`) | `contract`, `height`, `balance`, `storage_usage`, `storage_deposit`, `deposit_per_byte`, `storage_keys`, `merkle {tracked, root, version}`, `tables [{name, rows, indexes, fields}]` |
+| `/admin/table/<name>?limit&cursor&order` | `{table, total, rows [{id, hex, bytes, decoded?, decode_error?}], next_cursor}` |
+| `/admin/table/<name>/<id>` | One row |
+| `/admin/index/<table>/<index>?value=V&limit&cursor&order` | With `value`: matching rows as above. Without: `entries [{value (hex of the encoded index value), id}]` |
+| `/admin/storage?limit&cursor` | `keys [{key, key_text, hex, bytes}]` |
+| `/admin/tokens` | `tokens [{id, name, symbol, decimals, supply, creator, holders [{holder, balance}]}]` |
+| `/admin/events` | Server-Sent Events: first the current `height`, then one event per commit that wrote state: `{"height", "tables": [touched table names], "storage", "tokens", "accounts"}` |
+
+The table scan for row counts is linear in the number of rows, which is fine for development data.
+
 ## Tests
 
-`crates/btb-tests/tests/dev_gate.rs` is the automated gate: it starts the server on an ephemeral port with the real `todo` contract, opens an SSE stream, posts `add` and `toggle`, and asserts the new event arrives (and that another user's change pushes nothing). `examples/todo/web/smoke.js` is an optional Playwright check of the page in Chromium.
+`crates/btb-tests/tests/dev_gate.rs` is the automated gate: it starts the server on an ephemeral port with the real `todo` contract, opens an SSE stream, posts `add` and `toggle`, and asserts the new event arrives (and that another user's change pushes nothing). `examples/todo/web/smoke.js` is an optional Playwright check of the page in Chromium. `crates/btb-tests/tests/dev_dashboard.rs` covers the dashboard and `/admin` endpoints (tables and counts, paging, decoding, index browse, live event after commit); `crates/btb-dev/web/smoke.js` is the Playwright check of the dashboard page.

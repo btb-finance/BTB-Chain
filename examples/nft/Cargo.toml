@@ -1,0 +1,27 @@
+[package]
+name = "nft"
+description = "Example BTB contract: NFTs with an escrow-based marketplace"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone workspace: this crate only builds for riscv64imac-unknown-none-elf (see .cargo/config.toml).
+[workspace]
+
+[dependencies]
+btb-sdk = { path = "../../crates/btb-sdk", features = ["runtime"] }
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"
+
+# Temporary host-side index declarations (see docs/DEV_SERVER.md): `btb dev` registers them.
+[package.metadata.btb]
+indexes = ["Nft:owner:addr@0"]

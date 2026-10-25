@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<title>BTB token launcher</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --mute: #6b6b6b; --line: #ddd; --accent: #2b59ff; --bad: #c0262d; --ok: #1a7f37; --card: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #16181d; --fg: #eee; --mute: #999; --line: #333; --accent: #7a98ff; --bad: #ff7b81; --ok: #56d364; --card: #1d2027; } }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; margin: 0; padding: 0 16px; }
+  main { max-width: 760px; margin: 24px auto 48px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 0 0 8px; }
+  .sub, .hint { color: var(--mute); font-size: .85rem; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 14px 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+  label { font-size: .85rem; color: var(--mute); }
+  input[type=text], input[type=number] { padding: 6px 8px; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: inherit; min-width: 0; }
+  input.wide { flex: 1; min-width: 12rem; }
+  input.num { width: 7rem; }
+  button { padding: 6px 12px; font: inherit; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  li:last-child { border-bottom: 0; }
+  code, .mono { font-family: ui-monospace, monospace; font-size: .85rem; }
+  .grow { flex: 1; min-width: 8rem; overflow-wrap: anywhere; }
+  .big { font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+  #status { color: var(--mute); font-size: .8rem; }
+  #err { color: var(--bad); min-height: 1.2em; font-size: .9rem; }
+  #err.ok { color: var(--ok); }
+</style>
+</head>
+<body>
+<main>
+  <h1>BTB token launcher</h1>
+  <div class="sub">Everything below is a live subscription (<code>info</code>, <code>holders</code>, <code>balance_of</code>); open it in two tabs as two users. Dev identity only, no signatures.</div>
+  <section>
+    <div class="row"><label for="who">You</label><input id="who" type="text" value="alice" class="num"> <span class="hint mono" id="me"></span></div>
+    <div class="row"><label for="token">Token id</label><input id="token" type="text" class="wide mono" placeholder="64 hex characters (launch one below)"></div>
+  </section>
+  <section>
+    <h2>Launch a token</h2>
+    <form id="launch">
+      <div class="row">
+        <input id="name" type="text" value="Gold" placeholder="name" class="num" required>
+        <input id="symbol" type="text" value="GLD" placeholder="symbol" class="num" required>
+        <input id="decimals" type="number" value="6" min="0" max="38" class="num" title="decimals">
+        <input id="supply" type="text" value="1000000" class="num" title="supply">
+        <input id="faucet" type="text" value="100" class="num" title="faucet amount per claimer">
+        <label><input id="mintable" type="checkbox"> mintable</label>
+        <button id="launchBtn">Launch</button>
+      </div>
+      <div class="hint">name, symbol, decimals, supply, faucet amount per claimer. The launcher contract holds the whole supply; the faucet pays it out.</div>
+    </form>
+  </section>
+  <section>
+    <h2>Token</h2>
+    <div id="info" class="hint">no token selected</div>
+    <div class="row"><span>Your balance: <b id="bal" class="big">-</b></span> <button id="claim" class="ghost">Claim from faucet</button></div>
+  </section>
+  <section>
+    <h2>Holders <span class="hint">(first 50, ascending address)</span></h2>
+    <ul id="holders"></ul>
+  </section>
+  <div id="err"></div>
+  <div id="status">connecting...</div>
+</main>
+<!-- btb-client:begin -->
+<script>
+// @btb/client (MIT), inlined from sdk-ts/dist by examples/sync-sdk.mjs. Do not edit.
+const btb = (() => {
+// Canonical BTB binary encoding (docs/ENCODING.md). Mirrors the `btb-codec` crate:
+// little-endian fixed-width integers (bigint for 64/128 bits), u32 length prefixes,
+// strict decoding (no trailing bytes, bool/option tags 0/1, valid UTF-8, length caps).
+/** Default maximum length (bytes or elements) a decoder accepts. Same as `btb-codec`. */
+const DEFAULT_MAX_LEN = 1 << 24;
+class CodecError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = "CodecError";
+    }
+}
+/** Growable output buffer. */
+class Writer {
+    buf = new Uint8Array(64);
+    len = 0;
+    grow(n) {
+        if (this.len + n <= this.buf.length)
+            return;
+        let cap = this.buf.length;
+        while (cap < this.len + n)
+            cap *= 2;
+        const next = new Uint8Array(cap);
+        next.set(this.buf.subarray(0, this.len));
+        this.buf = next;
+    }
+    byte(b) {
+        this.grow(1);
+        this.buf[this.len++] = b;
+    }
+    bytes(b) {
+        this.grow(b.length);
+        this.buf.set(b, this.len);
+        this.len += b.length;
+    }
+    finish() {
+        return this.buf.slice(0, this.len);
+    }
+}
+/** Input cursor with a configurable length cap. */
+class Reader {
+    buf;
+    maxLen;
+    pos = 0;
+    constructor(buf, maxLen = DEFAULT_MAX_LEN) {
+        this.buf = buf;
+        this.maxLen = maxLen;
+    }
+    take(n) {
+        if (this.buf.length - this.pos < n)
+            throw new CodecError("unexpected end of input");
+        const out = this.buf.subarray(this.pos, this.pos + n);
+        this.pos += n;
+        return out;
+    }
+    /** A u32 length prefix, checked against the maximum before anything is allocated. */
+    len() {
+        const b = this.take(4);
+        const n = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+        if (n > this.maxLen)
+            throw new CodecError(`length ${n} exceeds maximum ${this.maxLen}`);
+        return n;
+    }
+    get remaining() {
+        return this.buf.length - this.pos;
+    }
+}
+/** Encode a value to bytes. */
+function encode(c, v) {
+    const w = new Writer();
+    c.encode(w, v);
+    return w.finish();
+}
+/** Decode a whole buffer; rejects trailing bytes and over-long length prefixes. */
+function decode(c, bytes, maxLen = DEFAULT_MAX_LEN) {
+    const r = new Reader(bytes, maxLen);
+    const v = c.decode(r);
+    if (r.remaining !== 0)
+        throw new CodecError("trailing bytes after value");
+    return v;
+}
+function toHex(b) {
+    let s = "";
+    for (const x of b)
+        s += x.toString(16).padStart(2, "0");
+    return s;
+}
+function fromHex(s) {
+    if (s.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(s))
+        throw new CodecError("invalid hex");
+    const out = new Uint8Array(s.length / 2);
+    for (let i = 0; i < out.length; i++)
+        out[i] = parseInt(s.slice(2 * i, 2 * i + 2), 16);
+    return out;
+}
+function uint(bits) {
+    const n = bits / 8;
+    const max = (1n << BigInt(bits)) - 1n;
+    return {
+        encode(w, v) {
+            if (typeof v !== "bigint" || v < 0n || v > max)
+                throw new CodecError(`value out of range for u${bits}`);
+            for (let i = 0; i < n; i++)
+                w.byte(Number((v >> BigInt(8 * i)) & 0xffn));
+        },
+        decode(r) {
+            const b = r.take(n);
+            let v = 0n;
+            for (let i = n - 1; i >= 0; i--)
+                v = (v << 8n) | BigInt(b[i]);
+            return v;
+        },
+    };
+}
+function sint(bits) {
+    const u = uint(bits);
+    const min = -(1n << BigInt(bits - 1));
+    const max = (1n << BigInt(bits - 1)) - 1n;
+    const mod = 1n << BigInt(bits);
+    return {
+        encode(w, v) {
+            if (typeof v !== "bigint" || v < min || v > max)
+                throw new CodecError(`value out of range for i${bits}`);
+            u.encode(w, v < 0n ? v + mod : v);
+        },
+        decode(r) {
+            const v = u.decode(r);
+            return v > max ? v - mod : v;
+        },
+    };
+}
+/** Small integers (8/16/32 bits) are plain JS numbers. */
+function small(bits, signed) {
+    const c = signed ? sint(bits) : uint(bits);
+    return {
+        encode(w, v) {
+            if (typeof v !== "number" || !Number.isInteger(v))
+                throw new CodecError(`expected integer for ${signed ? "i" : "u"}${bits}`);
+            c.encode(w, BigInt(v));
+        },
+        decode: (r) => Number(c.decode(r)),
+    };
+}
+const bool = {
+    encode: (w, v) => w.byte(v ? 1 : 0),
+    decode(r) {
+        const b = r.take(1)[0];
+        if (b > 1)
+            throw new CodecError(`invalid bool tag ${b}`);
+        return b === 1;
+    },
+};
+const bytes = {
+    encode(w, v) {
+        if (v.length > 0xffffffff)
+            throw new CodecError("length exceeds u32");
+        t.u32.encode(w, v.length);
+        w.bytes(v);
+    },
+    decode: (r) => r.take(r.len()).slice(),
+};
+const string = {
+    encode(w, v) {
+        if (/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(v))
+            throw new CodecError("string contains a lone surrogate");
+        bytes.encode(w, new TextEncoder().encode(v));
+    },
+    decode(r) {
+        try {
+            return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(r.take(r.len()));
+        }
+        catch {
+            throw new CodecError("invalid UTF-8");
+        }
+    },
+};
+function option(inner) {
+    return {
+        encode(w, v) {
+            if (v === null || v === undefined)
+                w.byte(0);
+            else {
+                w.byte(1);
+                inner.encode(w, v);
+            }
+        },
+        decode(r) {
+            const tag = r.take(1)[0];
+            if (tag === 0)
+                return null;
+            if (tag === 1)
+                return inner.decode(r);
+            throw new CodecError(`invalid option tag ${tag}`);
+        },
+    };
+}
+function vec(inner) {
+    return {
+        encode(w, v) {
+            t.u32.encode(w, v.length);
+            for (const x of v)
+                inner.encode(w, x);
+        },
+        decode(r) {
+            const n = r.len();
+            const out = []; // never sized from the prefix
+            for (let i = 0; i < n; i++)
+                out.push(inner.decode(r));
+            return out;
+        },
+    };
+}
+function array(inner, n) {
+    return {
+        encode(w, v) {
+            if (v.length !== n)
+                throw new CodecError(`expected array of length ${n}`);
+            for (const x of v)
+                inner.encode(w, x);
+        },
+        decode(r) {
+            const out = [];
+            for (let i = 0; i < n; i++)
+                out.push(inner.decode(r));
+            return out;
+        },
+    };
+}
+function tuple(...items) {
+    return {
+        encode(w, v) {
+            if (v.length !== items.length)
+                throw new CodecError(`expected tuple of ${items.length}`);
+            items.forEach((c, i) => c.encode(w, v[i]));
+        },
+        decode: (r) => items.map((c) => c.decode(r)),
+    };
+}
+/** A struct is the tuple of its fields in declaration order (key order of `fields`). */
+function struct(fields) {
+    const keys = Object.keys(fields);
+    return {
+        encode(w, v) {
+            for (const k of keys)
+                fields[k].encode(w, v[k]);
+        },
+        decode(r) {
+            const out = {};
+            for (const k of keys)
+                out[k] = fields[k].decode(r);
+            return out;
+        },
+    };
+}
+const address = {
+    encode(w, v) {
+        if (v.length !== 32)
+            throw new CodecError("address must be 32 bytes");
+        w.bytes(v);
+    },
+    decode: (r) => r.take(32).slice(),
+};
+/** Type combinators. 8/16/32-bit integers are `number`; 64/128-bit are `bigint`. */
+const t = {
+    bool,
+    u8: small(8, false),
+    u16: small(16, false),
+    u32: small(32, false),
+    u64: uint(64),
+    u128: uint(128),
+    i8: small(8, true),
+    i16: small(16, true),
+    i32: small(32, true),
+    i64: sint(64),
+    i128: sint(128),
+    bytes,
+    string,
+    address,
+    unit: tuple(),
+    option,
+    vec,
+    array,
+    tuple,
+    struct,
+};
+
+
+class BtbError extends Error {
+    status;
+    constructor(message, 
+    /** HTTP status, or 0 for network failures. */
+    status = 0) {
+        super(message);
+        this.status = status;
+        this.name = "BtbError";
+    }
+}
+class BtbClient {
+    url;
+    caller;
+    fetchFn;
+    ES;
+    reconnectMs;
+    constructor(opts) {
+        this.url = opts.url.replace(/\/+$/, "");
+        this.caller = opts.caller;
+        this.fetchFn = opts.fetch ?? ((...a) => globalThis.fetch(...a));
+        this.ES = opts.EventSource === undefined ? (globalThis.EventSource ?? null) : opts.EventSource;
+        this.reconnectMs = opts.reconnectMs ?? 1000;
+    }
+    target(kind, name, args) {
+        const q = new URLSearchParams();
+        if (args.length > 0)
+            q.set("args", toHex(args));
+        if (this.caller !== undefined)
+            q.set("caller", this.caller);
+        const qs = q.toString();
+        return `${this.url}/${kind}/${encodeURIComponent(name)}${qs ? `?${qs}` : ""}`;
+    }
+    async call(kind, name, argsType, args, resultType) {
+        let res;
+        try {
+            res = await this.fetchFn(this.target(kind, name, encode(argsType, args)), {
+                method: kind === "query" ? "GET" : "POST",
+            });
+        }
+        catch (e) {
+            throw new BtbError(`network error: ${e.message}`);
+        }
+        const text = await res.text();
+        if (!res.ok)
+            throw new BtbError(errorMessage(text, res.status), res.status);
+        return decode(resultType, fromHex(text.trim()));
+    }
+    /** Run a query once. */
+    query(name, argsType, args, resultType) {
+        return this.call("query", name, argsType, args, resultType);
+    }
+    /** Run a mutation; resolves with its result once committed. */
+    mutation(name, argsType, args, resultType) {
+        return this.call("mutation", name, argsType, args, resultType);
+    }
+    /**
+     * Watch a query: `onResult` gets the current result, then a new one each time it changes.
+     * Returns a function that stops the subscription.
+     */
+    subscribe(name, argsType, args, resultType, onResult, onError) {
+        const url = this.target("subscribe", name, encode(argsType, args));
+        let closed = false;
+        const deliver = (data) => {
+            if (closed)
+                return;
+            let value;
+            try {
+                value = decode(resultType, fromHex(data.trim()));
+            }
+            catch (e) {
+                onError?.(new BtbError(`bad result: ${e.message}`));
+                return;
+            }
+            onResult(value);
+        };
+        const fail = (e) => {
+            if (!closed)
+                onError?.(e);
+        };
+        if (this.ES) {
+            const es = new this.ES(url);
+            es.onmessage = (ev) => deliver(String(ev.data));
+            // EventSource reconnects by itself on transient errors; readyState CLOSED means it gave up.
+            es.onerror = () => {
+                fail(new BtbError("subscription connection error"));
+                if (es.readyState === 2)
+                    closed = true;
+            };
+            return () => {
+                closed = true;
+                es.close();
+            };
+        }
+        const abort = new AbortController();
+        const loop = async () => {
+            while (!closed) {
+                try {
+                    const res = await this.fetchFn(url, {
+                        headers: { accept: "text/event-stream" },
+                        signal: abort.signal,
+                    });
+                    if (!res.ok) {
+                        fail(new BtbError(errorMessage(await res.text(), res.status), res.status));
+                        if (res.status < 500)
+                            return; // a bad request will not get better
+                    }
+                    else if (res.body) {
+                        await readSse(res.body, deliver);
+                    }
+                }
+                catch (e) {
+                    if (closed)
+                        return;
+                    fail(new BtbError(`subscription connection error: ${e.message}`));
+                }
+                if (closed)
+                    return;
+                await new Promise((r) => setTimeout(r, this.reconnectMs));
+            }
+        };
+        void loop();
+        return () => {
+            closed = true;
+            abort.abort();
+        };
+    }
+}
+function errorMessage(text, status) {
+    try {
+        const j = JSON.parse(text);
+        if (typeof j.error === "string")
+            return j.error;
+    }
+    catch {
+        /* not JSON */
+    }
+    return text.trim() || `HTTP ${status}`;
+}
+/** Parse a Server-Sent Events body, calling `onData` once per event. */
+async function readSse(body, onData) {
+    const reader = body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let data = [];
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done)
+            return;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).replace(/\r$/, "");
+            buf = buf.slice(nl + 1);
+            if (line === "") {
+                if (data.length)
+                    onData(data.join("\n"));
+                data = [];
+            }
+            else if (line.startsWith("data:")) {
+                data.push(line.slice(5).replace(/^ /, ""));
+            }
+        }
+    }
+}
+
+return { BtbClient, BtbError, t, encode, decode, toHex, fromHex };
+})();
+</script>
+<!-- btb-client:end -->
+<script>
+(() => {
+
+  const { BtbClient, t } = btb;
+  const $ = id => document.getElementById(id);
+  const enc = new TextEncoder();
+  const short = hex => hex.slice(0, 8) + '..' + hex.slice(-4);
+  const hexOf = b => btb.toHex(b);
+  async function addrOf(s) {          // dev identity: 64 hex chars = address, other text = SHA-256
+    s = (s || '').trim() || 'anonymous';
+    if (/^[0-9a-f]{64}$/i.test(s)) return btb.fromHex(s.toLowerCase());
+    return new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s)));
+  }
+  function say(msg, ok) { const e = $('err'); e.textContent = msg; e.className = ok ? 'ok' : ''; }
+  function el(tag, props, ...kids) {
+    const e = Object.assign(document.createElement(tag), props || {});
+    e.append(...kids); return e;
+  }
+  // A set of live subscriptions that is replaced as a whole when the user or token changes.
+  let subs = [];
+  function watch(client, name, argT, args, resT, onResult) {
+    subs.push(client.subscribe(name, argT, args, resT, r => onResult(r),
+      e => { if (/connection/.test(e.message)) $('status').textContent = 'reconnecting...'; else onResult(null, e); }));
+  }
+  function stopAll() { subs.forEach(s => s()); subs = []; }
+  async function send(client, name, argT, args, resT) {
+    try { const r = await client.mutation(name, argT, args, resT); say(name + ' ok', true); return r; }
+    catch (e) { say(name + ': ' + e.message); return undefined; }
+  }
+  const parseHexId = s => { s = (s || '').trim().toLowerCase(); return /^[0-9a-f]{64}$/.test(s) ? btb.fromHex(s) : null; };
+  const big = s => { try { return BigInt(String(s).trim()); } catch { return null; } };
+
+
+  const Info = t.tuple(t.string, t.string, t.u8, t.u128);
+  const Holders = t.tuple(t.vec(t.tuple(t.address, t.u128)), t.option(t.address));
+  let client, me, token = null;
+
+  let connectGen = 0, lastWho = null, lastToken;
+  async function connect() {
+    const gen = ++connectGen;
+    const who = $('who').value.trim() || 'anonymous';
+    const addr = await addrOf(who);
+    if (gen !== connectGen) return;   // a newer connect() superseded this one
+    stopAll();
+    me = addr;
+    lastWho = who; lastToken = ($('token') || {}).value;
+    document.body.dataset.who = who;   // for the smoke tests
+    $('me').textContent = short(hexOf(me));
+    client = new BtbClient({ url: location.origin, caller: who });
+    token = parseHexId($('token').value);
+    $('info').textContent = token ? 'loading...' : 'no token selected';
+    if (!token) { $('bal').textContent = '-'; $('holders').replaceChildren(); $('status').textContent = 'live'; return; }
+    history.replaceState(null, '', '#' + hexOf(token));
+    watch(client, 'info', t.tuple(t.address), [token], Info, (r, e) => {
+      if (e) { $('info').textContent = 'error: ' + e.message; return; }
+      const [name, symbol, decimals, supply] = r;
+      $('info').textContent = `${name} (${symbol}), ${decimals} decimals, supply ${supply}`;
+      $('status').textContent = 'live (updated ' + new Date().toLocaleTimeString() + ')';
+    });
+    watch(client, 'balance_of', t.tuple(t.address, t.address), [token, me], t.u128, (r, e) => {
+      if (!e) $('bal').textContent = r.toString();
+    });
+    watch(client, 'holders', t.tuple(t.address, t.option(t.address), t.u32), [token, null, 50], Holders, (r, e) => {
+      if (e) return;
+      $('holders').replaceChildren(...r[0].map(([a, amt]) => {
+        const h = hexOf(a);
+        return el('li', { className: 'holder', title: h }, el('code', { className: 'grow' }, short(h) + (h === hexOf(me) ? '  (you)' : '')), el('b', {}, amt.toString()));
+      }));
+    });
+  }
+
+  $('launch').onsubmit = async ev => {
+    ev.preventDefault();
+    const [supply, faucet] = [big($('supply').value), big($('faucet').value)];
+    if (supply === null || faucet === null) return say('supply and faucet must be whole numbers');
+    const r = await send(client, 'launch', t.tuple(t.string, t.string, t.u8, t.u128, t.u128, t.bool),
+      [$('name').value, $('symbol').value, Number($('decimals').value), supply, faucet, $('mintable').checked], t.address);
+    if (r) { $('token').value = hexOf(r); connect(); }
+  };
+  $('claim').onclick = async () => { if (token) await send(client, 'claim', t.tuple(t.address), [token], t.u128); };
+  // `change` also fires when focus merely leaves a field: only reconnect on a real change.
+  $('who').onchange = () => { if ($('who').value.trim() !== lastWho) connect(); };
+  $('token').onchange = () => { if ($('token').value !== lastToken) connect(); };
+  $('token').value = location.hash.slice(1);
+  connect();
+
+})();
+</script>
+</body>
+</html>

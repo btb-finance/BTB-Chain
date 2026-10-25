@@ -24,3 +24,6 @@ sha2 = "0.11.1"
 default = []
 # Let `btb dev --data DIR` keep state in RocksDB (needs clang/libclang).
 rocksdb = ["btb-dev/rocksdb", "btb-runtime/rocksdb"]
+
+[dev-dependencies]
+serde_json = "1"

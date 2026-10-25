@@ -1,0 +1,16 @@
+{
+  // Makes rust-analyzer see the project the way `btb build` does: the RISC-V target, build-std
+  // (needs RUSTC_BOOTSTRAP), proc macros (#[btb::query] etc.) and no test harness (a bare-metal
+  // crate has none). The same keys are in rust-analyzer.toml for other editors.
+  "rust-analyzer.cargo.target": "riscv64imac-unknown-none-elf",
+  "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.cargo.features": [],
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.cargo.extraEnv": { "RUSTC_BOOTSTRAP": "1" },
+  "rust-analyzer.check.command": "check",
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.check.extraEnv": { "RUSTC_BOOTSTRAP": "1" },
+  "rust-analyzer.procMacro.enable": true,
+  "rust-analyzer.procMacro.attributes.enable": true,
+  "rust-analyzer.files.excludeDirs": ["target", "web"]
+}

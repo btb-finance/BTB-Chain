@@ -13,6 +13,10 @@ Example BTB contract: a token launcher with a faucet, built on the native user-t
 ```
 ./build.sh        # writes launcher.elf (git-ignored)
 cargo test -p btb-tests --test launcher -- --nocapture
+(cd examples/launcher && ../../target/debug/btb dev)   # live page: launch, claim, holders (needs cargo build -p btb-cli)
+node examples/launcher/web/smoke.js                    # Playwright check
 ```
+
+The page ([web/index.html](web/index.html), see [../README-web.md](../README-web.md)) subscribes to `info`, `holders` and `balance_of` of the selected token, so a claim in one tab appears in the others.
 
 Same build setup as [counter](../counter/README.md).

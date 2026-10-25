@@ -1,0 +1,15 @@
+# Same settings as .vscode/settings.json, for editors other than VS Code (Neovim, Helix, Zed, ...).
+[cargo]
+target = "riscv64imac-unknown-none-elf"
+allTargets = false
+buildScripts.enable = true
+extraEnv = { RUSTC_BOOTSTRAP = "1" }
+
+[check]
+command = "check"
+allTargets = false
+extraEnv = { RUSTC_BOOTSTRAP = "1" }
+
+[procMacro]
+enable = true
+attributes.enable = true

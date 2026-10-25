@@ -38,6 +38,10 @@ const stop = client.subscribe("list_mine", t.unit, [], Todos, (rows) => console.
 
 `subscribe` uses `EventSource` when the runtime has one and a `fetch` stream reader otherwise (Node), reconnecting after 1 s on dropped streams. Errors are `BtbError` with the HTTP `status` and the server's message.
 
+## In a plain page (no bundler)
+
+`btb dev` serves only `web/index.html`, so the example pages inline the built client (`sdk-ts/dist`) in a `<script>` that defines a global `btb`; `node examples/sync-sdk.mjs` refreshes it ([examples/README-web.md](../examples/README-web.md)). Pages use `new btb.BtbClient({ url: location.origin, caller })` and `btb.t`.
+
 ## React
 
 ```tsx

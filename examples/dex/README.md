@@ -14,6 +14,10 @@ Aborts: `zero amount`, `zero shares`, `no liquidity`, `slippage`, `overflow`. Re
 ```
 ./build.sh        # writes dex.elf (git-ignored)
 cargo test -p btb-tests --test dex -- --nocapture
+(cd examples/dex && ../../target/debug/btb dev)   # live page (needs cargo build -p btb-cli)
+node examples/dex/web/smoke.js                   # Playwright check
 ```
+
+The page ([web/index.html](web/index.html), see [../README-web.md](../README-web.md)) subscribes to `reserves`, `shares_of` and `quote`, so a swap in one tab moves the pool in the others.
 
 Same build setup as [counter](../counter/README.md).

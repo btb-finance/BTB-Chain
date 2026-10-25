@@ -51,11 +51,14 @@ The full developer experience on one node, so developers can build real apps.
 - [x] `btb` CLI: `init`, `dev` (hot reload), `deploy`
   - `crates/btb-cli`, see [docs/CLI.md](docs/CLI.md); `deploy` writes a local bundle until the chain exists (Phase 4)
 - [x] TypeScript SDK with React hooks (`useQuery`, `useMutation`)
-- [ ] Dashboard to browse contract tables like a database
-- [ ] Language server (autocomplete, errors, hover types)
+- [x] Dashboard to browse contract tables like a database
+  - `GET /dashboard` and `/admin/...` in `crates/btb-dev`, see [docs/DEV_SERVER.md](docs/DEV_SERVER.md#dashboard-and-admin-endpoints)
+- [x] Language server (autocomplete, errors, hover types)
+  - rust-analyzer config in `btb init` templates plus `crates/btb-lsp` (BTB diagnostics, hover, completion), see [docs/LSP.md](docs/LSP.md)
 - [x] Native token module (`Token.create`, transfers, holder queries)
   - host calls 16 to 23, `btb_sdk::token::Token`, [examples/launcher](examples/launcher), see [docs/TOKENOMICS.md](docs/TOKENOMICS.md#user-tokens)
-- [ ] Example apps: token launcher, simple DEX, NFT market
+- [x] Example apps: token launcher, simple DEX, NFT market
+  - [examples/launcher](examples/launcher), [examples/dex](examples/dex), [examples/nft](examples/nft) (escrow-based market), each with a live web page served by `btb dev` and a Playwright smoke script, see [examples/README-web.md](examples/README-web.md)
 
 **Gate:** an outside developer ships a working app and it feels like Convex.
 

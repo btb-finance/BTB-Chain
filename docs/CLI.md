@@ -15,6 +15,8 @@ btb deploy
 
 Creates `./<name>/` with the same structure as `examples/todo`: `Cargo.toml`, `.cargo/config.toml` (rv64im flags, `build-std`), `link.ld`, `rust-toolchain.toml`, `src/main.rs` (a `Note` table with `add`, `toggle`, `list_mine`) and `web/index.html` (a live page that calls those three functions). The templates are embedded in the binary. The source is `src/main.rs`, not `lib.rs`: a contract is a `no_std`/`no_main` binary, which is what produces the ELF.
 
+It also writes `.vscode/settings.json`, `.vscode/extensions.json` and `rust-analyzer.toml` so rust-analyzer uses the RISC-V target and `build-std` and expands the `#[btb::*]` macros; see [LSP.md](LSP.md).
+
 The generated `Cargo.toml` depends on `btb-sdk`. Where it finds it is configurable:
 
 - `--sdk-path DIR` writes `btb-sdk = { path = "DIR", ... }`. A relative `DIR` is relative to the new project, e.g. `--sdk-path ../BTB-Chain/crates/btb-sdk`.

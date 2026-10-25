@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTB Dashboard</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--mut:#6b7280;--line:#e5e7eb;--card:#f8fafc;--acc:#2563eb;--ok:#15803d}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--fg:#e6e8eb;--mut:#9aa3ad;--line:#262c33;--card:#171b21;--acc:#6ea0ff;--ok:#4ade80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:16px;margin:0}
+#status{color:var(--mut)} #status.live{color:var(--ok)}
+.warn{color:var(--mut);font-size:12px}
+main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:16px}
+@media (max-width:760px){main{grid-template-columns:1fr}}
+section{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:10px 12px;margin-bottom:12px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 8px}
+ul{list-style:none;margin:0;padding:0}
+#tables li{padding:5px 8px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between}
+#tables li.sel{background:var(--acc);color:#fff}
+#tables li.flash{outline:2px solid var(--ok)}
+dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 10px}dt{color:var(--mut)}dd{margin:0;word-break:break-all}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+td.hex,.mono{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}
+.wrap{overflow-x:auto}
+button,input,select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+button{cursor:pointer}button:disabled{opacity:.4;cursor:default}
+.bar{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+.err{color:#dc2626}
+</style>
+</head>
+<body>
+<header>
+  <h1>BTB Dashboard</h1>
+  <span id="status">connecting</span>
+  <span class="warn">dev server, read-only, no auth: never expose</span>
+</header>
+<main>
+  <div>
+    <section><h2>Contract</h2><dl id="info"></dl></section>
+    <section><h2>Tables</h2><ul id="tables"></ul></section>
+    <section><h2>Tokens</h2><div id="tokens" class="mono">none</div></section>
+  </div>
+  <div>
+    <section>
+      <h2 id="title">Select a table</h2>
+      <div class="bar">
+        <button id="prev" disabled>&larr; Prev</button>
+        <button id="next" disabled>Next &rarr;</button>
+        <select id="order"><option value="asc">id asc</option><option value="desc">id desc</option></select>
+        <select id="limit"><option>10</option><option selected>25</option><option>100</option></select>
+        <span id="count" class="warn"></span>
+      </div>
+      <div id="idxbar" class="bar"></div>
+      <div class="wrap"><table id="rows"><thead></thead><tbody></tbody></table></div>
+      <div id="msg" class="err"></div>
+    </section>
+    <section><h2>Storage keys</h2><div class="wrap"><table id="storage"><thead><tr><th>key</th><th>text</th><th>value (hex)</th></tr></thead><tbody></tbody></table></div></section>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const state = {table: null, stack: [], cursor: null, next: null, idx: null, val: ''};
+let info = null;
+
+async function api(path) {
+  const r = await fetch(path);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+function short(h) { return h.length > 20 ? h.slice(0, 10) + '...' + h.slice(-6) : h; }
+function show(v) { return typeof v === 'string' ? v : JSON.stringify(v); }
+
+async function loadOverview() {
+  info = await api('/admin/overview');
+  const dl = $('info'); dl.textContent = '';
+  const add = (k, v) => { dl.append(el('dt', k), el('dd', v, 'mono')); };
+  add('address', short(info.contract));
+  add('height', info.height);
+  add('balance', info.balance);
+  add('storage used', info.storage_usage + ' B');
+  add('deposit', info.storage_deposit);
+  add('kv keys', info.storage_keys);
+  add('merkle', info.merkle.tracked ? info.merkle.root : 'not tracked');
+  const ul = $('tables'); ul.textContent = '';
+  for (const t of info.tables) {
+    const li = el('li'); li.dataset.name = t.name;
+    li.append(el('span', t.name), el('span', String(t.rows), 'warn'));
+    if (t.name === state.table) li.className = 'sel';
+    li.onclick = () => selectTable(t.name);
+    ul.append(li);
+  }
+  if (!state.table && info.tables.length) selectTable(info.tables[0].name);
+}
+
+function selectTable(name) {
+  state.table = name; state.stack = []; state.cursor = null; state.idx = null; state.val = '';
+  for (const li of $('tables').children) li.classList.toggle('sel', li.dataset.name === name);
+  buildIdxBar();
+  loadRows();
+}
+
+function buildIdxBar() {
+  const bar = $('idxbar'); bar.textContent = '';
+  const t = info.tables.find(t => t.name === state.table);
+  if (!t || !t.indexes.length) return;
+  const sel = el('select'); sel.id = 'idxsel';
+  sel.append(new Option('(no index)', ''));
+  for (const i of t.indexes) sel.append(new Option('index ' + i, i));
+  const inp = el('input'); inp.id = 'idxval'; inp.placeholder = 'value (address hex or u64)'; inp.size = 36;
+  const go = el('button', 'Browse'); go.id = 'idxgo';
+  go.onclick = () => { state.idx = sel.value || null; state.val = inp.value.trim(); state.stack = []; state.cursor = null; loadRows(); };
+  bar.append(sel, inp, go);
+}
+
+async function loadRows() {
+  if (!state.table) return;
+  const q = new URLSearchParams({limit: $('limit').value, order: $('order').value});
+  if (state.cursor) q.set('cursor', state.cursor);
+  let path = '/admin/table/' + encodeURIComponent(state.table);
+  if (state.idx) { path = '/admin/index/' + encodeURIComponent(state.table) + '/' + encodeURIComponent(state.idx); if (state.val) q.set('value', state.val); }
+  $('msg').textContent = '';
+  let j;
+  try { j = await api(path + '?' + q); } catch (e) { $('msg').textContent = e.message; return; }
+  const t = info.tables.find(t => t.name === state.table);
+  $('title').textContent = state.table + (state.idx ? ' by ' + state.idx + (state.val ? ' = ' + short(state.val) : '') : '');
+  $('count').textContent = j.total !== undefined ? j.total + ' rows' : '';
+  const head = $('rows').tHead, body = $('rows').tBodies[0];
+  head.textContent = ''; body.textContent = '';
+  const hr = head.insertRow();
+  if (j.entries) {
+    for (const h of ['index value (hex)', 'row id']) hr.append(el('th', h));
+    for (const e of j.entries) { const r = body.insertRow(); r.append(el('td', e.value, 'hex'), el('td', String(e.id))); }
+  } else {
+    const hasDec = t && t.fields;
+    hr.append(el('th', 'id'));
+    if (hasDec) t.fields.forEach((f, i) => hr.append(el('th', 'f' + i + ' ' + f)));
+    hr.append(el('th', 'hex'));
+    for (const row of j.rows) {
+      const r = body.insertRow(); r.append(el('td', String(row.id)));
+      if (hasDec) {
+        if (row.decoded) row.decoded.forEach(v => r.append(el('td', show(v), 'hex')));
+        else { const c = el('td', row.decode_error || 'n/a', 'err'); c.colSpan = t.fields.length; r.append(c); }
+      }
+      r.append(el('td', row.hex, 'hex'));
+    }
+  }
+  state.next = j.next_cursor;
+  $('next').disabled = !j.next_cursor;
+  $('prev').disabled = state.stack.length === 0;
+}
+
+async function loadStorage() {
+  const j = await api('/admin/storage?limit=50');
+  const b = $('storage').tBodies[0]; b.textContent = '';
+  for (const k of j.keys) { const r = b.insertRow(); r.append(el('td', k.key, 'hex'), el('td', k.key_text), el('td', k.hex, 'hex')); }
+}
+
+async function loadTokens() {
+  const j = await api('/admin/tokens');
+  const d = $('tokens'); d.textContent = '';
+  if (!j.tokens.length) { d.textContent = 'none'; return; }
+  for (const t of j.tokens) {
+    d.append(el('div', t.symbol + ' (' + t.name + ') supply ' + t.supply));
+    for (const h of t.holders) d.append(el('div', '  ' + short(h.holder) + ': ' + h.balance));
+  }
+}
+
+$('next').onclick = () => { state.stack.push(state.cursor); state.cursor = state.next; loadRows(); };
+$('prev').onclick = () => { state.cursor = state.stack.pop() || null; loadRows(); };
+$('order').onchange = $('limit').onchange = () => { state.stack = []; state.cursor = null; loadRows(); };
+
+async function refreshAll(ev) {
+  await loadOverview();
+  if (ev && ev.tables.includes(state.table)) {
+    const li = [...$('tables').children].find(l => l.dataset.name === state.table);
+    if (li) { li.classList.add('flash'); setTimeout(() => li.classList.remove('flash'), 600); }
+    await loadRows();
+  }
+  if (!ev || ev.storage) await loadStorage();
+  if (!ev || ev.tokens) await loadTokens();
+}
+
+function connect() {
+  const es = new EventSource('/admin/events');
+  es.onopen = () => { $('status').textContent = 'live'; $('status').className = 'live'; };
+  es.onmessage = m => { const ev = JSON.parse(m.data); refreshAll(ev.tables.length || ev.storage || ev.tokens || ev.accounts ? ev : null).catch(e => $('msg').textContent = e.message); };
+  es.onerror = () => { $('status').textContent = 'reconnecting'; $('status').className = ''; };
+}
+refreshAll(null).then(connect).catch(e => { $('msg').textContent = e.message; });
+</script>
+</body>
+</html>

@@ -21,6 +21,9 @@ const T_CONFIG: &str = include_str!("../templates/cargo-config.toml");
 const T_LINK: &str = include_str!("../templates/link.ld");
 const T_TOOLCHAIN: &str = include_str!("../templates/rust-toolchain.toml");
 const T_MAIN: &str = include_str!("../templates/main.rs");
+const T_VSCODE: &str = include_str!("../templates/vscode-settings.json");
+const T_VSCODE_EXT: &str = include_str!("../templates/vscode-extensions.json");
+const T_RA: &str = include_str!("../templates/rust-analyzer.toml");
 const T_INDEX: &str = include_str!("../templates/index.html");
 const T_GITIGNORE: &str = "/target\n";
 
@@ -84,11 +87,14 @@ pub fn init(dir: &Path, name: &str, sdk: &SdkSource) -> Result<PathBuf, String> 
         t.replace("{{name}}", name)
             .replace("{{sdk}}", &sdk.dependency())
     };
-    let files: [(&str, String); 8] = [
+    let files: [(&str, String); 11] = [
         ("Cargo.toml", sub(T_CARGO)),
         (".cargo/config.toml", T_CONFIG.into()),
         ("link.ld", T_LINK.into()),
         ("rust-toolchain.toml", T_TOOLCHAIN.into()),
+        (".vscode/settings.json", T_VSCODE.into()),
+        (".vscode/extensions.json", T_VSCODE_EXT.into()),
+        ("rust-analyzer.toml", T_RA.into()),
         ("src/main.rs", sub(T_MAIN)),
         ("web/index.html", sub(T_INDEX)),
         (".gitignore", T_GITIGNORE.into()),
@@ -138,8 +144,8 @@ fn read_manifest(project: &Path) -> Result<String, String> {
     })
 }
 
-/// The index declarations of `[package.metadata.btb] indexes = [...]` (Table:index:kind@offset).
-pub fn project_indexes(project: &Path) -> Result<Vec<IndexSpec>, String> {
+/// The strings of `[package.metadata.btb] <key> = [...]`.
+fn metadata_list(project: &Path, key: &str) -> Result<Vec<String>, String> {
     let text = read_manifest(project)?;
     let (mut in_sec, mut in_list, mut out) = (false, false, Vec::new());
     for line in text.lines() {
@@ -148,19 +154,33 @@ pub fn project_indexes(project: &Path) -> Result<Vec<IndexSpec>, String> {
             in_sec = l == "[package.metadata.btb]";
             continue;
         }
-        if in_sec && l.starts_with("indexes") {
+        if in_sec && l.starts_with(key) && l[key.len()..].trim_start().starts_with('=') {
             in_list = true;
         }
         if in_list {
-            for part in l.split('"').skip(1).step_by(2) {
-                out.push(IndexSpec::parse(part)?);
-            }
+            out.extend(l.split('"').skip(1).step_by(2).map(String::from));
             if l.contains(']') {
                 in_list = false;
             }
         }
     }
     Ok(out)
+}
+
+/// The index declarations of `[package.metadata.btb] indexes = [...]` (Table:index:kind@offset).
+pub fn project_indexes(project: &Path) -> Result<Vec<IndexSpec>, String> {
+    metadata_list(project, "indexes")?
+        .iter()
+        .map(|s| IndexSpec::parse(s))
+        .collect()
+}
+
+/// The dashboard field hints of `[package.metadata.btb] fields = ["Table:addr,bool,string"]`.
+pub fn project_fields(project: &Path) -> Result<Vec<(String, Vec<String>)>, String> {
+    metadata_list(project, "fields")?
+        .iter()
+        .map(|s| btb_dev::parse_fields(s))
+        .collect()
 }
 
 /// A built and validated contract.
@@ -371,6 +391,7 @@ impl DevSession {
             Some(_) => return Err("--data needs a build with --features rocksdb".into()),
         };
         load_page(&server, &project);
+        server.set_fields(project_fields(&project)?);
         let server = Arc::new(server);
         let stop = Arc::new(AtomicBool::new(false));
         let reloads = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -390,6 +411,9 @@ impl DevSession {
                     Ok(b) => match s.reload(&b.elf) {
                         Ok(_) => {
                             load_page(&s, &project);
+                            if let Ok(f) = project_fields(&project) {
+                                s.set_fields(f);
+                            }
                             rl.fetch_add(1, Ordering::SeqCst);
                             eprintln!("btb: reloaded (state kept)");
                             print_entries(&b);
