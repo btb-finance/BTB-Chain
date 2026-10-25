@@ -23,8 +23,10 @@
 //!
 //! The whole sold amount is escrowed in the DEX vault when the order is placed (BTB in the
 //! vault's balance, tokens in the vault's token balance), so a vault balance always equals
-//! the sum of open escrows plus nothing else. Amounts are `u64` (the unit of the asset); all
-//! price math is exact integer math (`u128`, and a 256-bit intermediate for pro-rata shares).
+//! the sum of open escrows plus nothing else. Amounts are `u128` (the unit of the asset, like
+//! token balances; BTB balances are `u64`, so a BTB amount above that is simply more than anyone
+//! owns) and at most [`MAX_ORDER_AMOUNT`]; all price math is exact integer math with 256-bit
+//! intermediates (cross-multiplied prices, pro-rata shares, fills).
 //!
 //! # Clearing (every `dex_batch_blocks` blocks, at the end of the block)
 //!
@@ -89,6 +91,11 @@ pub const MAX_OPEN_ORDERS: usize = 64;
 pub const MAX_BATCHES: u32 = 1 << 20;
 /// Highest fee a genesis may set, in basis points.
 pub const MAX_FEE_BPS: u64 = 1_000;
+/// Largest `sell_amount` or `buy_amount` of one order, `2^100` (1.27e30 units, over a trillion
+/// whole tokens at 18 decimals). It keeps the per-pair sums of the clearing in `u128` for any
+/// book of fewer than `2^28` orders; larger sums are refused by [`clear`] (no trade) instead of
+/// wrapping.
+pub const MAX_ORDER_AMOUNT: u128 = 1 << 100;
 const BPS: u128 = 10_000;
 
 pub type OrderId = Hash;
@@ -158,8 +165,8 @@ pub enum DexOp {
     Place {
         sell: Asset,
         buy: Asset,
-        sell_amount: u64,
-        buy_amount: u64,
+        sell_amount: u128,
+        buy_amount: u128,
         batches: u32,
     },
     /// Cancel the sender's open order and refund its escrow.
@@ -197,8 +204,8 @@ impl DexOp {
             0 => DexOp::Place {
                 sell: Asset::get(r)?,
                 buy: Asset::get(r)?,
-                sell_amount: u64::decode_from(r)?,
-                buy_amount: u64::decode_from(r)?,
+                sell_amount: u128::decode_from(r)?,
+                buy_amount: u128::decode_from(r)?,
                 batches: u32::decode_from(r)?,
             },
             1 => DexOp::Cancel {
@@ -215,14 +222,15 @@ impl DexOp {
         }
     }
 
-    /// BTB the op takes from the sender's balance on top of the fee (the BTB escrow).
+    /// BTB the op takes from the sender's balance on top of the fee (the BTB escrow). An amount
+    /// above `u64::MAX` saturates: no balance covers it, so the transaction is refused.
     pub fn debit(&self) -> u64 {
         match self {
             DexOp::Place {
                 sell: Asset::Btb,
                 sell_amount,
                 ..
-            } => *sell_amount,
+            } => u64::try_from(*sell_amount).unwrap_or(u64::MAX),
             _ => 0,
         }
     }
@@ -232,6 +240,8 @@ impl DexOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DexError {
     ZeroAmount,
+    /// An amount above [`MAX_ORDER_AMOUNT`].
+    AmountTooLarge,
     /// Selling an asset for itself.
     SameAsset,
     /// `batches` is 0 or above [`MAX_BATCHES`].
@@ -289,13 +299,13 @@ pub struct Order {
     pub quote: Asset,
     pub side: Side,
     /// Base units still to trade.
-    pub base_rem: u64,
+    pub base_rem: u128,
     /// Escrow left: base for an ask, quote for a bid.
-    pub escrow: u64,
+    pub escrow: u128,
     /// Limit price `n / d`, quote per base. A bid's limit is tightened to `escrow / base_rem`
     /// after a partial fill so that its escrow can never be overdrawn by rounding.
-    pub n: u64,
-    pub d: u64,
+    pub n: u128,
+    pub d: u128,
     pub batches_left: u32,
     pub placed: u64,
     /// Gross base traded and quote traded so far (for the result record).
@@ -338,10 +348,10 @@ impl Order {
             side,
             base: Asset::get(&mut r)?,
             quote: Asset::get(&mut r)?,
-            base_rem: u64::decode_from(&mut r)?,
-            escrow: u64::decode_from(&mut r)?,
-            n: u64::decode_from(&mut r)?,
-            d: u64::decode_from(&mut r)?,
+            base_rem: u128::decode_from(&mut r)?,
+            escrow: u128::decode_from(&mut r)?,
+            n: u128::decode_from(&mut r)?,
+            d: u128::decode_from(&mut r)?,
             batches_left: u32::decode_from(&mut r)?,
             placed: u64::decode_from(&mut r)?,
             filled: u128::decode_from(&mut r)?,
@@ -378,8 +388,8 @@ pub struct OrderResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clearing {
     pub height: u64,
-    pub n: u64,
-    pub d: u64,
+    pub n: u128,
+    pub d: u128,
     pub base_volume: u128,
     pub quote_volume: u128,
     pub orders: u32,
@@ -413,8 +423,16 @@ fn mul_wide(a: u128, b: u128) -> (u128, u128) {
     (hi, lo)
 }
 
+/// `(floor(a * b / c), a * b mod c)` with a 256-bit intermediate, or `None` if the quotient
+/// does not fit in 128 bits. Panics on `c == 0`.
+pub fn mul_div_checked(a: u128, b: u128, c: u128) -> Option<(u128, u128)> {
+    assert!(c != 0, "division by zero");
+    let (hi, _) = mul_wide(a, b);
+    (hi < c).then(|| mul_div(a, b, c))
+}
+
 /// `(floor(a * b / c), a * b mod c)` with a 256-bit intermediate. The quotient must fit in
-/// 128 bits (callers use `b <= c`). Panics on `c == 0`.
+/// 128 bits (callers use `b <= c`; otherwise see [`mul_div_checked`]). Panics on `c == 0`.
 pub fn mul_div(a: u128, b: u128, c: u128) -> (u128, u128) {
     assert!(c != 0, "division by zero");
     if let Some(p) = a.checked_mul(b) {
@@ -439,15 +457,16 @@ pub fn mul_div(a: u128, b: u128, c: u128) -> (u128, u128) {
     (q, rem)
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
+fn gcd(mut a: u128, mut b: u128) -> u128 {
     while b != 0 {
         (a, b) = (b, a % b);
     }
     a
 }
 
-fn cmp_price(a: (u64, u64), b: (u64, u64)) -> Ordering {
-    (a.0 as u128 * b.1 as u128).cmp(&(b.0 as u128 * a.1 as u128))
+/// Compare the prices `a.0 / a.1` and `b.0 / b.1` exactly (cross-multiplied in 256 bits).
+pub fn cmp_price(a: (u128, u128), b: (u128, u128)) -> Ordering {
+    mul_wide(a.0, b.1).cmp(&mul_wide(b.0, a.1))
 }
 
 // ------------------------------------------------------------------ the clearing function
@@ -456,24 +475,25 @@ fn cmp_price(a: (u64, u64), b: (u64, u64)) -> Ordering {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lim {
     pub id: OrderId,
-    pub base: u64,
-    pub n: u64,
-    pub d: u64,
+    pub base: u128,
+    pub n: u128,
+    pub d: u128,
 }
 
 /// The outcome of one pair's batch. Fills are sorted by order id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cleared {
-    pub n: u64,
-    pub d: u64,
+    pub n: u128,
+    pub d: u128,
     pub volume: u128,
-    pub ask_fills: Vec<(OrderId, u64)>,
-    pub bid_fills: Vec<(OrderId, u64)>,
+    pub ask_fills: Vec<(OrderId, u128)>,
+    pub bid_fills: Vec<(OrderId, u128)>,
 }
 
-/// Split `v <= sum(base)` over `items` pro rata (largest remainder, ties by lowest id).
-fn ration(items: &[Lim], v: u128) -> Vec<u64> {
-    let total: u128 = items.iter().map(|l| u128::from(l.base)).sum();
+/// Split `v <= sum(base)` over `items` pro rata (largest remainder, ties by lowest id). The sum
+/// of the bases must fit in `u128` (`clear` checks it).
+fn ration(items: &[Lim], v: u128) -> Vec<u128> {
+    let total: u128 = items.iter().map(|l| l.base).sum();
     if v >= total {
         return items.iter().map(|l| l.base).collect();
     }
@@ -481,9 +501,9 @@ fn ration(items: &[Lim], v: u128) -> Vec<u64> {
     let mut rems = Vec::with_capacity(items.len());
     let mut given = 0u128;
     for (i, l) in items.iter().enumerate() {
-        let (q, r) = mul_div(u128::from(l.base), v, total);
+        let (q, r) = mul_div(l.base, v, total);
         given += q;
-        fills.push(q as u64);
+        fills.push(q);
         rems.push((std::cmp::Reverse(r), l.id, i));
     }
     rems.sort();
@@ -494,7 +514,9 @@ fn ration(items: &[Lim], v: u128) -> Vec<u64> {
 }
 
 /// Clear one pair. The result depends only on the *set* of orders (the inputs are sorted by
-/// price and id inside), never on their order in the slices.
+/// price and id inside), never on their order in the slices. `None` if nothing trades, or if
+/// the bases of one side sum past `u128` (not reachable below `2^28` orders, see
+/// [`MAX_ORDER_AMOUNT`]).
 pub fn clear(asks: &[Lim], bids: &[Lim]) -> Option<Cleared> {
     let key = |l: &Lim| ((l.n, l.d), l.id);
     let sorted = |v: &[Lim]| {
@@ -510,18 +532,18 @@ pub fn clear(asks: &[Lim], bids: &[Lim]) -> Option<Cleared> {
     // prefix[i] = base of a[..i]; suffix[i] = base of b[i..]
     let mut prefix = vec![0u128];
     for l in &a {
-        prefix.push(prefix.last().unwrap() + u128::from(l.base));
+        prefix.push(prefix.last().unwrap().checked_add(l.base)?);
     }
     let mut suffix = vec![0u128; b.len() + 1];
     for i in (0..b.len()).rev() {
-        suffix[i] = suffix[i + 1] + u128::from(b[i].base);
+        suffix[i] = suffix[i + 1].checked_add(b[i].base)?;
     }
-    let mut cands: Vec<(u64, u64)> = a.iter().chain(b.iter()).map(|l| (l.n, l.d)).collect();
+    let mut cands: Vec<(u128, u128)> = a.iter().chain(b.iter()).map(|l| (l.n, l.d)).collect();
     cands.sort_by(|x, y| cmp_price(*x, *y));
     cands.dedup_by(|x, y| cmp_price(*x, *y) == Ordering::Equal);
 
     // (price, volume, imbalance, eligible asks, first eligible bid)
-    type Best = ((u64, u64), u128, u128, usize, usize);
+    type Best = ((u128, u128), u128, u128, usize, usize);
     let mut best: Option<Best> = None;
     for &p in &cands {
         let ia = a.partition_point(|x| cmp_price((x.n, x.d), p) != Ordering::Greater);
@@ -701,7 +723,7 @@ fn close(
         Side::Ask => &o.base,
         Side::Bid => &o.quote,
     };
-    transfer(kv, sold, &dex_vault(), &o.owner, u128::from(o.escrow))?;
+    transfer(kv, sold, &dex_vault(), &o.owner, o.escrow)?;
     kv.delete(&order_key(&o.pair(), &o.id))?;
     kv.delete(&k2(TAG_OWNER, &o.owner, &o.id))?;
     let res = OrderResult {
@@ -739,6 +761,9 @@ pub(crate) fn apply(
         } => {
             if *sell_amount == 0 || *buy_amount == 0 {
                 return Err(DexError::ZeroAmount.into());
+            }
+            if *sell_amount > MAX_ORDER_AMOUNT || *buy_amount > MAX_ORDER_AMOUNT {
+                return Err(DexError::AmountTooLarge.into());
             }
             if sell == buy {
                 return Err(DexError::SameAsset.into());
@@ -794,11 +819,11 @@ pub(crate) fn apply(
                     }
                 }
             }
-            if balance_of(kv, sell, sender)? < u128::from(*sell_amount) {
+            if balance_of(kv, sell, sender)? < *sell_amount {
                 return Err(DexError::InsufficientBalance.into());
             }
             // Checked: write.
-            transfer(kv, sell, sender, &dex_vault(), u128::from(*sell_amount))?;
+            transfer(kv, sell, sender, &dex_vault(), *sell_amount)?;
             let id = order_id(sender, nonce);
             let o = Order {
                 id,
@@ -908,7 +933,7 @@ fn clear_pair(
     let (base, quote) = (orders[0].base, orders[0].quote);
     let vault = dex_vault();
     if let Some(c) = clear(&asks, &bids) {
-        let fills: BTreeMap<OrderId, u64> = c
+        let fills: BTreeMap<OrderId, u128> = c
             .ask_fills
             .iter()
             .chain(c.bid_fills.iter())
@@ -923,10 +948,10 @@ fn clear_pair(
                 continue;
             }
             count += 1;
-            let fv = u128::from(f);
-            let value = fv * u128::from(c.n);
-            let (floor, rem) = (value / u128::from(c.d), value % u128::from(c.d));
-            o.filled += fv;
+            let overflow = || StateError("dex: amount overflow".into());
+            let (floor, rem) = mul_div_checked(f, c.n, c.d).ok_or_else(overflow)?;
+            // The result record is statistics: saturate rather than stop the chain.
+            o.filled = o.filled.saturating_add(f);
             o.base_rem -= f;
             match o.side {
                 Side::Ask => {
@@ -934,25 +959,24 @@ fn clear_pair(
                     let fee = mul_div(floor, u128::from(cfg.dex_fee_bps), BPS).0;
                     let net = floor - fee;
                     o.escrow -= f;
-                    o.quote_traded += floor;
-                    quote_out += net;
-                    base_out += fv;
+                    o.quote_traded = o.quote_traded.saturating_add(floor);
+                    quote_out = quote_out.checked_add(net).ok_or_else(overflow)?;
+                    base_out = base_out.checked_add(f).ok_or_else(overflow)?;
                     transfer(kv, &quote, &vault, &o.owner, net)?;
                 }
                 Side::Bid => {
                     // Pays ceil(f n / d) quote and receives f base less the fee.
-                    let pay = floor + u128::from(rem != 0);
-                    let pay64 = u64::try_from(pay)
-                        .ok()
+                    let pay = floor
+                        .checked_add(u128::from(rem != 0))
                         .filter(|p| *p <= o.escrow)
                         .ok_or_else(|| StateError("dex: bid pays more than its escrow".into()))?;
-                    o.escrow -= pay64;
-                    o.quote_traded += pay;
-                    quote_paid += pay;
-                    let fee = mul_div(fv, u128::from(cfg.dex_fee_bps), BPS).0;
-                    transfer(kv, &base, &vault, &o.owner, fv - fee)?;
+                    o.escrow -= pay;
+                    o.quote_traded = o.quote_traded.saturating_add(pay);
+                    quote_paid = quote_paid.checked_add(pay).ok_or_else(overflow)?;
+                    let fee = mul_div(f, u128::from(cfg.dex_fee_bps), BPS).0;
+                    transfer(kv, &base, &vault, &o.owner, f - fee)?;
                     base_fee += fee;
-                    base_in += fv;
+                    base_in = base_in.checked_add(f).ok_or_else(overflow)?;
                 }
             }
             if o.side == Side::Bid && o.base_rem > 0 && o.escrow > 0 {
@@ -1014,8 +1038,8 @@ fn decode_clearing(height: u64, b: &[u8]) -> Result<Clearing, DecodeError> {
     let mut r = Reader::new(b, 128);
     Ok(Clearing {
         height,
-        n: u64::decode_from(&mut r)?,
-        d: u64::decode_from(&mut r)?,
+        n: u128::decode_from(&mut r)?,
+        d: u128::decode_from(&mut r)?,
         base_volume: u128::decode_from(&mut r)?,
         quote_volume: u128::decode_from(&mut r)?,
         orders: u32::decode_from(&mut r)?,
@@ -1232,28 +1256,54 @@ mod tests {
         h
     }
 
-    fn le(p: (u64, u64), q: (u64, u64)) -> bool {
-        cmp_price(p, q) != Ordering::Greater
+    /// `p <= q` by the schoolbook 256-bit product, independent of `mul_wide`.
+    fn le(p: (u128, u128), q: (u128, u128)) -> bool {
+        ref_cmp(p, q) != Ordering::Greater
+    }
+
+    fn ref_cmp(p: (u128, u128), q: (u128, u128)) -> Ordering {
+        mul256(p.0, q.1)
+            .iter()
+            .rev()
+            .cmp(mul256(q.0, p.1).iter().rev())
+    }
+
+    #[test]
+    fn cmp_price_is_exact_on_wide_values() {
+        let mut r = Rng(99);
+        let wide = |r: &mut Rng| (((r.next() as u128) << 64) | r.next() as u128) >> r.below(120);
+        for _ in 0..5_000 {
+            let (p, q) = (
+                (wide(&mut r), wide(&mut r).max(1)),
+                (wide(&mut r), wide(&mut r).max(1)),
+            );
+            assert_eq!(cmp_price(p, q), ref_cmp(p, q));
+            assert_eq!(cmp_price(p, p), Ordering::Equal);
+        }
+        // 2^127/3 against 2^127/3 + epsilon: a 128-bit product would wrap.
+        let big = 1u128 << 127;
+        assert_eq!(cmp_price((big, 3), (big + 1, 3)), Ordering::Less);
+        assert_eq!(cmp_price((big, 1), (big - 1, 1)), Ordering::Greater);
     }
 
     /// Obvious reference: for each candidate price recompute S and D from scratch.
-    fn reference(asks: &[Lim], bids: &[Lim]) -> Option<((u64, u64), u128, u128)> {
-        let mut cands: Vec<(u64, u64)> = asks.iter().chain(bids).map(|l| (l.n, l.d)).collect();
-        cands.sort_by(|a, b| cmp_price(*a, *b));
-        let vol_at = |p: (u64, u64)| {
+    fn reference(asks: &[Lim], bids: &[Lim]) -> Option<((u128, u128), u128, u128)> {
+        let mut cands: Vec<(u128, u128)> = asks.iter().chain(bids).map(|l| (l.n, l.d)).collect();
+        cands.sort_by(|a, b| ref_cmp(*a, *b));
+        let vol_at = |p: (u128, u128)| {
             let s: u128 = asks
                 .iter()
                 .filter(|l| le((l.n, l.d), p))
-                .map(|l| u128::from(l.base))
+                .map(|l| l.base)
                 .sum();
             let d: u128 = bids
                 .iter()
                 .filter(|l| le(p, (l.n, l.d)))
-                .map(|l| u128::from(l.base))
+                .map(|l| l.base)
                 .sum();
             (s.min(d), s.abs_diff(d))
         };
-        let mut best: Option<((u64, u64), u128, u128)> = None;
+        let mut best: Option<((u128, u128), u128, u128)> = None;
         for p in cands {
             let (v, imb) = vol_at(p);
             if v == 0 {
@@ -1271,14 +1321,27 @@ mod tests {
     }
 
     fn random_book(r: &mut Rng, n: usize) -> (Vec<Lim>, Vec<Lim>) {
+        random_book_scaled(r, n, 0)
+    }
+
+    /// Like `random_book`, but every amount and price term is shifted left by a random
+    /// 0..=`max_shift` bits, so books reach 2^100 and need the full 256-bit comparisons.
+    fn random_book_scaled(r: &mut Rng, n: usize, max_shift: u64) -> (Vec<Lim>, Vec<Lim>) {
         let (mut asks, mut bids) = (vec![], vec![]);
         for i in 0..n {
-            let d = 1 + r.below(6);
+            let shift = |r: &mut Rng| {
+                if max_shift == 0 {
+                    0
+                } else {
+                    r.below(max_shift + 1)
+                }
+            };
+            let (sb, sn, sd) = (shift(r), shift(r), shift(r));
             let l = Lim {
                 id: id(i as u32),
-                base: 1 + r.below(50),
-                n: 1 + r.below(30),
-                d,
+                base: u128::from(1 + r.below(50)) << sb,
+                n: u128::from(1 + r.below(30)) << sn,
+                d: u128::from(1 + r.below(6)) << sd,
             };
             if r.below(2) == 0 {
                 asks.push(l)
@@ -1291,11 +1354,22 @@ mod tests {
 
     #[test]
     fn clearing_matches_bruteforce_on_random_books() {
-        let mut r = Rng(42);
+        bruteforce(42, 0);
+    }
+
+    /// Same, with amounts and prices up to 2^100 (256-bit cross products and shares).
+    #[test]
+    fn clearing_matches_bruteforce_on_wide_random_books() {
+        bruteforce(43, 94);
+        bruteforce(44, 40);
+    }
+
+    fn bruteforce(seed: u64, max_shift: u64) {
+        let mut r = Rng(seed);
         let mut traded = 0;
         for round in 0..3_000 {
             let n = 1 + r.below(14) as usize;
-            let (asks, bids) = random_book(&mut r, n);
+            let (asks, bids) = random_book_scaled(&mut r, n, max_shift);
             let want = reference(&asks, &bids);
             let got = clear(&asks, &bids);
             match (want, &got) {
@@ -1305,17 +1379,17 @@ mod tests {
                     assert_eq!(cmp_price((c.n, c.d), p), Ordering::Equal, "round {round}");
                     assert_eq!(c.volume, v, "round {round}");
                     // No *other* price (a fine rational grid, not just limit prices) has more volume.
-                    for num in 1..=120u64 {
+                    for num in 1..=120u128 {
                         let q = (num, 4);
                         let s: u128 = asks
                             .iter()
                             .filter(|l| le((l.n, l.d), q))
-                            .map(|l| u128::from(l.base))
+                            .map(|l| l.base)
                             .sum();
                         let d: u128 = bids
                             .iter()
                             .filter(|l| le(q, (l.n, l.d)))
-                            .map(|l| u128::from(l.base))
+                            .map(|l| l.base)
                             .sum();
                         assert!(
                             s.min(d) <= v,
@@ -1347,8 +1421,8 @@ mod tests {
                 })
                 .collect();
             assert_eq!(elig.len(), fills.len());
-            let total: u128 = elig.iter().map(|l| u128::from(l.base)).sum();
-            let sum: u128 = fills.iter().map(|f| u128::from(f.1)).sum();
+            let total: u128 = elig.iter().map(|l| l.base).sum();
+            let sum: u128 = fills.iter().map(|f| f.1).sum();
             assert_eq!(sum, c.volume);
             for (id, f) in fills {
                 let l = elig.iter().find(|l| l.id == *id).expect("eligible");
@@ -1357,7 +1431,7 @@ mod tests {
                     assert_eq!(*f, l.base, "short side fills fully");
                 } else {
                     // pro rata: floor or floor + 1 of base * V / L
-                    let q = mul_div(u128::from(l.base), c.volume, total).0 as u64;
+                    let q = mul_div(l.base, c.volume, total).0;
                     assert!(*f == q || *f == q + 1, "pro rata {f} vs {q}");
                 }
             }
@@ -1384,7 +1458,7 @@ mod tests {
 
     #[test]
     fn extreme_values_do_not_overflow() {
-        let m = u64::MAX;
+        let m = MAX_ORDER_AMOUNT;
         let a = [
             Lim {
                 id: id(1),
@@ -1414,11 +1488,8 @@ mod tests {
             },
         ];
         let c = clear(&a, &b).expect("trades");
-        assert!(c.volume <= 2 * u128::from(m));
-        assert_eq!(
-            c.ask_fills.iter().map(|f| u128::from(f.1)).sum::<u128>(),
-            c.volume
-        );
+        assert!(c.volume <= 2 * m);
+        assert_eq!(c.ask_fills.iter().map(|f| f.1).sum::<u128>(), c.volume);
         assert!(clear(&[], &b).is_none());
         assert!(clear(&a, &[]).is_none());
         // zero-sized or zero-price entries are ignored, never divide by zero
@@ -1432,5 +1503,32 @@ mod tests {
             &b
         )
         .is_none());
+    }
+
+    #[test]
+    fn sums_past_u128_are_refused_not_wrapped() {
+        let big = |i, base| Lim {
+            id: id(i),
+            base,
+            n: 1,
+            d: 1,
+        };
+        // Two bids that together want more than u128::MAX base: no clearing.
+        let bids = [big(1, u128::MAX), big(2, u128::MAX)];
+        assert!(clear(&[big(3, 10)], &bids).is_none());
+        // One of them alone is fine.
+        let c = clear(&[big(3, 10)], &bids[..1]).expect("trades");
+        assert_eq!(c.volume, 10);
+    }
+
+    #[test]
+    fn mul_div_checked_reports_quotient_overflow() {
+        assert_eq!(mul_div_checked(u128::MAX, 2, 2), Some((u128::MAX, 0)));
+        assert_eq!(mul_div_checked(u128::MAX, 2, 1), None);
+        assert_eq!(mul_div_checked(1 << 100, 1 << 100, 1 << 70), None);
+        assert_eq!(
+            mul_div_checked(1 << 100, 1 << 100, 1 << 73),
+            Some((1 << 127, 0))
+        );
     }
 }

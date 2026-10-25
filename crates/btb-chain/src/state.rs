@@ -12,7 +12,7 @@
 //! | `0x25` meta | `25 01` / `25 02` | config / head `(height, hash, timestamp)` |
 //! | `0x32` site file | `32 C path` | `SHA-256(content) \|\| content` (`site.rs`) |
 //!
-//! Payment channels add `0x30`/`0x31` (see `channel.rs`), the DEX `0x34`..`0x38` (see `dex.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
+//! Storage nodes add `0x40`..`0x47` (see `storage.rs`). Payment channels add `0x30`/`0x31` (see `channel.rs`), the DEX `0x34`..`0x38` (see `dex.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
 //! entries (accounts, contracts, the fee pools and the slash vault share them); storage
 //! deposits are its `0x09` entries; bonded stake is `0x26` and unbonding stake `0x27`.
 
@@ -88,6 +88,8 @@ pub struct ChainConfig {
     pub dex_batch_blocks: u64,
     /// Clearing fee in basis points of what each side receives (see `dex.rs`).
     pub dex_fee_bps: u64,
+    /// Storage nodes: challenge periods, prices, deposits (`storage.rs`).
+    pub storage: crate::storage::StorageConfig,
 }
 
 impl ChainConfig {
@@ -106,6 +108,7 @@ impl ChainConfig {
             staking: StakingConfig::default(),
             dex_batch_blocks: 1,
             dex_fee_bps: 10,
+            storage: crate::storage::StorageConfig::default(),
         }
     }
 
@@ -134,6 +137,7 @@ impl ChainConfig {
         if self.dex_fee_bps > crate::dex::MAX_FEE_BPS {
             return Err("dex_fee_bps above the maximum".into());
         }
+        self.storage.validate()?;
         Ok(())
     }
 
@@ -154,6 +158,7 @@ impl ChainConfig {
         .into_iter()
         .chain(self.staking.fields())
         .chain([self.dex_batch_blocks, self.dex_fee_bps])
+        .chain(self.storage.fields())
         {
             v.encode_to(&mut o);
         }
@@ -177,6 +182,15 @@ impl ChainConfig {
             staking: StakingConfig::from_fields([n()?, n()?, n()?, n()?, n()?, n()?]),
             dex_batch_blocks: n()?,
             dex_fee_bps: n()?,
+            storage: crate::storage::StorageConfig::from_fields([
+                n()?,
+                n()?,
+                n()?,
+                n()?,
+                n()?,
+                n()?,
+                n()?,
+            ]),
         };
         Ok(cfg)
     }
@@ -230,6 +244,15 @@ impl GenesisConfig {
 
     /// `hash()`, also committing to the genesis validators (identical when there are none).
     pub fn hash_with_validators(&self, validators: &[GenesisValidator]) -> Hash {
+        self.hash_full(validators, None)
+    }
+
+    /// `hash_with_validators`, also committing to the oracle config (identical when `None`).
+    pub fn hash_full(
+        &self,
+        validators: &[GenesisValidator],
+        oracle: Option<&crate::oracle::OracleGenesis>,
+    ) -> Hash {
         let mut allocs = self.allocations.clone();
         allocs.sort();
         let mut b = self.config.encode();
@@ -245,6 +268,10 @@ impl GenesisConfig {
             b.extend_from_slice(&v.consensus_key);
             v.network_addr.encode_to(&mut b);
             v.stake.encode_to(&mut b);
+        }
+        if let Some(o) = oracle {
+            b.extend_from_slice(b"btb.oracle.genesis.v1");
+            o.encode_to(&mut b);
         }
         sha256(&[b"btb.genesis.v1", &b])
     }
@@ -364,7 +391,9 @@ pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
         + sum_tag(kv, layout::TAG_DEPOSIT)?
         + sum_tag(kv, staking::TAG_STAKE)?
         + sum_tag(kv, staking::TAG_UNBOND)?
-        + sum_tag(kv, crate::channel::TAG_LOCKED)?)
+        + sum_tag(kv, crate::channel::TAG_LOCKED)?
+        + sum_tag(kv, crate::storage::TAG_NODE_DEPOSIT)?
+        + sum_tag(kv, crate::storage::TAG_ESCROW)?)
 }
 
 /// Register a manifest's indexes into `tables` for `contract`.
@@ -425,9 +454,21 @@ impl<S: KvStore> ChainState<S> {
     /// operator's allocation (the allocations still sum to `TOTAL_SUPPLY`). The genesis hash
     /// commits to the validators.
     pub fn from_genesis_with_validators(
+        kv: S,
+        genesis: &GenesisConfig,
+        validators: &[GenesisValidator],
+    ) -> Result<Self, GenesisError> {
+        Self::from_genesis_full(kv, genesis, validators, None)
+    }
+
+    /// `from_genesis_with_validators` plus the oracle config (beacon key holders and price
+    /// feeds, `crate::oracle`). The genesis hash commits to it. With an oracle config every
+    /// block must carry a valid beacon.
+    pub fn from_genesis_full(
         mut kv: S,
         genesis: &GenesisConfig,
         validators: &[GenesisValidator],
+        oracle: Option<&crate::oracle::OracleGenesis>,
     ) -> Result<Self, GenesisError> {
         genesis.config.validate().map_err(GenesisError::Config)?;
         let mut sum = 0u128;
@@ -465,7 +506,7 @@ impl<S: KvStore> ChainState<S> {
                 ));
             }
         }
-        let genesis_hash = genesis.hash_with_validators(validators);
+        let genesis_hash = genesis.hash_full(validators, oracle);
         staking::genesis_ops(
             &genesis.config.staking,
             validators,
@@ -473,6 +514,9 @@ impl<S: KvStore> ChainState<S> {
             &mut batch,
         )
         .map_err(GenesisError::Config)?;
+        if let Some(og) = oracle {
+            crate::oracle::genesis_ops(og, &mut batch).map_err(GenesisError::Config)?;
+        }
         batch.put(meta_config_key(), genesis.config.encode());
         let head = Head {
             height: 0,

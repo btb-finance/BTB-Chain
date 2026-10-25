@@ -38,7 +38,7 @@ pub mod num {
 /// Raw `ecall`: call number in a7, arguments in a0..a4, result in a0.
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
-fn ecall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+pub(crate) fn ecall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let ret: u64;
     // SAFETY: the VM defines `ecall` as a host call that only touches a0 and guest memory the
     // caller passed in.
@@ -57,7 +57,7 @@ fn ecall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn ecall(n: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+pub(crate) fn ecall(n: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
     panic!("btb host call {n} is only available when running inside the BTB VM (riscv64)");
 }
 

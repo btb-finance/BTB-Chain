@@ -8,6 +8,7 @@
 //! `timestamp` (Unix milliseconds) is chosen by the proposer. Execution checks only that it is
 //! not earlier than the parent's; contracts never see it, and crons run by block height.
 
+use crate::oracle::OracleInput;
 use crate::sha256;
 use crate::tx::{Hash, Transaction, TxError};
 use btb_codec::{Decode, DecodeError, Encode, Reader};
@@ -42,6 +43,11 @@ impl Header {
 pub struct Block {
     pub header: Header,
     pub txs: Vec<Transaction>,
+    /// The beacon for this height and the validators' price observations (`crate::oracle`).
+    /// Empty on a chain without an oracle config. Not part of the header hash: the beacon is
+    /// the unique group signature on `(chain, epoch, height)` and the observations are covered
+    /// by the consensus block id of the payload they came in.
+    pub oracle: OracleInput,
 }
 
 pub fn tx_root(txs: &[Transaction]) -> Hash {
@@ -69,7 +75,14 @@ impl Block {
                 tx_root: tx_root(&txs),
             },
             txs,
+            oracle: OracleInput::default(),
         }
+    }
+
+    /// The same block with oracle input attached.
+    pub fn with_oracle(mut self, oracle: OracleInput) -> Self {
+        self.oracle = oracle;
+        self
     }
 
     pub fn hash(&self) -> Hash {
@@ -88,6 +101,11 @@ impl Block {
         h.tx_root.encode_to(&mut o);
         let txs: Vec<Vec<u8>> = self.txs.iter().map(Transaction::encode).collect();
         txs.encode_to(&mut o);
+        // Optional trailing section: absent (not even a length) when there is no oracle input,
+        // so blocks of chains without oracles encode exactly as before.
+        if !self.oracle.is_empty() {
+            self.oracle.encode_to(&mut o);
+        }
         o
     }
 
@@ -101,6 +119,11 @@ impl Block {
             tx_root: <[u8; 32]>::decode_from(&mut r)?,
         };
         let raw: Vec<Vec<u8>> = Vec::decode_from(&mut r)?;
+        let oracle = if r.remaining() == 0 {
+            OracleInput::default()
+        } else {
+            OracleInput::decode_from(&mut r)?
+        };
         if r.remaining() != 0 {
             return Err(DecodeError::TrailingBytes.into());
         }
@@ -108,6 +131,10 @@ impl Block {
             .iter()
             .map(|b| Transaction::decode(b))
             .collect::<Result<_, _>>()?;
-        Ok(Block { header, txs })
+        Ok(Block {
+            header,
+            txs,
+            oracle,
+        })
     }
 }

@@ -3,6 +3,7 @@
 //! Everything is a plain function here so tests can drive it; `main.rs` only parses arguments.
 
 pub mod chain;
+pub mod storage;
 
 use btb_dev::{IndexSpec, Server};
 use btb_vm::{Contract, EntryPoint};

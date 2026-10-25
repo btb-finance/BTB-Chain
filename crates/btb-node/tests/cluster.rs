@@ -167,6 +167,8 @@ impl Cluster {
             gas_price: 1,
             epoch_len,
             min_stake: 100 * UNITS_PER_BTB,
+            storage: Default::default(),
+            oracle: None,
             validators: keys
                 .iter()
                 .map(|k| (k.verifying_key().to_bytes(), 100 * UNITS_PER_BTB))
@@ -740,8 +742,11 @@ fn garbage_flooding_equivocating_validator_does_not_stop_progress() {
         t.elapsed().as_millis()
     );
     c.assert_same_state();
+    // The receipt came from one node; the others may still be a block behind.
     for i in 0..3 {
-        assert_eq!(c.balance(i, &bob), total);
+        c.wait_until("bob's full balance on every honest node", 30, || {
+            c.balance(i, &bob) == total
+        });
     }
     let malformed: u64 = (0..3)
         .map(|i| c.status(i)["net"]["dropped_malformed"].as_u64().unwrap())

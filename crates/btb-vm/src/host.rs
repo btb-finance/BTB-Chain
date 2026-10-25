@@ -92,6 +92,27 @@ pub mod abi {
     /// address that owns its token balances and is matched against a token's mint authority).
     pub const CONTRACT_ADDRESS: u64 = 23;
 
+    /// Oracle host calls use their own number range (40..=49) so they never collide with other
+    /// modules' additions.
+    ///
+    /// `random_bytes(out_ptr, len) -> 0`. Writes `len` (at most `MAX_RANDOM_BYTES`) bytes derived
+    /// from the chain's randomness beacon, the transaction id and a per-transaction call
+    /// counter (see `docs/ORACLES.md`). Only allowed in a mutation or cron entry point marked
+    /// `randomness`: anywhere else (queries, actions, unmarked functions) it traps with
+    /// `Trap::RandomnessForbidden`; on a chain without a beacon it traps with
+    /// `Trap::RandomnessUnavailable`. Gas `HOST_RANDOM_BYTES + RANDOM_BYTE * len`, charged first.
+    pub const RANDOM_BYTES: u64 = 40;
+    /// `price(pair_id, out_ptr) -> 0 ok | NOT_FOUND`. Read-only; allowed in queries, mutations
+    /// and crons. On success writes 32 bytes to `out_ptr`: `price: u128 LE`, `height: u64 LE`
+    /// (the block that last updated the price), `decimals: u8`, 7 zero bytes. `NOT_FOUND` if the
+    /// pair is not configured or has no price yet. In mutations and crons the call costs
+    /// `HOST_PRICE_MUTATION` gas (a read plus a per-read fee that goes to the validators); in
+    /// queries `HOST_PRICE_QUERY`, and queries are not billed.
+    pub const PRICE: u64 = 41;
+
+    /// Largest `len` accepted by `random_bytes`.
+    pub const MAX_RANDOM_BYTES: u64 = 1024;
+
     /// Largest `limit` honoured by `token_holders`.
     pub const MAX_TOKEN_HOLDERS_LIMIT: u32 = crate::token::MAX_HOLDERS_LIMIT;
 
@@ -236,6 +257,15 @@ pub fn parse_index_scan(req: &[u8]) -> Option<IndexScan> {
     })
 }
 
+/// The agreed price of a pair, as `price` returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceRecord {
+    pub price: u128,
+    /// Block height of the update.
+    pub height: u64,
+    pub decimals: u8,
+}
+
 /// What the embedder (node runtime) provides to a running contract.
 pub trait Host {
     /// True for queries: state-changing calls then trap with `Trap::WriteInQuery`.
@@ -271,6 +301,17 @@ pub trait Host {
     /// The user-token ledger (`token_*` calls other than native BTB). `None`: unsupported, the
     /// calls then return `abi::TOKEN_UNSUPPORTED` (`NOT_FOUND` for the info and holder reads).
     fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
+        None
+    }
+    /// `len` pseudo-random bytes for the next `random_bytes` call of this execution, derived from
+    /// the beacon; `None` if the host has no beacon. The VM has already checked that the entry
+    /// point is allowed to ask. Must be deterministic: same beacon, same transaction, same call
+    /// index, same bytes.
+    fn random_bytes(&mut self, _len: usize) -> Option<Vec<u8>> {
+        None
+    }
+    /// The agreed price of `pair`, if any.
+    fn price(&mut self, _pair: u32) -> Option<PriceRecord> {
         None
     }
 }
@@ -590,6 +631,43 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                 vm.charge_gas(gas::HOST_TOKEN_BURN)?;
                 let (id, amount) = (token_id(vm, a0)?, amount(vm, a1)?);
                 status(host.tokens().map(|t| token::burn(t, &id, amount)))
+            }
+            abi::RANDOM_BYTES => {
+                vm.charge_gas(cost(gas::HOST_RANDOM_BYTES, gas::RANDOM_BYTE, a1))?;
+                if !vm.randomness_allowed() || host.read_only() {
+                    return Err(Trap::RandomnessForbidden);
+                }
+                if a1 > abi::MAX_RANDOM_BYTES {
+                    return Err(Trap::Abort("random_bytes: len above the maximum".into()));
+                }
+                // Validate the output window before doing anything.
+                buf(vm, a0, a1)?;
+                let bytes = host.random_bytes(a1 as usize);
+                match bytes {
+                    Some(b) if b.len() as u64 == a1 => vm.write_mem(a0, &b)?,
+                    _ => return Err(Trap::RandomnessUnavailable),
+                }
+                0
+            }
+            abi::PRICE => {
+                vm.charge_gas(if host.read_only() {
+                    gas::HOST_PRICE_QUERY
+                } else {
+                    gas::HOST_PRICE_MUTATION
+                })?;
+                // Validate the output window before doing anything.
+                buf(vm, a1, 32)?;
+                match u32::try_from(a0).ok().and_then(|pair| host.price(pair)) {
+                    None => abi::NOT_FOUND,
+                    Some(p) => {
+                        let mut out = [0u8; 32];
+                        out[..16].copy_from_slice(&p.price.to_le_bytes());
+                        out[16..24].copy_from_slice(&p.height.to_le_bytes());
+                        out[24] = p.decimals;
+                        vm.write_mem(a1, &out)?;
+                        0
+                    }
+                }
             }
             abi::RETURN_DATA => {
                 vm.charge_gas(cost(gas::HOST_RETURN_DATA, gas::RETURN_BYTE, a1))?;

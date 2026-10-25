@@ -11,10 +11,12 @@ pub mod channel;
 pub mod dex;
 pub mod exec;
 pub mod mempool;
+pub mod oracle;
 pub(crate) mod parallel;
 pub mod site;
 pub mod staking;
 pub mod state;
+pub mod storage;
 pub mod tx;
 
 pub use block::{Block, Header};
@@ -22,12 +24,14 @@ pub use channel::{channel_id, Channel, ChannelError, ChannelOp};
 pub use dex::{dex_fees, dex_vault, Asset, DexError, DexOp};
 pub use exec::{BlockError, ExecMode, Executor, Invalid, Origin, Receipt, Revert, Status};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
+pub use oracle::{OracleGenesis, OracleInput, PairConfig};
 pub use parallel::ParStats;
 pub use staking::{
     ActiveValidator, EpochRecord, GenesisValidator, SlashOutcome, StakeError, StakingConfig,
     ValidatorInfo,
 };
 pub use state::{ChainConfig, ChainState, GenesisConfig, GenesisError, Head};
+pub use storage::{StorageConfig, StorageError, StorageOp};
 pub use tx::{
     account_address, contract_address, Address, Hash, Manifest, SigningKey, Transaction, TxBody,
     TxError, TxKind,

@@ -53,7 +53,7 @@ On BTB, **the chain is the backend**:
 - **Free, instant queries and live updates.** Hosting nodes answer reads and push changes to your UI. No RPC subscription.
 - **Cron jobs on-chain.** Contracts schedule their own work. No backend servers.
 - **Frontends hosted on-chain.** Deploy your website with your contracts. No AWS.
-- **Oracles built in.** Random numbers, live prices and web data come straight from BTB's validators, which already run servers and reach agreement. No separate oracle network and no oracle fees per request. ([Oracles](docs/ORACLES.md))
+- **Oracles built in.** Random numbers, live prices and web data come straight from BTB's validators, which already run servers and reach agreement. No separate oracle network to run or pay: reading a price in a query is free, and a contract that reads one inside a mutation pays a small per-read fee to the validators that reported it. ([Oracles](docs/ORACLES.md))
 
 One command deploys everything:
 
@@ -68,7 +68,7 @@ Write contracts in **Rust**, or any language that compiles to RISC-V. Apps follo
 
 ### Anyone can host, anyone can earn
 
-Every action on BTB costs a tiny amount of BTB that goes to whoever did the work: a bot reading a price pays the validators that reported it, a page view pays the node that served it, a stored file pays the nodes holding it.
+Every action on BTB costs a tiny amount of BTB that goes to whoever did the work: a bot reading a price inside a transaction pays the validators that reported it (a plain query read is free), a page view pays the node that served it, a stored file pays the nodes holding it.
 
 Big files are never copied to every machine. A 100 GB NFT artwork is split into 100 small pieces stored on 100 different nodes, and any 34 pieces can rebuild it. So **anyone can host a small part of the network, even from a phone, and earn from it**. ([Scaling and earning](docs/SCALING.md))
 

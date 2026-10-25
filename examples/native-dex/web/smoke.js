@@ -11,6 +11,7 @@ const os = require('os');
 const path = require('path');
 const { chromium } = require('playwright');
 
+const U64 = (1n << 64n) - 1n;
 const root = path.resolve(__dirname, '../../..');
 const rnd = () => 20000 + Math.floor(Math.random() * 20000);
 const basePort = rnd(), rpcBase = rnd() + 100, faucetPort = rnd() + 200;
@@ -166,6 +167,41 @@ async function main() {
       return sum;
     };
     check((await total(tokens[0])) === 10n ** 12n && (await total(tokens[1])) === 10n ** 12n, 'GLD and SLV supplies (10^12 each) are exactly conserved across holders, vault and fee account');
+
+    // 6. Amounts beyond 64 bits: two tokens with supply 10^30 and a faucet of 10^22 per claim.
+    //    An order of 2 * 10^20 units (above 2^64 = 1.8 * 10^19) is placed through the page and cleared.
+    const wide = [];
+    for (const [name, sym] of [['Wide', 'WID'], ['Deep', 'DEP']]) {
+      const args = launchArgs(name, sym, 10n ** 30n, 10n ** 22n).toString('hex');
+      const r = ok(await issuer.evaluate(async ([c, a]) =>
+        window.dexApp.send(window.dexApp.T.call(c, 'launch', window.dexApp.unhex(a))), [launcher, args]));
+      wide.push(r.output);
+    }
+    for (const t of wide) for (const p of [alice, bob]) {
+      ok(await p.evaluate(async ([c, t]) =>
+        window.dexApp.send(window.dexApp.T.call(c, 'claim', window.dexApp.unhex(t))), [launcher, t]));
+    }
+    const wp = await rpc('btb_dexPair', wide);
+    const [wBase, wQuote] = [wp.base.id, wp.quote.id];
+    const big = 200000000000000000000n;
+    for (const p of [alice, bob]) await pick(p, wide[0], wide[1]);
+    const aq0 = await bal('alice', wQuote), bb0 = await bal('bob', wBase);
+    await alice.fill('#amount', big.toString()); await alice.fill('#price', '1'); await alice.fill('#batches', '50');
+    await alice.click('#sell');
+    await alice.waitForFunction(() => /placed in block/.test(document.getElementById('msg').textContent), null, { timeout: 60000 });
+    await bob.fill('#amount', big.toString()); await bob.fill('#price', '1'); await bob.fill('#batches', '1');
+    await bob.click('#buy');
+    await bob.waitForFunction(() => /placed in block/.test(document.getElementById('msg').textContent), null, { timeout: 60000 });
+    await bob.waitForFunction(() => /200000000000000000000/.test(document.getElementById('lastinfo').textContent), null, { timeout: 30000 });
+    check(big > U64, 'a 2 * 10^20 unit order (above 2^64) was accepted and cleared at price 1');
+    check((await bal('alice', wQuote)) === aq0 + big - big / 1000n, 'Alice received 2 * 10^20 less the 0.1% fee in the quote token');
+    check((await bal('bob', wBase)) === bb0 + big - big / 1000n, 'Bob received 2 * 10^20 less the 0.1% fee in the base token');
+    const totalW = async t => {
+      let sum = 0n;
+      for (const a of [launcher, A.alice, A.bob, A.issuer, cfg.vault, cfg.fee_account]) sum += BigInt(await rpc('btb_dexBalance', [a, t]));
+      return sum;
+    };
+    check((await totalW(wBase)) === 10n ** 30n && (await totalW(wQuote)) === 10n ** 30n, 'both wide token supplies (10^30) are exactly conserved');
 
     check(errors.length === 0, 'no page or console errors' + (errors.length ? ': ' + errors.join('; ') : ''));
     console.log('smoke passed');

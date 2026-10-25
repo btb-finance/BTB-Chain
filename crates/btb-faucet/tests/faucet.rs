@@ -47,6 +47,8 @@ fn network() -> &'static Net {
             gas_price: 1,
             epoch_len: 600,
             min_stake: 100 * BTB,
+            storage: Default::default(),
+            oracle: None,
             validators: keys
                 .iter()
                 .map(|k| (k.verifying_key().to_bytes(), 100 * BTB))

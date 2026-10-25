@@ -28,6 +28,7 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Channel(_) => "channel",
         TxKind::Site(_) => "site",
         TxKind::Dex(_) => "dex",
+        TxKind::Storage(_) => "storage",
     }
 }
 
@@ -95,6 +96,12 @@ pub fn tx_json(tx: &Transaction) -> Value {
             o.insert("path".into(), json!(path));
         }
         TxKind::Dex(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
+        TxKind::Storage(op) => {
             o.insert(
                 "op".into(),
                 json!(format!("{op:?}").split([' ', '(', '{']).next()),

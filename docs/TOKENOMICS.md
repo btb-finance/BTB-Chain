@@ -12,8 +12,9 @@ Every request pays the node that served or executed it:
 | Website / file serving | App via voucher | Hosting node | Batched on-chain |
 | Mutation | Sender (or app-sponsored) | Block executor 80%, relay host 20% (proposed) | In the block |
 | Cron job | Contract's prepaid balance | Block executor | In the block |
-| Oracle price read (in a mutation) | The user or bot reading it | Validators that reported the price | In the block |
-| Randomness | Mutation's gas | Validators | In the block |
+| Oracle price read in a mutation or cron | The user or bot reading it (a per-read fee of 10,000 gas on top of the read) | Validators that reported the price (validator pool) | In the block |
+| Oracle price read in a query | Nobody (queries are not billed) | Served by hosting nodes | None |
+| Randomness | Mutation's gas (`300 + 2/byte`; the full gas limit is charged) | Validators | In the block |
 | Large-file storage (blob layer) | Uploader prepays per GB per period | Storage nodes that pass storage challenges | Per period |
 | File retrieval | App or user via voucher | Storage and edge nodes that served the bytes | Batched on-chain |
 | Cross-chain signing and relaying | The requesting app | Validators (signing), relayers (delivery) | In the block |
@@ -43,6 +44,10 @@ The payer signs every voucher, so a host can never claim more than it actually s
 ## Pricing
 
 Queries are metered in the VM like mutations — per instruction, per row read, per byte returned — so every host computes the same gas for the same request. Hosts compete on price per gas unit, and the SDK routes requests to fast, cheap hosts.
+
+## Large-file storage (blob layer)
+
+Implemented in `btb-chain` (`storage.rs`), details in [STORAGE.md](STORAGE.md). The uploader's `Store` transaction **prepays an escrow** of `(k + m) pieces x periods x pay`, where `pay = price_per_kib_period x piece KiB`. Each time a storage node proves it still holds its piece (a Merkle proof of a challenged 1 KiB chunk), `pay` moves from the escrow to the node. A node that misses a challenge loses `slash_bps` of that piece's collateral, **moved into the file's escrow** (it funds the replacement node; whatever is unspent is refunded to the uploader when the file ends), and the period's payment stays in the escrow. Nodes lock a deposit of `deposit_per_kib` per KiB they hold plus a minimum, so the stake is proportional to the data. Nothing is minted: node deposits and escrows are counted in the supply invariant like balances and stake. Fees for the proof transactions are ordinary gas. Retrieval payments (vouchers) are not built.
 
 ## Storage deposits
 

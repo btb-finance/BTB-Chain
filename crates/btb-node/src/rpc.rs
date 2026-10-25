@@ -17,6 +17,8 @@
 //! | `btb_getEpoch` | `[epoch?]` | validator set of an epoch |
 //! | `btb_status` | `[]` | node status |
 //!
+//! The `btb_storage*` methods (storage nodes, stored files, duties) are in `storage_rpc`.
+//!
 //! `GET /explorer` serves the embedded block explorer page (no external assets). `GET /dex`
 //! serves the native DEX page (order entry, book, clearing prices); its `btb_dex*` methods are
 //! in `dex_rpc`.

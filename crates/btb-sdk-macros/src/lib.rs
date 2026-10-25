@@ -19,7 +19,8 @@ pub fn query(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry("query", attr, item)
 }
 
-/// State-changing function run in a transaction.
+/// State-changing function run in a transaction. `#[btb::mutation(randomness)]` lets it call
+/// `random::*` (the chain's threshold-BLS beacon); it then always costs its full gas limit.
 #[proc_macro_attribute]
 pub fn mutation(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry("mutation", attr, item)
@@ -29,6 +30,7 @@ pub fn mutation(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// also exports a marker symbol `btb_every_<N>_<name>` that `btb deploy` reads into the
 /// manifest's `crons`. Without `every` the cron has no schedule and never runs.
 /// Wall-clock units are rejected: the chain schedules by block height only.
+/// `#[btb::cron(randomness, every = "N blocks")]` also allows `random::*` (see `mutation`).
 #[proc_macro_attribute]
 pub fn cron(attr: TokenStream, item: TokenStream) -> TokenStream {
     entry("cron", attr, item)
@@ -53,15 +55,29 @@ fn entry(kind: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
     let mut every_blocks = None;
+    let mut randomness = false;
     if !attr.is_empty() {
-        if kind != "cron" {
+        if kind != "cron" && kind != "mutation" {
             return Err(syn::Error::new(
                 attr.span(),
-                "this attribute takes no arguments",
+                if kind == "query" || kind == "action" {
+                    "queries and actions can never use randomness (only a mutation or cron can be marked `randomness`)"
+                } else {
+                    "this attribute takes no arguments"
+                },
             ));
         }
-        let lit = syn::parse2::<CronArgs>(attr)?.every;
-        every_blocks = Some(parse_every(&lit)?);
+        let args = syn::parse2::<EntryArgs>(attr)?;
+        randomness = args.randomness;
+        if let Some(lit) = &args.every {
+            if kind != "cron" {
+                return Err(syn::Error::new(
+                    lit.span(),
+                    "`every` is only valid on `#[btb::cron]`",
+                ));
+            }
+            every_blocks = Some(parse_every(lit)?);
+        }
     }
     let sig = &func.sig;
     if sig.asyncness.is_some() || !sig.generics.params.is_empty() || sig.variadic.is_some() {
@@ -133,6 +149,14 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
             pub extern "C" fn #sym() {}
         }
     });
+    let rand_marker = randomness.then(|| {
+        let sym = format_ident!("btb_randomness_{}_{}", kind, name);
+        quote! {
+            #[doc(hidden)]
+            #[no_mangle]
+            pub extern "C" fn #sym() {}
+        }
+    });
     Ok(quote! {
         #func
 
@@ -145,6 +169,7 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
         }
 
         #marker
+        #rand_marker
     })
 }
 
@@ -169,19 +194,43 @@ fn parse_every(lit: &LitStr) -> syn::Result<u64> {
     }
 }
 
-struct CronArgs {
-    every: LitStr,
+/// The comma-separated attribute arguments: `randomness` and (crons) `every = "N blocks"`,
+/// each at most once, in any order.
+struct EntryArgs {
+    randomness: bool,
+    every: Option<LitStr>,
 }
 
-impl syn::parse::Parse for CronArgs {
+impl syn::parse::Parse for EntryArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let key: syn::Ident = input.parse()?;
-        if key != "every" {
-            return Err(syn::Error::new(key.span(), "expected `every = \"...\"`"));
+        let mut args = EntryArgs {
+            randomness: false,
+            every: None,
+        };
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            if key == "randomness" {
+                if args.randomness {
+                    return Err(syn::Error::new(key.span(), "`randomness` given twice"));
+                }
+                args.randomness = true;
+            } else if key == "every" {
+                if args.every.is_some() {
+                    return Err(syn::Error::new(key.span(), "`every` given twice"));
+                }
+                input.parse::<syn::Token![=]>()?;
+                args.every = Some(input.parse()?);
+            } else {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "expected `randomness` or `every = \"N blocks\"`",
+                ));
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
         }
-        input.parse::<syn::Token![=]>()?;
-        let every: LitStr = input.parse()?;
-        Ok(CronArgs { every })
+        Ok(args)
     }
 }
 

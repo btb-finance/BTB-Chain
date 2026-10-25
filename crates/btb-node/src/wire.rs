@@ -13,6 +13,7 @@ use btb_chain::exec::check_static;
 use btb_chain::{ChainConfig, Transaction};
 use btb_codec::{Decode, Encode, Reader};
 use btb_consensus::{Block, Message, QuorumCert};
+use btb_oracle::SignedObservation;
 use std::collections::BTreeSet;
 
 pub const KIND_CONSENSUS: u8 = 1;
@@ -21,6 +22,8 @@ pub const KIND_TX: u8 = 2;
 pub const KIND_SYNC_REQ: u8 = 3;
 /// Block sync response: see `SyncResponse`.
 pub const KIND_SYNC_RESP: u8 = 4;
+/// Oracle traffic (beacon partials and values, price observations): see `crate::oracle`.
+pub const KIND_ORACLE: u8 = 5;
 
 /// Most consensus blocks in one sync response (committed blocks plus the blocks that prove them).
 pub const MAX_SYNC_CHAIN: usize = 24;
@@ -58,6 +61,8 @@ pub enum Inbound {
     /// Ask for committed blocks starting at this height.
     SyncReq(u64),
     SyncResp(Box<SyncResponse>),
+    /// An oracle message (decoded by `oracle::OracleMsg::decode`).
+    Oracle(Vec<u8>),
 }
 
 /// Answer to a block sync request: consecutive consensus blocks of one epoch, oldest first,
@@ -145,6 +150,9 @@ pub fn parse_frame(data: &[u8]) -> Option<Inbound> {
             data[1..9].try_into().ok()?,
         ))),
         KIND_SYNC_RESP => SyncResponse::decode(&data[1..]).map(|r| Inbound::SyncResp(Box::new(r))),
+        KIND_ORACLE if data.len() <= 1 + crate::oracle::MAX_ORACLE_MSG => {
+            Some(Inbound::Oracle(data[1..].to_vec()))
+        }
         _ => None,
     }
 }
@@ -154,18 +162,42 @@ pub struct Batch {
     /// Proposer's wall clock, Unix milliseconds (clamped to the parent's on execution).
     pub timestamp: u64,
     pub txs: Vec<Transaction>,
+    /// Validators' signed price observations the proposer collected (`btb_chain::oracle`).
+    /// Encoded as an optional trailing list, so a batch without any is byte-identical to the
+    /// old format.
+    pub observations: Vec<SignedObservation>,
 }
 
 impl Batch {
     pub fn encode(&self) -> Vec<u8> {
         let raw: Vec<Vec<u8>> = self.txs.iter().map(Transaction::encode).collect();
-        (self.timestamp, raw).encode()
+        let mut out = (self.timestamp, raw).encode();
+        if !self.observations.is_empty() {
+            let obs: Vec<Vec<u8>> = self
+                .observations
+                .iter()
+                .map(|o| o.encode().to_vec())
+                .collect();
+            obs.encode_to(&mut out);
+        }
+        out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Batch> {
         let mut r = Reader::new(bytes, MAX_PAYLOAD);
         let timestamp = u64::decode_from(&mut r).ok()?;
         let raw: Vec<Vec<u8>> = Vec::decode_from(&mut r).ok()?;
+        let observations = if r.remaining() == 0 {
+            Vec::new()
+        } else {
+            let obs: Vec<Vec<u8>> = Vec::decode_from(&mut r).ok()?;
+            if obs.is_empty() || obs.len() > btb_chain::oracle::MAX_OBS_PER_BLOCK {
+                return None;
+            }
+            obs.iter()
+                .map(|b| SignedObservation::decode(b))
+                .collect::<Option<Vec<_>>>()?
+        };
         if r.remaining() != 0 {
             return None;
         }
@@ -173,7 +205,11 @@ impl Batch {
             .iter()
             .map(|b| Transaction::decode(b).ok())
             .collect::<Option<Vec<_>>>()?;
-        Some(Batch { timestamp, txs })
+        Some(Batch {
+            timestamp,
+            txs,
+            observations,
+        })
     }
 }
 
@@ -235,6 +271,7 @@ mod tests {
         let good = Batch {
             timestamp: 5,
             txs: vec![tx(7, 0, &k), tx(7, 1, &k)],
+            observations: vec![],
         };
         assert_eq!(Batch::decode(&good.encode()), Some(good.clone()));
         assert!(payload_ok(&good.encode(), &cfg));
@@ -242,11 +279,13 @@ mod tests {
         let wrong = Batch {
             timestamp: 5,
             txs: vec![tx(8, 0, &k)],
+            observations: vec![],
         };
         assert!(!payload_ok(&wrong.encode(), &cfg));
         let dup = Batch {
             timestamp: 5,
             txs: vec![tx(7, 0, &k), tx(7, 0, &k)],
+            observations: vec![],
         };
         assert!(!payload_ok(&dup.encode(), &cfg));
         let mut forged = tx(7, 0, &k);
@@ -254,6 +293,7 @@ mod tests {
         let bad = Batch {
             timestamp: 5,
             txs: vec![forged],
+            observations: vec![],
         };
         assert!(!payload_ok(&bad.encode(), &cfg));
         assert!(!payload_ok(&[1, 2, 3], &cfg));

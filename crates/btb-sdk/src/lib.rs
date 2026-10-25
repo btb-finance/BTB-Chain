@@ -19,6 +19,7 @@ extern crate alloc;
 extern crate self as btb_sdk;
 
 pub mod host;
+pub mod oracle;
 #[cfg(all(feature = "runtime", target_os = "none"))]
 pub mod runtime;
 pub mod table;
@@ -62,6 +63,7 @@ pub mod prelude {
     pub use crate::host::{
         abort, block_height, caller, contract_address, token_balance, token_transfer, Key,
     };
+    pub use crate::oracle::{price, random, Price};
     pub use crate::table::Table;
     pub use crate::token::Token;
     pub use alloc::string::String;

@@ -1,6 +1,6 @@
 //! `btb-node run --config node.json` | `btb-node init-testnet --validators N --dir DIR` |
 //! `btb-node peer-id --key FILE`. See docs/NODE.md.
-use btb_node::config::{init_testnet, load_key, NodeParams};
+use btb_node::config::{init_testnet_with, load_key, NodeParams};
 use btb_node::{open_chain, Node};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -8,6 +8,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:\n\
   btb-node run --config node.json [--rpc 127.0.0.1:PORT] [--data DIR]\n\
   btb-node init-testnet --validators N --dir DIR [--chain-id N] [--base-port P] [--rpc-base-port P]\n\
+                        [--oracle true]  (beacon key from a trusted dealer + demo price feeds)\n\
   btb-node peer-id --key validator.key\n\
 \n\
   --data DIR   keep consensus safety state there; chain state in RocksDB when built with\n\
@@ -54,12 +55,13 @@ fn run() -> Result<(), String> {
         "init-testnet" => {
             let n = num("--validators", 4)? as usize;
             let dir = PathBuf::from(get("--dir").ok_or("--dir is required")?);
-            let dirs = init_testnet(
+            let dirs = init_testnet_with(
                 n,
                 &dir,
                 num("--chain-id", 7)?,
                 num("--base-port", 9000)? as u16,
                 num("--rpc-base-port", 8545)? as u16,
+                get("--oracle").is_some_and(|v| v != "false" && v != "0"),
             )?;
             println!(
                 "wrote genesis, faucet key and {} node directories under {}",

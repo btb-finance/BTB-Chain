@@ -72,6 +72,8 @@ Millions of tiny payments would overload any chain if each were a transaction. B
 
 ## Keeping storage honest: proofs
 
+> **Built:** the flow below is implemented in `btb-chain` (`storage.rs`) and `btb-storage`; see [STORAGE.md](STORAGE.md) for the exact rules. Until the randomness beacon exists, assignment and challenge chunks are derived from block hashes (a proposer can grind them, but cannot forge proofs); each piece is challenged once per period at a time spread by its hash, and a miss slashes part of the piece's collateral into the file's escrow, reassigns the piece and has the new node rebuild it from any `k` others.
+
 Paying people to store data only works if they can't pretend. BTB uses **storage challenges**, similar to Filecoin, Arweave, Storj and Walrus:
 
 1. At random times (chosen by the randomness beacon), the chain challenges a storage node: "prove you have bytes X to Y of piece 37."
@@ -125,7 +127,7 @@ Every one of these is a separate way to earn, and none needs the same machine to
 ## Rollout
 
 - **Phase 2–3:** blob storage on a single node; storage fees in the local devnet.
-- **Phase 5:** storage nodes with challenges and repair, hosting nodes with vouchers, edge caching.
+- **Phase 5:** storage nodes with challenges and repair (built, see [STORAGE.md](STORAGE.md)), hosting nodes with vouchers, edge caching.
 - **After mainnet:** a lightweight node app for phones and home devices, and state sharding when demand requires it.
 
 See [Architecture](ARCHITECTURE.md) and [Tokenomics](TOKENOMICS.md) for how these pieces fit the rest of BTB.

@@ -33,30 +33,9 @@ fn field<'a>(out: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no {name:?} in {out}"))
 }
 
-/// The counter example with a schedule on its cron (the original has none).
-fn copy_counter(tmp: &Path) -> std::path::PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let src = root.join("examples/counter");
-    let dst = tmp.join("counter");
-    std::fs::create_dir_all(dst.join("src")).unwrap();
-    std::fs::create_dir_all(dst.join(".cargo")).unwrap();
-    for f in [
-        "Cargo.lock",
-        "link.ld",
-        "rust-toolchain.toml",
-        ".cargo/config.toml",
-    ] {
-        std::fs::copy(src.join(f), dst.join(f)).unwrap();
-    }
-    let sdk = root.join("crates/btb-sdk").canonicalize().unwrap();
-    let toml = std::fs::read_to_string(src.join("Cargo.toml")).unwrap();
-    let toml = toml.replace("../../crates/btb-sdk", sdk.to_str().unwrap());
-    std::fs::write(dst.join("Cargo.toml"), toml).unwrap();
-    let code = std::fs::read_to_string(src.join("src/main.rs")).unwrap();
-    assert!(code.contains("#[btb::cron]"));
-    let code = code.replace("#[btb::cron]", "#[btb::cron(every = \"3 blocks\")]");
-    std::fs::write(dst.join("src/main.rs"), code).unwrap();
-    dst
+/// The counter example, used in place (its cron runs every 10 blocks).
+fn counter_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter")
 }
 
 #[test]
@@ -65,7 +44,8 @@ fn deploy_call_query_over_rpc() {
     let mut c = Lite::new(4, 600, None);
     let tmp = std::env::temp_dir().join(format!("btb-cli-chain-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    let counter = copy_counter(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let counter = counter_dir();
     let key = tmp.join("faucet.key");
     btb_node::config::save_key(&key, &c.faucet.key).unwrap();
     let rpc = format!("http://{}", c.node(0).rpc_addr().unwrap());
@@ -86,7 +66,7 @@ fn deploy_call_query_over_rpc() {
     c.run(&fund);
 
     let m = std::fs::read_to_string(counter.join("target/btb/deploy/manifest.json")).unwrap();
-    assert!(m.contains("\"every_blocks\": 3"), "{m}");
+    assert!(m.contains("\"every_blocks\": 10"), "{m}");
 
     // A mutation through the CLI: increment(5) returns the new total (u64 LE).
     let out = ok(btb(

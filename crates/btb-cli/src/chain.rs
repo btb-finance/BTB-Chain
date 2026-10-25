@@ -132,6 +132,11 @@ impl Session {
         })
     }
 
+    /// A JSON-RPC call to the node this session talks to.
+    pub fn rpc_call(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.rpc.call(method, params)
+    }
+
     pub fn sender(&self) -> [u8; 32] {
         account_address(&self.key.verifying_key().to_bytes())
     }

@@ -143,6 +143,20 @@ Equivalently, `k(B) = exec_height(B.parent)` is the highest block committed by t
 
 **Sync and restart.** Block sync checks the same thing: a synced block must carry a well-formed claim for an earlier height (`btb_node::sync::verify`), and executing it compares the claim with the node's own digest chain (`state divergence` otherwise). A restarted node rebuilds its record of recent digests from the block store and, for heights without a record, from the chain state's Merkle roots (the receipts of such a height are then unknown: the node does not vote on claims about that single height until the commit point moves past it). Nothing about attestation is persisted in the consensus safety file: `k(B)` is recomputed when the replica relinks the chain.
 
+## Randomness beacon and execution lag
+
+On a chain with oracles ([ORACLES.md](ORACLES.md)) a block can be executed only when its **beacon** is known, and the beacon of height `h` is a threshold signature whose partials the validators release only once they have *committed* block `h`. So consensus and execution interact in one more place, without a change to the protocol rules above:
+
+1. A replica emits `Commit(h)`. The node queues the block and releases its partial signature for `h`.
+2. When `t = n - floor((n - 1)/3)` valid partials are in (or a peer sends the finished, verified beacon) the node executes `h` with the beacon and records its result.
+3. Execution attestation is unchanged: `Replica::set_exec_hooks` already lets a leader wait to propose, and a voter `Defer` a vote, until the result for `k(B)` exists; a late beacon is just a late execution. The extra delay is one message round trip between `Commit(h)` and the execution of `h` (no more than `k(B) = height - 2` in the steady state allows, since the leader of height `h + 2` proposes only after it executed `h`).
+
+*Safety.* Every honest node executes `h` with the same beacon (it is unique), so the state-root theorem above holds unchanged. A Byzantine node can send junk partials or beacons: partials are accepted only from the holder they name and checked (optimistically as an aggregate, then one by one), finished beacons are verified before use, and the executor verifies the beacon again against the group key stored in the genesis state (`BlockError::Oracle`), so a wrong value stops a node instead of forking it.
+
+*Liveness.* With at least `t` honest holders online the beacon appears: that is `n - f >= t` for `f <= floor((n - 1)/3)` faulty. If fewer are online, execution waits (the blocks stay committed and queued, and the replica's vote deferral times the round out like a slow leader) until they return or a peer supplies the beacon. A node that is catching up asks `Want{height}` and is served from the block history. Unpredictability is the other direction: fewer than `t` holders cannot compute `beacon(h)` before block `h` is final, which is what makes the randomness unbiasable by whoever orders the block.
+
+*Not done:* the beacon committee is fixed at genesis (a trusted-dealer key), not re-formed for each epoch's validator set; see [ORACLES.md](ORACLES.md#status).
+
 ## Epochs and validator-set changes
 
 The validator set is fixed inside an **epoch** and changes only at an epoch boundary. An epoch is a *fresh consensus instance*, not a reconfiguration of a running one:

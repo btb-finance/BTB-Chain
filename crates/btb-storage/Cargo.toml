@@ -1,0 +1,15 @@
+[package]
+name = "btb-storage"
+description = "BTB storage nodes: Reed-Solomon erasure coding, Merkle piece proofs, a piece store with an HTTP API, the storage-node daemon and the store/fetch client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+btb-chain = { path = "../btb-chain" }
+btb-codec = { path = "../btb-codec" }
+# MIT. GF(2^8) Reed-Solomon, pure Rust (no simd feature, so no C compiler).
+reed-solomon-erasure = { version = "6", default-features = false }
+sha2 = "0.11.1"
+serde_json = "1"

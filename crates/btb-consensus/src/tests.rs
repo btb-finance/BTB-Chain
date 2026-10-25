@@ -1417,3 +1417,33 @@ fn ended_replica_answers_laggards_but_ignores_everything_else() {
         .iter()
         .any(|a| matches!(a, Action::Send { msg: Message::SyncResponse { blocks }, .. } if blocks.len() == 2)));
 }
+
+#[test]
+fn uncommitted_payloads_lists_the_ancestry_a_new_proposal_must_not_repeat() {
+    let fx = Fixture::new(4);
+    let mut r = fx.replica(3);
+    let b1 = fx.block(1, 1, fx.ctx.genesis_qc(), 1, b"one");
+    let id1 = b1.id();
+    assert_eq!(
+        votes(&r.on_message(Message::Propose(fx.proposal(b1, None)))).len(),
+        1
+    );
+    let qc1 = fx.qc(1, id1, &[0, 1, 2]);
+    let b2 = fx.block(2, 2, qc1, 2, b"two");
+    let id2 = b2.id();
+    r.on_message(Message::Propose(fx.proposal(b2, None)));
+    // Nothing is committed yet: both payloads can still commit, newest first.
+    assert_eq!(r.committed_height(), 0);
+    assert_eq!(
+        r.uncommitted_payloads(&id2),
+        vec![b"two".as_slice(), b"one".as_slice()]
+    );
+    assert_eq!(r.uncommitted_payloads(&id1), vec![b"one".as_slice()]);
+    assert!(r.uncommitted_payloads(&[9; 32]).is_empty());
+    // A QC for block 2 commits block 1: only block 2 is left.
+    r.on_message(Message::Vote(fx.vote(0, 2, id2)));
+    r.on_message(Message::Vote(fx.vote(1, 2, id2)));
+    r.on_message(Message::Vote(fx.vote(2, 2, id2)));
+    assert_eq!(r.committed_height(), 1);
+    assert_eq!(r.uncommitted_payloads(&id2), vec![b"two".as_slice()]);
+}

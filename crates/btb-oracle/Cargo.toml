@@ -1,0 +1,11 @@
+[package]
+name = "btb-oracle"
+description = "Threshold-BLS randomness beacon (Feldman VSS, joint-Feldman DKG, resharing) and price-feed aggregation for BTB Chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blst = "0.3.15"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }

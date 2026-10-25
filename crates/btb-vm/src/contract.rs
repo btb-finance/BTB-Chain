@@ -10,8 +10,15 @@
 //! (grows down from `sp`), then the input region (16-byte trampoline + input), both below
 //! `mem_size & !15`. The call fails with `OutOfMemory` unless at least `MIN_STACK` bytes remain between the loaded image and the input region.
 //!
-//! Randomness is NOT implemented yet: there is no host call for the beacon. When added it will
-//! only be available to mutations and crons marked `randomness`, never to queries or actions.
+//! Randomness: `random_bytes` (host call 40) is available only to mutation and cron entry points
+//! marked `randomness`. The marker is an exported symbol `btb_randomness_<kind>_<name>` (kind
+//! `mutation` or `cron`) that `#[btb::mutation(randomness)]` and
+//! `#[btb::cron(randomness, every = "N blocks")]` emit; it is read from the ELF on every call, so
+//! it cannot be bypassed by the manifest or by the caller. A marker on a query or action, or one
+//! without a matching entry point, makes the contract invalid at deploy time. At run time a
+//! `random_bytes` call anywhere else traps with `Trap::RandomnessForbidden`. There are no
+//! cross-contract calls, so a marked function can never be reached from another contract's
+//! code; if they are added, the callee must run with the flag off.
 
 use crate::decode::Trap;
 use crate::elf::{self, ElfError};
@@ -19,6 +26,7 @@ use crate::host::{run_with_host, Address, Host};
 use crate::vm::{Exit, Vm};
 
 const PREFIX: &str = "btb_";
+const RANDOMNESS_PREFIX: &str = "btb_randomness_";
 const MAX_NAME: usize = 64;
 const EBREAK: u32 = 0x0010_0073;
 const TRAMPOLINE: u64 = 16;
@@ -53,6 +61,8 @@ pub struct EntryPoint {
     pub kind: FunctionKind,
     pub name: String,
     pub addr: u64,
+    /// Marked `randomness`: may call `random_bytes` (mutations and crons only).
+    pub randomness: bool,
 }
 
 /// Why a contract was rejected by `from_elf`.
@@ -67,6 +77,9 @@ pub enum ContractError {
         name: String,
     },
     NoEntryPoints,
+    /// A `btb_randomness_*` marker that is malformed, names a query or action, or has no
+    /// matching mutation or cron entry point.
+    BadRandomnessMarker(String),
 }
 
 impl From<ElfError> for ContractError {
@@ -119,8 +132,24 @@ impl Contract {
     /// Segment placement is checked against the memory size at call time.
     pub fn from_elf(bytes: &[u8]) -> Result<Self, ContractError> {
         let mut entries: Vec<EntryPoint> = Vec::new();
+        let mut markers: Vec<(FunctionKind, String)> = Vec::new();
         for (sym, addr) in elf::export_list(bytes)? {
             if !sym.starts_with(PREFIX) {
+                continue;
+            }
+            if let Some(rest) = sym.strip_prefix(RANDOMNESS_PREFIX) {
+                let bad = || ContractError::BadRandomnessMarker(sym.clone());
+                let (kind, name) = [FunctionKind::Mutation, FunctionKind::Cron]
+                    .iter()
+                    .find_map(|k| {
+                        rest.strip_prefix(&k.prefix()["btb_".len()..])
+                            .map(|n| (*k, n))
+                    })
+                    .ok_or_else(bad)?;
+                if !valid_name(name) || markers.iter().any(|(k, n)| *k == kind && n == name) {
+                    return Err(bad());
+                }
+                markers.push((kind, name.to_string()));
                 continue;
             }
             let Some((kind, name)) = FunctionKind::ALL
@@ -142,7 +171,22 @@ impl Contract {
                 kind,
                 name: name.to_string(),
                 addr,
+                randomness: false,
             });
+        }
+        for (kind, name) in markers {
+            match entries
+                .iter_mut()
+                .find(|e| e.kind == kind && e.name == name)
+            {
+                Some(e) => e.randomness = true,
+                None => {
+                    return Err(ContractError::BadRandomnessMarker(format!(
+                        "{RANDOMNESS_PREFIX}{}{name}",
+                        &kind.prefix()["btb_".len()..]
+                    )))
+                }
+            }
         }
         if entries.is_empty() {
             return Err(ContractError::NoEntryPoints);
@@ -156,6 +200,13 @@ impl Contract {
 
     pub fn entry_points(&self) -> &[EntryPoint] {
         &self.entries
+    }
+
+    /// Whether the entry point `(kind, name)` exists and is marked `randomness`.
+    pub fn is_randomness(&self, kind: FunctionKind, name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.kind == kind && e.name == name && e.randomness)
     }
 
     /// Run one entry point in a fresh VM. Queries always run read-only, whatever `host` says.
@@ -199,6 +250,11 @@ impl Contract {
         vm.set_reg(10, input_ptr);
         vm.set_reg(11, input_len);
         vm.set_pc(entry.addr);
+        // Only a marked mutation or cron may use the beacon; the host is read-only for queries
+        // anyway, but the flag is the single gate and is off for everything else.
+        vm.set_randomness_allowed(
+            entry.randomness && matches!(kind, FunctionKind::Mutation | FunctionKind::Cron),
+        );
 
         let result = if kind == FunctionKind::Query {
             run_with_host(&mut vm, &mut ReadOnly(host))
@@ -268,6 +324,12 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     }
     fn tokens(&mut self) -> Option<&mut dyn crate::token::TokenStore> {
         self.0.tokens()
+    }
+    fn random_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
+        self.0.random_bytes(len)
+    }
+    fn price(&mut self, pair: u32) -> Option<crate::host::PriceRecord> {
+        self.0.price(pair)
     }
 }
 

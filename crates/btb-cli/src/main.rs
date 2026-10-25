@@ -12,6 +12,9 @@ const USAGE: &str = "usage: btb <command>\n\
   btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]   send a mutation\n\
   btb query --rpc URL <contract> <fn> [args]         run a read-only query\n\
   btb keygen <FILE>                                  write a new account key file\n\
+  btb store <file> --rpc URL --key FILE [--k N --m N --periods N]   erasure-code a file onto storage nodes\n\
+  btb fetch <root> --rpc URL [--out FILE]            fetch and verify a stored file\n\
+  btb storage-node run --rpc URL --key FILE --dir DIR [--listen ADDR] [--endpoint URL] [--deposit UNITS]\n\
 \n\
 Run build, dev and deploy inside a project. The sdk path defaults to $BTB_SDK_PATH, else the\n\
 crates/btb-sdk of the checkout this btb was built from. See docs/CLI.md.";
@@ -163,6 +166,7 @@ fn run() -> Result<(), String> {
             s.join();
             Ok(())
         }
+        "store" | "fetch" | "storage-node" => btb_cli::storage::run(&cmd, rest),
         "-h" | "--help" | "help" => Err(String::new()),
         other => Err(format!("unknown command {other}")),
     }

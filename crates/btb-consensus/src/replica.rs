@@ -335,6 +335,24 @@ impl Replica {
     pub fn pending_blocks(&self) -> usize {
         self.pending.len()
     }
+
+    /// The payloads of the uncommitted blocks that a child of `tip` would have as ancestors,
+    /// newest first. They can still commit, so an embedder must not propose their contents
+    /// again in a child of `tip`. Stops at the committed height or at a block this replica
+    /// does not hold.
+    pub fn uncommitted_payloads(&self, tip: &Hash) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut cur = *tip;
+        while let Some(b) = self.blocks.get(&cur) {
+            if b.height <= self.safety.committed_height {
+                break;
+            }
+            out.push(b.payload.as_slice());
+            cur = b.parent;
+        }
+        out
+    }
+
     /// Leader of `round` (pure function of the round and the validator set).
     pub fn leader(&self, round: Round) -> ValidatorIndex {
         self.schedule[(round % self.schedule.len() as u64) as usize]

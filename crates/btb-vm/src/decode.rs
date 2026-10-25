@@ -15,6 +15,11 @@ pub enum Trap {
     WriteInQuery,
     /// The guest called `abort`; carries the (lossily UTF-8 decoded) message.
     Abort(String),
+    /// `random_bytes` outside a mutation or cron entry point marked `randomness` (a query, an
+    /// action, or an unmarked function).
+    RandomnessForbidden,
+    /// `random_bytes` where the chain has no randomness beacon for this execution.
+    RandomnessUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

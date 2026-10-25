@@ -10,8 +10,11 @@ pub mod driver;
 pub mod explorer;
 pub mod hex;
 pub mod net;
+pub mod oracle;
+pub mod oracle_rpc;
 pub mod rpc;
 pub mod storage;
+pub mod storage_rpc;
 pub mod sync;
 pub mod wire;
 
@@ -36,8 +39,13 @@ pub fn open_chain<S: KvStore>(kv: S, genesis: &GenesisFile) -> Result<ChainState
         .map_err(|e| e.to_string())?
         .is_empty();
     if empty {
-        ChainState::from_genesis_with_validators(kv, &g, &genesis.genesis_validators())
-            .map_err(|e| format!("genesis: {e:?}"))
+        ChainState::from_genesis_full(
+            kv,
+            &g,
+            &genesis.genesis_validators(),
+            genesis.oracle.as_ref(),
+        )
+        .map_err(|e| format!("genesis: {e:?}"))
     } else {
         ChainState::open(kv).map_err(|e| format!("open chain state: {e}"))
     }

@@ -52,7 +52,7 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 
 **Table.** A contract-declared database table with a primary key and optional indexes, which is how BTB state is modeled. See [Architecture](ARCHITECTURE.md#state-model).
 
-**Threshold beacon.** The per-block random value made by validators jointly producing a threshold BLS signature. No single party can predict or choose it. It is available only to mutations and crons marked `randomness`. See [Oracles](ORACLES.md#1-verifiable-randomness).
+**Threshold beacon.** The per-block random value made by validators jointly producing a threshold BLS signature on `(chain, epoch, height)`; each releases its partial only after the block is committed. No single party can predict or choose it. It is available only to mutations and crons marked `randomness`. See [Oracles](ORACLES.md#1-verifiable-randomness).
 
 **Threshold key.** A key split among validators so that no one holds it whole, but a two-thirds quorum can sign together. It is used for cross-chain signing and oracle reports. See [Cross-chain](CROSS_CHAIN.md#writing-chain-signatures).
 

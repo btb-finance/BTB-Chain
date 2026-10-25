@@ -35,6 +35,9 @@
 #define BTB_TOKEN_MINT 21
 #define BTB_TOKEN_BURN 22
 #define BTB_CONTRACT_ADDRESS 23
+/* Oracles (range 40..49): see docs/ORACLES.md. */
+#define BTB_RANDOM_BYTES 40
+#define BTB_PRICE 41
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
@@ -59,6 +62,12 @@
 #define BTB_MUTATION(name) BTB_ENTRY(mutation, name)
 #define BTB_CRON(name) BTB_ENTRY(cron, name)
 #define BTB_ACTION(name) BTB_ENTRY(action, name)
+/* Marks a mutation or cron as allowed to call btb_random_bytes: place BTB_RANDOMNESS(mutation, roll);
+ * (or `cron`) next to BTB_MUTATION(roll). The VM reads the exported symbol
+ * btb_randomness_<kind>_<name> from the ELF; a marker on any other kind, or without its entry
+ * point, makes the contract invalid. A marked function is always charged its full gas limit. */
+#define BTB_RANDOMNESS(kind, name)                                             \
+  __attribute__((used, visibility("default"))) void btb_randomness_##kind##_##name(void) {}
 
 /* Raw ecalls. Memory clobber: the host reads or writes guest memory. */
 static inline uint64_t btb_ecall5(uint64_t n, uint64_t a0, uint64_t a1,
@@ -153,6 +162,18 @@ static inline uint64_t btb_table_index_scan(const uint8_t *req, uint64_t req_len
 /* Writes the 32-byte address of the running contract. */
 static inline void btb_contract_address(uint8_t out[32]) {
   btb_ecall5(BTB_CONTRACT_ADDRESS, BTB_P(out), 0, 0, 0, 0);
+}
+
+/* Writes len (at most 1024) bytes from the beacon to out. Only in a mutation or cron marked with
+ * BTB_RANDOMNESS; anywhere else (queries, unmarked functions) the call traps. */
+static inline void btb_random_bytes(uint8_t *out, uint64_t len) {
+  btb_ecall5(BTB_RANDOM_BYTES, BTB_P(out), len, 0, 0, 0);
+}
+/* Latest agreed price of feed `pair`. Returns 0 and fills out (price u128 LE, height u64 LE,
+ * decimals u8, 7 zero bytes) or BTB_NOT_FOUND. Free in queries; mutations and crons pay a
+ * per-read fee in gas. */
+static inline uint64_t btb_price(uint32_t pair, uint8_t out[32]) {
+  return btb_ecall5(BTB_PRICE, pair, BTB_P(out), 0, 0, 0);
 }
 
 /* ---- User tokens (see docs/TOKENOMICS.md). 32-byte token ids; u128 amounts are passed as

@@ -170,10 +170,8 @@ pub fn handle<S: KvStore>(st: &ChainState<S>, method: &str, p: &[Value]) -> RpcR
             let (mut asks, mut bids): (Vec<&Order>, Vec<&Order>) =
                 orders.iter().partition(|o| o.side == Side::Ask);
             // best first: asks by ascending price, bids by descending price
-            let key = |o: &&Order| (u128::from(o.n), u128::from(o.d));
             let cmp = |a: &&Order, b: &&Order| {
-                let (x, y) = (key(a), key(b));
-                (x.0 * y.1).cmp(&(y.0 * x.1)).then(a.id.cmp(&b.id))
+                dex::cmp_price((a.n, a.d), (b.n, b.d)).then(a.id.cmp(&b.id))
             };
             asks.sort_by(cmp);
             bids.sort_by(|a, b| cmp(b, a));

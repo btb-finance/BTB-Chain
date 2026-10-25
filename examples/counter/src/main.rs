@@ -63,7 +63,7 @@ pub fn increment_in_query(by: u64) -> u64 {
 }
 
 /// Scheduled bump by one.
-#[btb::cron]
+#[btb::cron(every = "10 blocks")]
 pub fn tick() {
     store(load().wrapping_add(1));
 }

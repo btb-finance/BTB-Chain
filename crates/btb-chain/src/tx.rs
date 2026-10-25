@@ -13,6 +13,7 @@
 //! Unstake  (tag 4): amount:u64
 //! RegisterValidator (tag 5): consensus_key[32] || network_addr:bytes
 //! SubmitEvidence    (tag 6): epoch:u64 || evidence
+//! Storage           (tag 12): sub:u8 || fields (`storage.rs`: 0 register, 1 add deposit, 2 withdraw, 3 store, 4 prove)
 //! Dex               (tag 10): sub:u8 || fields (`dex.rs`: 0 place, 1 cancel)
 //! Site              (tag 9): sub:u8 || fields (`site.rs`: 0 publish, 1 remove)
 //! evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleVote)
@@ -203,6 +204,8 @@ pub enum TxKind {
     Site(crate::site::SiteOp),
     /// A DEX order or cancellation (`crate::dex`).
     Dex(crate::dex::DexOp),
+    /// A storage-node or stored-file operation (`crate::storage`).
+    Storage(crate::storage::StorageOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -344,6 +347,10 @@ impl Encode for TxBody {
                 10u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Storage(op) => {
+                12u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
     }
 }
@@ -394,6 +401,10 @@ impl TxBody {
             },
             10 => match crate::dex::DexOp::decode_from(r)? {
                 Ok(op) => TxKind::Dex(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            12 => match crate::storage::StorageOp::decode_from(r)? {
+                Ok(op) => TxKind::Storage(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
             t => return Err(TxError::BadTag(t)),
@@ -500,6 +511,7 @@ impl Transaction {
             TxKind::Channel(op) => op.gas(),
             TxKind::Site(op) => op.gas(),
             TxKind::Dex(op) => op.gas(),
+            TxKind::Storage(op) => op.gas(),
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }

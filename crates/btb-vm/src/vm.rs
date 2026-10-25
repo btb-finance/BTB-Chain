@@ -28,6 +28,9 @@ pub struct Vm {
     mem: Vec<u8>,
     gas_limit: u64,
     gas_used: u64,
+    /// Whether the running entry point may call `random_bytes` (set by `Contract::call` from
+    /// the `randomness` marker in the ELF; false for queries, actions and unmarked functions).
+    randomness: bool,
 }
 
 impl Vm {
@@ -38,7 +41,16 @@ impl Vm {
             mem: vec![0; mem_size],
             gas_limit,
             gas_used: 0,
+            randomness: false,
         }
+    }
+
+    pub fn randomness_allowed(&self) -> bool {
+        self.randomness
+    }
+
+    pub fn set_randomness_allowed(&mut self, allowed: bool) {
+        self.randomness = allowed;
     }
 
     pub fn reg(&self, i: usize) -> u64 {

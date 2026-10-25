@@ -609,8 +609,9 @@ impl NetTask {
             self.strike(peer);
             return;
         };
-        if !is_validator && !matches!(msg, Inbound::SyncReq(_)) {
-            // Followers get block sync and nothing else.
+        if !is_validator && !matches!(msg, Inbound::SyncReq(_) | Inbound::Oracle(_)) {
+            // Followers get block sync and beacon requests (the driver answers only `Want`
+            // from them) and nothing else.
             self.handle
                 .stats
                 .dropped_follower

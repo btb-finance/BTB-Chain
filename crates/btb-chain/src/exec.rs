@@ -83,6 +83,8 @@ pub enum Revert {
     Site(crate::site::SiteError),
     /// A DEX transaction was refused (nothing changed).
     Dex(crate::dex::DexError),
+    /// A storage transaction was refused (nothing changed).
+    Storage(crate::storage::StorageError),
     Vm(String),
 }
 
@@ -125,6 +127,8 @@ pub enum BlockError {
     TimestampBeforeParent,
     TooManyTxs,
     BlockGasLimit,
+    /// The block's oracle input is missing, malformed or does not verify (wrong beacon, ...).
+    Oracle(String),
     /// Balances + deposits no longer add up to the fixed supply (a bug; nothing was written).
     SupplyInvariant {
         expected: u128,
@@ -156,6 +160,7 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
         TxKind::Transfer { amount, .. } | TxKind::Stake { amount, .. } => fee.checked_add(*amount),
         TxKind::Channel(op) => fee.checked_add(op.debit()),
         TxKind::Dex(op) => fee.checked_add(op.debit()),
+        TxKind::Storage(op) => fee.checked_add(op.debit(&cfg.storage)),
         _ => Some(fee),
     }
 }
@@ -227,6 +232,14 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
             }
         }
         TxKind::SubmitEvidence { .. } | TxKind::Channel(_) | TxKind::Dex(_) => {
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::Storage(op) => {
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
             if !tx.verify_signature() {
                 return Err(Invalid::BadSignature);
             }
@@ -352,9 +365,18 @@ impl<S: KvStore> Ctx<'_, S> {
         function: &str,
         args: &[u8],
         vm_gas: u64,
+        entropy_id: &Hash,
     ) -> Result<RunResult, StateError> {
         let c = load_contract(&mut *self.cache, &record.code)?;
         let mut host = RuntimeHost::new(&self.overlay, &self.tables, contract, caller, self.height);
+        // Randomness: only a marked mutation or cron may ask (the VM enforces that); its
+        // bytes derive from the block beacon, this id (tx id, or the cron receipt id) and the
+        // call index. Such a function is always charged its full gas limit, so a caller
+        // cannot make an unwelcome outcome fail by running out of gas (see ORACLES.md).
+        let uses_randomness = kind != FunctionKind::Query && c.is_randomness(kind, function);
+        if uses_randomness {
+            host.enable_randomness(*entropy_id);
+        }
         let r = c.call(
             kind,
             function,
@@ -363,9 +385,10 @@ impl<S: KvStore> Ctx<'_, S> {
             vm_gas,
             self.cfg.vm_memory as usize,
         );
+        let full = |used: u64| if uses_randomness { vm_gas } else { used };
         Ok(match r {
             Ok(o) => {
-                let used = o.gas_used.min(vm_gas);
+                let used = full(o.gas_used.min(vm_gas));
                 match host.finish() {
                     Ok(b) => (used, Ok((o.output, b))),
                     Err(f) => (used, Err(Revert::Fault(format!("{f:?}")))),
@@ -373,8 +396,11 @@ impl<S: KvStore> Ctx<'_, S> {
             }
             Err(CallError::Trap { trap, gas_used }) => match trap {
                 Trap::OutOfGas => (vm_gas, Err(Revert::OutOfGas)),
-                Trap::Abort(m) => (gas_used.min(vm_gas), Err(Revert::Abort(m))),
-                t => (gas_used.min(vm_gas), Err(Revert::Trap(format!("{t:?}")))),
+                Trap::Abort(m) => (full(gas_used.min(vm_gas)), Err(Revert::Abort(m))),
+                t => (
+                    full(gas_used.min(vm_gas)),
+                    Err(Revert::Trap(format!("{t:?}"))),
+                ),
             },
             Err(CallError::NoSuchEntry { .. }) => (0, Err(Revert::NoSuchFunction)),
             Err(e) => (0, Err(Revert::Vm(format!("{e:?}")))),
@@ -496,6 +522,7 @@ impl<S: KvStore> Ctx<'_, S> {
         args: &[u8],
         gas_limit: u64,
         intrinsic: u64,
+        tx_id: &Hash,
     ) -> Result<Done, StateError> {
         let Some(rec) = self.contract_record(contract)? else {
             return Ok(Done {
@@ -517,6 +544,7 @@ impl<S: KvStore> Ctx<'_, S> {
             function,
             args,
             gas_limit - intrinsic,
+            tx_id,
         )?;
         let gas_used = intrinsic + used;
         Ok(match res {
@@ -643,6 +671,23 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::dex::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Storage(op) => {
+                let (scfg, height) = (self.cfg.storage, self.height);
+                let gas_used = tx.intrinsic_gas();
+                match crate::storage::apply(&mut self.overlay, &scfg, &sender, height, op) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::storage::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Storage(e)),
+                    },
+                    Err(crate::storage::Fail::State(e)) => return Err(e),
+                }
+            }
             TxKind::Site(op) => {
                 let gas_used = tx.intrinsic_gas();
                 match crate::site::apply(&mut self.overlay, &sender, op) {
@@ -674,6 +719,7 @@ impl<S: KvStore> Ctx<'_, S> {
                 args,
                 *gas_limit,
                 tx.intrinsic_gas(),
+                &id,
             )?,
         };
         let fee = done
@@ -765,6 +811,7 @@ impl<S: KvStore> Ctx<'_, S> {
                 &function,
                 &[],
                 self.cfg.cron_gas_limit,
+                &id,
             )?;
             let fee = used * self.cfg.gas_price;
             let res = res.and_then(|(out, batch)| {
@@ -942,6 +989,14 @@ impl Executor {
         };
         let mut receipts = Vec::with_capacity(block.txs.len());
         staking::begin_block(&mut ctx.overlay, h.height)?;
+        crate::oracle::begin_block(
+            &mut ctx.overlay,
+            cfg.chain_id,
+            cfg.staking.epoch_len,
+            h.height,
+            &block.oracle,
+        )
+        .map_err(BlockError::Oracle)?;
         let mut stats = None;
         let mut ran_parallel = false;
         let threads = match self.mode {
@@ -997,6 +1052,14 @@ impl Executor {
         }
         ctx.run_crons(&mut receipts)?;
         crate::dex::end_block(&mut ctx.overlay, &cfg, h.height)?;
+        crate::oracle::end_block(
+            &mut ctx.overlay,
+            cfg.chain_id,
+            cfg.staking.epoch_len,
+            h.height,
+            &block.oracle.observations,
+        )?;
+        crate::storage::end_block(&mut ctx.overlay, &cfg.storage, h.height, h.hash())?;
         staking::end_block(&mut ctx.overlay, &cfg.staking, h.height, h.hash())?;
         let new_head = Head {
             height: h.height,

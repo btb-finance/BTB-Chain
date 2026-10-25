@@ -90,3 +90,33 @@ fn cron_every_exports_a_schedule_marker() {
     // The marker is a plain symbol `btb_every_<blocks>_<name>` that `btb deploy` reads.
     let _: extern "C" fn() = btb_every_3600_hourly;
 }
+
+#[btb::mutation(randomness)]
+pub fn dice() -> u8 {
+    0
+}
+
+#[btb::cron(randomness, every = "10 blocks")]
+pub fn lottery() {}
+
+#[btb::cron(every = "7 blocks", randomness)]
+pub fn lottery2() {}
+
+#[btb::cron(randomness)]
+pub fn unscheduled_lottery() {}
+
+#[test]
+fn randomness_exports_a_marker_symbol() {
+    // `btb_randomness_<kind>_<name>` is what the VM reads from the ELF; it is independent of
+    // the schedule marker.
+    let _: extern "C" fn() = btb_randomness_mutation_dice;
+    let _: extern "C" fn() = btb_randomness_cron_lottery;
+    let _: extern "C" fn() = btb_every_10_lottery;
+    let _: extern "C" fn() = btb_randomness_cron_lottery2;
+    let _: extern "C" fn() = btb_every_7_lottery2;
+    let _: extern "C" fn() = btb_randomness_cron_unscheduled_lottery;
+    assert_eq!(dice(), 0);
+    lottery();
+    lottery2();
+    unscheduled_lottery();
+}

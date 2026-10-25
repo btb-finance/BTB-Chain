@@ -6,7 +6,7 @@ Example BTB contract: a persistent counter with a `Change` table.
 | --- | --- |
 | query | `get() -> u64`, `change(id: u64) -> Option<(u64, u64, u64)>` |
 | mutation | `increment(by: u64) -> u64` (aborts on overflow) |
-| cron | `tick()` |
+| cron | `tick()` every 10 blocks (`#[btb::cron(every = "10 blocks")]`) |
 | query | `increment_in_query(by)`: deliberately illegal, a test fixture showing `WriteInQuery` |
 
 ```

@@ -25,6 +25,7 @@ use crate::config::NodeParams;
 use crate::explorer::tx_json;
 use crate::hex;
 use crate::net::NetHandle;
+use crate::oracle::{OracleMsg, OracleNode};
 use crate::storage::{ExecLog, ExecMeta, FileSafety};
 use crate::sync::{self, Expect, SyncError};
 use crate::wire::{
@@ -32,8 +33,8 @@ use crate::wire::{
     SyncResponse, MAX_PAYLOAD,
 };
 use btb_chain::{
-    account_address, Address, Block as ChainBlock, ChainState, Executor, Mempool, MempoolConfig,
-    Receipt, Status, Transaction, TxBody, TxKind,
+    account_address, Address, Block as ChainBlock, ChainConfig, ChainState, Executor, Mempool,
+    MempoolConfig, OracleInput, Receipt, Status, Transaction, TxBody, TxKind,
 };
 use btb_consensus::{
     Action, Anchor, Block as ConsensusBlock, Config as ConsensusConfig, Context, Evidence, Hash,
@@ -193,6 +194,42 @@ struct Driver<S: KvStore + 'static> {
     /// Stall time before asking for blocks, and the spacing of requests (`NodeParams::sync_poll_ms`).
     sync_stall: Duration,
     sync_gap: Duration,
+    /// Beacon partials and price observations (`None`: the chain has no oracle config).
+    oracle: Option<OracleNode>,
+    /// Committed blocks waiting for their beacon before they can be executed (oracle chains only).
+    pending_exec: VecDeque<btb_consensus::Block>,
+}
+
+/// `(sender, nonce)` of every transaction in the given block payloads.
+fn payload_nonces(payloads: &[&[u8]]) -> HashSet<(Address, u64)> {
+    let mut out = HashSet::new();
+    for p in payloads {
+        for tx in Batch::decode(p).map(|b| b.txs).unwrap_or_default() {
+            out.insert((tx.sender(), tx.body.nonce));
+        }
+    }
+    out
+}
+
+/// Mempool transactions for the next block, skipping every `(sender, nonce)` in `taken`
+/// (already in a pending block) and so continuing each sender at its first free nonce.
+fn select_txs(
+    mempool: &Mempool,
+    state_nonce: impl Fn(&Address) -> u64,
+    taken: &HashSet<(Address, u64)>,
+    cfg: &ChainConfig,
+) -> Vec<Transaction> {
+    mempool.select(
+        |a| {
+            let mut n = state_nonce(a);
+            while taken.contains(&(*a, n)) {
+                n += 1;
+            }
+            n
+        },
+        cfg.max_block_txs as usize,
+        cfg.block_gas_limit,
+    )
 }
 
 fn now_ms() -> u64 {
@@ -254,6 +291,7 @@ impl<S: KvStore + 'static> Driver<S> {
         if let Some(h) = p.test_exec_fault_from {
             exec_win.inject_fault(h);
         }
+        let oracle = OracleNode::from_state(&state, p)?;
         let now = Instant::now();
         let mut d = Driver {
             replica: None,
@@ -300,6 +338,8 @@ impl<S: KvStore + 'static> Driver<S> {
             sync_gap: p
                 .sync_poll_ms
                 .map_or(SYNC_GAP, |m| Duration::from_millis(m).min(SYNC_GAP)),
+            oracle,
+            pending_exec: VecDeque::new(),
         };
         d.begin_epoch(epoch)?;
         Ok(d)
@@ -439,6 +479,7 @@ impl<S: KvStore + 'static> Driver<S> {
             self.apply(acts, e);
         }
         self.check_epoch_switch();
+        self.oracle_tick();
         self.flush_evidence();
         if !self.proofs_wanted.is_empty() {
             self.resolve_proofs();
@@ -510,6 +551,7 @@ impl<S: KvStore + 'static> Driver<S> {
             Input::Net(_, Inbound::Tx(bytes)) => {
                 let _ = self.add_tx(&bytes, None);
             }
+            Input::Net(from, Inbound::Oracle(b)) => self.on_oracle(from, &b),
             Input::Net(from, Inbound::SyncReq(h)) => self.serve_sync(from, h),
             Input::Net(from, Inbound::SyncResp(r)) => self.on_sync_response(from, *r),
             Input::Rpc {
@@ -539,6 +581,10 @@ impl<S: KvStore + 'static> Driver<S> {
             for tx in &b.txs {
                 self.inflight.insert((tx.sender(), tx.body.nonce), now);
                 self.note_evidence_tx(tx);
+            }
+            if let Some(o) = self.oracle.as_mut() {
+                // Observations already in a proposal need not be proposed again.
+                o.prices.note_included(&b.observations);
             }
         }
     }
@@ -631,13 +677,18 @@ impl<S: KvStore + 'static> Driver<S> {
         {
             return;
         }
-        let payload = self.select_payload();
+        let tip = rep.high_qc().block_id;
+        let payload = self.select_payload(&tip);
         let tail = self.max_nonempty_round > s.committed_round;
         let idle = self.last_progress.elapsed() >= self.idle_block;
         if payload.is_empty() && !tail && !idle {
             return;
         }
         self.proposed_for_round = r;
+        if let (Some(o), Some(b)) = (self.oracle.as_mut(), Batch::decode(&payload)) {
+            // They are in our proposal now; a failed round makes validators observe again.
+            o.prices.note_included(&b.observations);
+        }
         let epoch = self.epoch;
         if let Some(rep) = self.replica.as_mut() {
             let acts = rep.propose(payload);
@@ -655,21 +706,24 @@ impl<S: KvStore + 'static> Driver<S> {
             .map_or(u32::MAX, |i| i as u32)
     }
 
-    /// Transactions for the next block, as an encoded `Batch` (empty bytes if none).
-    fn select_payload(&self) -> Vec<u8> {
-        let cfg = *self.state.config();
-        let inflight = &self.inflight;
+    /// Transactions for the next block (a child of consensus block `tip`), as an encoded
+    /// `Batch` (empty bytes if none).
+    ///
+    /// Transactions in the uncommitted ancestors of `tip` can still commit, so they are never
+    /// proposed again in this chain (the executor would skip the copy as `BadNonce`, and the
+    /// copy's receipt would hide the real one). Transactions seen in other recent proposals
+    /// are held back for `inflight_ttl`, but that is only a hint: a proposal can commit later.
+    fn select_payload(&self, tip: &Hash) -> Vec<u8> {
+        let mut taken: HashSet<(Address, u64)> = self.inflight.keys().copied().collect();
+        if let Some(rep) = self.replica.as_ref() {
+            taken.extend(payload_nonces(&rep.uncommitted_payloads(tip)));
+        }
         let state = &self.state;
-        let txs = self.mempool.select(
-            |a| {
-                let mut n = state.nonce(a).unwrap_or(0);
-                while inflight.contains_key(&(*a, n)) {
-                    n += 1;
-                }
-                n
-            },
-            cfg.max_block_txs as usize,
-            cfg.block_gas_limit,
+        let txs = select_txs(
+            &self.mempool,
+            |a| state.nonce(a).unwrap_or(0),
+            &taken,
+            state.config(),
         );
         let mut size = 64;
         let mut out = Vec::new();
@@ -681,19 +735,98 @@ impl<S: KvStore + 'static> Driver<S> {
             size += n;
             out.push(tx);
         }
-        if out.is_empty() {
+        // Price observations the proposer collected ride along (and make a block worth
+        // proposing even without transactions).
+        let observations = self.oracle.as_ref().map_or_else(Vec::new, |o| {
+            let head = self.exec_log.done().height;
+            o.prices.for_proposal(head)
+        });
+        if out.is_empty() && observations.is_empty() {
             return Vec::new();
         }
         Batch {
             timestamp: now_ms(),
             txs: out,
+            observations,
         }
         .encode()
     }
 
     // -------------------------------------------------------------- execution
 
+    /// A block was committed. Without oracles it is executed at once. With oracles it is queued
+    /// and executed as soon as its beacon is known: the validators release their partial
+    /// signatures for a height only now, after it is final, so the block's content cannot
+    /// depend on the randomness it will see.
     fn execute_commit(&mut self, block: btb_consensus::Block) {
+        if self.oracle.is_none() {
+            return self.execute_now(block, None);
+        }
+        let last = self
+            .pending_exec
+            .back()
+            .map_or(self.exec_log.done().height, |b| b.height);
+        if block.height <= last {
+            return; // re-delivered after a restart, or already queued
+        }
+        if block.height != last + 1 {
+            self.fatal = Some(format!(
+                "committed height {} does not follow height {last}",
+                block.height
+            ));
+            return;
+        }
+        let height = block.height;
+        self.pending_exec.push_back(block);
+        let released = self
+            .oracle
+            .as_mut()
+            .and_then(|o| o.beacons.on_commit(height));
+        if let Some(m) = released {
+            self.net.broadcast(m.frame());
+        }
+        self.drain_pending_exec();
+    }
+
+    /// Execute queued blocks whose beacon is available, in order. Returns whether any ran.
+    fn drain_pending_exec(&mut self) -> bool {
+        let mut ran = false;
+        while self.fatal.is_none() {
+            let Some(front) = self.pending_exec.front() else {
+                break;
+            };
+            let h = front.height;
+            let beacon = self.oracle.as_ref().and_then(|o| o.beacons.get(h)).cloned();
+            let Some(beacon) = beacon else {
+                if let Some(o) = self.oracle.as_mut() {
+                    if o.waiting.map(|w| w.0) != Some(h) {
+                        o.waiting = Some((h, Instant::now(), None));
+                    }
+                }
+                break;
+            };
+            let block = self.pending_exec.pop_front().expect("front exists");
+            self.execute_now(block, Some(beacon));
+            ran = true;
+        }
+        if self.pending_exec.is_empty() {
+            if let Some(o) = self.oracle.as_mut() {
+                o.waiting = None;
+            }
+        }
+        ran
+    }
+
+    /// Execution that happens outside `apply` (a beacon arrived): the replica may have been
+    /// waiting for it.
+    fn after_oracle_execution(&mut self, ran: bool) {
+        if ran {
+            self.check_epoch_switch();
+            self.resume_replica();
+        }
+    }
+
+    fn execute_now(&mut self, block: btb_consensus::Block, beacon: Option<btb_oracle::Beacon>) {
         let done = self.exec_log.done();
         if block.height <= done.height {
             return; // re-delivered after a restart; already executed
@@ -705,12 +838,16 @@ impl<S: KvStore + 'static> Driver<S> {
             ));
             return;
         }
-        if let Err(e) = self.try_execute(block) {
+        if let Err(e) = self.try_execute(block, beacon) {
             self.fatal = Some(e);
         }
     }
 
-    fn try_execute(&mut self, block: btb_consensus::Block) -> Result<(), String> {
+    fn try_execute(
+        &mut self,
+        block: btb_consensus::Block,
+        beacon: Option<btb_oracle::Beacon>,
+    ) -> Result<(), String> {
         // A committed block was certified by a quorum, and every honest voter checked its
         // attestation against its own execution. If ours differs, either this node computed
         // another state (a bug) or more than a third of the stake is faulty. Either way it
@@ -726,9 +863,9 @@ impl<S: KvStore + 'static> Driver<S> {
             })?;
         let head = self.state.head().map_err(|e| e.to_string())?;
         let root = self.state.root().map_err(|e| e.to_string())?;
-        let (ts, txs) = match Batch::decode(&block.payload) {
-            Some(b) => (b.timestamp.max(head.timestamp), b.txs),
-            None => (head.timestamp, Vec::new()),
+        let (ts, txs, observations) = match Batch::decode(&block.payload) {
+            Some(b) => (b.timestamp.max(head.timestamp), b.txs, b.observations),
+            None => (head.timestamp, Vec::new(), Vec::new()),
         };
         let meta = ExecMeta {
             height: block.height,
@@ -736,7 +873,11 @@ impl<S: KvStore + 'static> Driver<S> {
             id: block.id(),
         };
         self.exec_log.begin(meta, head.height)?;
-        let chain_block = ChainBlock::new(head.height + 1, head.hash, ts, root, txs);
+        let chain_block =
+            ChainBlock::new(head.height + 1, head.hash, ts, root, txs).with_oracle(OracleInput {
+                beacon: beacon.clone(),
+                observations,
+            });
         let (chain_block, receipts, new_root) = match self
             .executor
             .execute_block(&mut self.state, &chain_block)
@@ -750,7 +891,11 @@ impl<S: KvStore + 'static> Driver<S> {
                     self.index()
                 );
                 let empty =
-                    ChainBlock::new(head.height + 1, head.hash, head.timestamp, root, Vec::new());
+                    ChainBlock::new(head.height + 1, head.hash, head.timestamp, root, Vec::new())
+                        .with_oracle(OracleInput {
+                            beacon: beacon.clone(),
+                            observations: Vec::new(),
+                        });
                 let (r, nr) = self
                     .executor
                     .execute_block(&mut self.state, &empty)
@@ -779,6 +924,15 @@ impl<S: KvStore + 'static> Driver<S> {
         };
         self.store.put(&stored)?;
         self.exec_log.finish()?;
+        if let Some(b) = &beacon {
+            self.store.put_beacon(h, &b.encode())?;
+        }
+        if let Some(o) = self.oracle.as_mut() {
+            o.beacons.prune(h);
+            if let Some(b) = Batch::decode(&stored.consensus.payload) {
+                o.prices.note_included(&b.observations);
+            }
+        }
 
         let now = Instant::now();
         self.last_progress = now;
@@ -810,6 +964,77 @@ impl<S: KvStore + 'static> Driver<S> {
             self.resolve_proofs();
         }
         Ok(())
+    }
+
+    // -------------------------------------------------------------- oracles
+
+    /// An oracle frame from `from`. Followers (non-validators) may only ask for beacons.
+    fn on_oracle(&mut self, from: [u8; 32], bytes: &[u8]) {
+        let Some(msg) = OracleMsg::decode(bytes) else {
+            return;
+        };
+        let is_validator = self.keys.contains(&from);
+        let Some(o) = self.oracle.as_mut() else {
+            return;
+        };
+        let completed = match msg {
+            OracleMsg::Want { height } => {
+                let b = o.beacons.get(height).cloned().or_else(|| {
+                    self.store
+                        .beacon(height)
+                        .and_then(|raw| btb_oracle::Beacon::decode(&raw))
+                });
+                if let Some(b) = b {
+                    self.net.send(from, OracleMsg::Beacon(b).frame());
+                }
+                false
+            }
+            _ if !is_validator => false,
+            OracleMsg::Partial { height, index, sig } => {
+                o.beacons.on_partial(&from, height, index, &sig).is_some()
+            }
+            OracleMsg::Beacon(b) => o.beacons.on_beacon(b),
+            OracleMsg::Price(ob) => {
+                o.prices.on_observation(ob, &self.keys);
+                false
+            }
+        };
+        if completed {
+            let ran = self.drain_pending_exec();
+            self.after_oracle_execution(ran);
+        }
+    }
+
+    /// Periodic oracle work: observe prices, ask peers for a beacon that is late.
+    fn oracle_tick(&mut self) {
+        if self.oracle.is_none() {
+            return;
+        }
+        let me_in_set = self.index() != u32::MAX;
+        let head = self.exec_log.done().height;
+        let now = Instant::now();
+        let mut out = Vec::new();
+        if let Some(o) = self.oracle.as_mut() {
+            if me_in_set {
+                for ob in o.prices.tick(now, head) {
+                    out.push(OracleMsg::Price(ob).frame());
+                }
+            }
+            if let Some((h, since, last)) = o.waiting {
+                let due = now.duration_since(since) >= crate::oracle::WANT_AFTER
+                    && last.is_none_or(|l| now.duration_since(l) >= crate::oracle::WANT_EVERY);
+                if due {
+                    o.waiting = Some((h, since, Some(now)));
+                    out.push(OracleMsg::Want { height: h }.frame());
+                }
+            }
+        }
+        for f in out {
+            self.net.broadcast(f);
+        }
+        // A beacon may have arrived through another path (the block store, a peer).
+        let ran = self.drain_pending_exec();
+        self.after_oracle_execution(ran);
     }
 
     // -------------------------------------------------------------- consensus block recovery
@@ -1546,7 +1771,11 @@ impl<S: KvStore + 'static> Driver<S> {
                     }),
                 })
             }
+            m if m.starts_with("btb_oracle") => {
+                crate::oracle_rpc::handle(&self.state, &self.store, m, arr)
+            }
             m if m.starts_with("btb_dex") => crate::dex_rpc::handle(&self.state, m, arr),
+            m if m.starts_with("btb_storage") => crate::storage_rpc::handle(&self.state, m, arr),
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {method}"),
@@ -1602,6 +1831,12 @@ impl<S: KvStore + 'static> Driver<S> {
                 "exec_rejected": st.exec_rejected,
                 "exec_deferred": st.exec_deferred,
             },
+            "oracle": self.oracle.as_ref().map(|o| json!({
+                "holds_share": o.beacons.holds_share(),
+                "blocks_waiting_for_beacon": self.pending_exec.len(),
+                "rejected_partials": o.beacons.rejected,
+                "pending_prices": o.prices.pending(),
+            })),
             "evidence": self.evidence,
             "evidence_submitted": self.evidence_submitted,
             "history": {
@@ -1691,4 +1926,68 @@ fn block_json(h: u64, b: &StoredBlock) -> Value {
         "transactions": b.tx_ids.iter().map(|i| hex::encode(i)).collect::<Vec<_>>(),
         "receipts": b.receipts.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btb_chain::MempoolConfig;
+
+    const CHAIN_ID: u64 = 7;
+
+    fn transfers(key: &SigningKey, nonces: std::ops::Range<u64>) -> Vec<Transaction> {
+        nonces
+            .map(|nonce| {
+                Transaction::sign(
+                    TxBody {
+                        chain_id: CHAIN_ID,
+                        nonce,
+                        kind: TxKind::Transfer {
+                            to: [9; 32],
+                            amount: 1,
+                        },
+                    },
+                    key,
+                )
+            })
+            .collect()
+    }
+
+    /// Regression: a transaction in an uncommitted block (for example one that gathered a QC
+    /// but whose commit is still one round away) used to be proposed again once the
+    /// `inflight` hint had expired after a few round timeouts. Both copies committed, the
+    /// second failed with `BadNonce` and its receipt replaced the real one.
+    #[test]
+    fn transactions_of_uncommitted_ancestors_are_not_reproposed() {
+        let key = SigningKey::from_bytes(&[5; 32]);
+        let sender = account_address(&key.verifying_key().to_bytes());
+        let cfg = ChainConfig::new(CHAIN_ID);
+        let mut pool = Mempool::new(cfg, MempoolConfig::default());
+        let txs = transfers(&key, 0..4);
+        for t in &txs {
+            pool.insert(t.clone(), 0, u64::MAX).unwrap();
+        }
+        // An ancestor block carries nonces 0 and 1; the state is still at nonce 0 and the
+        // inflight hint has long expired (empty).
+        let ancestor = Batch {
+            timestamp: 1,
+            txs: txs[..2].to_vec(),
+            observations: Vec::new(),
+        }
+        .encode();
+        let taken = payload_nonces(&[ancestor.as_slice()]);
+        let picked = select_txs(&pool, |_| 0, &taken, &cfg);
+        let nonces: Vec<u64> = picked.iter().map(|t| t.body.nonce).collect();
+        assert_eq!(nonces, vec![2, 3]);
+        assert!(picked.iter().all(|t| t.sender() == sender));
+        // Without ancestors the same pool proposes from nonce 0 (the bug's behaviour).
+        let none = select_txs(&pool, |_| 0, &HashSet::new(), &cfg);
+        assert_eq!(none.len(), 4);
+        // Already committed (state nonce 2) but not yet pruned from the pool: never selected.
+        let committed = select_txs(&pool, |_| 2, &HashSet::new(), &cfg);
+        let nonces: Vec<u64> = committed.iter().map(|t| t.body.nonce).collect();
+        assert_eq!(nonces, vec![2, 3]);
+        // An undecodable ancestor payload (an empty block) takes nothing.
+        assert!(payload_nonces(&[&[][..]]).is_empty());
+    }
 }

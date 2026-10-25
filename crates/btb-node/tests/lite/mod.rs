@@ -117,6 +117,17 @@ impl Lite {
         epoch_len: u64,
         followers: Option<FollowerPolicy>,
     ) -> Lite {
+        Self::with_storage(n, running, epoch_len, followers, Default::default())
+    }
+
+    /// Like `with_running`, with storage-node parameters in the genesis.
+    pub fn with_storage(
+        n: usize,
+        running: usize,
+        epoch_len: u64,
+        followers: Option<FollowerPolicy>,
+        storage: btb_chain::StorageConfig,
+    ) -> Lite {
         let keys: Vec<SigningKey> = (0..n).map(|i| key(10 + i as u8)).collect();
         let faucet = Wallet::new(99);
         let per = 1_000 * UNITS_PER_BTB;
@@ -132,6 +143,8 @@ impl Lite {
             gas_price: 1,
             epoch_len,
             min_stake: 100 * UNITS_PER_BTB,
+            storage,
+            oracle: None,
             validators: keys
                 .iter()
                 .map(|k| (k.verifying_key().to_bytes(), 100 * UNITS_PER_BTB))

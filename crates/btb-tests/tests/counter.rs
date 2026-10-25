@@ -231,3 +231,14 @@ fn sdk_host_call_numbers_match_the_vm() {
         assert_eq!(a, b);
     }
 }
+
+#[test]
+fn sdk_oracle_host_call_numbers_match_the_vm() {
+    use btb_sdk::oracle::num;
+    assert_eq!(num::RANDOM_BYTES, abi::RANDOM_BYTES);
+    assert_eq!(num::PRICE, abi::PRICE);
+    assert_eq!(
+        btb_sdk::oracle::MAX_RANDOM_BYTES as u64,
+        abi::MAX_RANDOM_BYTES
+    );
+}

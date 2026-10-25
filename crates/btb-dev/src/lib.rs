@@ -412,6 +412,19 @@ fn run<S: KvStore>(
     height: u64,
 ) -> Result<(Vec<u8>, WriteBatch, ReadSet), (&'static str, String)> {
     let mut host = RuntimeHost::new(store, &sh.tables, CONTRACT, caller, height);
+    if kind != FunctionKind::Query {
+        // No beacon on a development server: marked functions get numbers from a fixed seed so
+        // they can be tried out. Different on every call; not random in any security sense.
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(
+            &CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_le_bytes(),
+        );
+        id[8..].copy_from_slice(&caller[..24]);
+        host.enable_dev_randomness(*b"btb.dev.randomness.not.secure!!!", id);
+    }
     let contract = sh.contract.read().unwrap().clone();
     let out = contract
         .call(kind, function, args, &mut host, GAS, MEM)

@@ -6,7 +6,7 @@
 //! `src/dex.rs`.
 
 mod support;
-use btb_chain::dex::{pair_id, DexError, Outcome, Side, MAX_OPEN_ORDERS};
+use btb_chain::dex::{pair_id, DexError, Outcome, Side, MAX_OPEN_ORDERS, MAX_ORDER_AMOUNT};
 use btb_chain::*;
 use btb_codec::Address as CodecAddress;
 use btb_runtime::{KvStore, MemKv};
@@ -34,8 +34,8 @@ fn place(
     w: &mut Wallet,
     sell: Asset,
     buy: Asset,
-    sell_amount: u64,
-    buy_amount: u64,
+    sell_amount: u128,
+    buy_amount: u128,
     batches: u32,
 ) -> Transaction {
     w.sign(TxKind::Dex(DexOp::Place {
@@ -165,7 +165,7 @@ impl World {
         for p in self.net.state.dex_pairs().unwrap() {
             for o in self.net.state.dex_book(&p.id).unwrap() {
                 let sold = if o.side == Side::Ask { o.base } else { o.quote };
-                *escrow.entry(sold).or_default() += u128::from(o.escrow);
+                *escrow.entry(sold).or_default() += o.escrow;
                 assert!(o.base_rem > 0 && o.escrow > 0 && o.batches_left > 0);
             }
         }
@@ -632,7 +632,7 @@ fn malformed_and_hostile_orders_are_refused_without_effect() {
         place(&mut a, Asset::Btb, gold, 5, 5, (1 << 20) + 1), // too long
         place(&mut a, fake, gold, 5, 5, 1),             // token that does not exist
         place(&mut a, gold, fake, 5, 5, 1),
-        place(&mut a, gold, silver, (FAUCET + 1) as u64, 5, 1), // more than the balance
+        place(&mut a, gold, silver, FAUCET + 1, 5, 1), // more than the balance
     ];
     let r = w.net.run(txs);
     let want = [
@@ -659,7 +659,14 @@ fn malformed_and_hostile_orders_are_refused_without_effect() {
     assert_eq!(snap[0] - after[0], gas);
     assert_eq!(snap[1..], after[1..]);
     // Not enough BTB for escrow + fee is invalid (never enters a block's effects).
-    let r = w.net.run(vec![place(&mut b, Asset::Btb, gold, RICH, 1, 1)]);
+    let r = w.net.run(vec![place(
+        &mut b,
+        Asset::Btb,
+        gold,
+        u128::from(RICH),
+        1,
+        1,
+    )]);
     assert!(
         matches!(
             r[0].status,
@@ -769,7 +776,7 @@ fn extreme_amounts_and_prices_do_not_overflow_or_create_tokens() {
         w.net.run(txs).iter().for_each(ok);
     }
     let (x, y) = (Asset::Token(ids[0]), Asset::Token(ids[1]));
-    let m = u64::MAX;
+    let m = u128::from(u64::MAX);
     let r = w.net.run(vec![
         place(&mut a, x, y, m, m, 2),
         place(&mut b, y, x, m, 1, 2), // pays up to u64::MAX of y for a single unit of x
@@ -808,6 +815,164 @@ fn extreme_amounts_and_prices_do_not_overflow_or_create_tokens() {
         assert_eq!(token_total(w.net.state.store(), t), 1u128 << 100);
     }
 }
+// Amounts beyond u64 ---------------------------------------------------------------
+
+/// Two tokens with supply 2^110 whose faucet gives 2^100 (= `MAX_ORDER_AMOUNT`) per claim.
+/// Returns `[base, quote]` of their pair.
+fn wide_world(traders: usize) -> (World, [Asset; 2], Vec<Wallet>) {
+    let mut w = World::new(traders, |_| {});
+    let mut issuer = w.wallets.remove(0);
+    let mut traders: Vec<Wallet> = w.wallets.drain(..).collect();
+    let mut ids = vec![];
+    for (n, s) in [("Wide", "WID"), ("Deep", "DEP")] {
+        let r = w.net.run(vec![issuer.call(
+            w.launcher,
+            "launch",
+            &(
+                n.to_string(),
+                s.to_string(),
+                18u8,
+                1u128 << 110,
+                MAX_ORDER_AMOUNT,
+                false,
+            ),
+        )]);
+        ok(&r[0]);
+        ids.push(bytes32(&r[0].output));
+    }
+    for t in &ids {
+        let txs: Vec<_> = traders
+            .iter_mut()
+            .map(|t_| t_.call(w.launcher, "claim", &CodecAddress(*t)))
+            .collect();
+        w.net.run(txs).iter().for_each(ok);
+    }
+    let (base, quote) = btb_chain::dex::pair_of(&Asset::Token(ids[0]), &Asset::Token(ids[1]));
+    w.tokens.extend(ids);
+    (w, [base, quote], traders)
+}
+
+#[test]
+fn orders_far_beyond_u64_clear_exactly() {
+    let (mut w, [base, quote], mut t) = wide_world(2);
+    let mut b = t.pop().unwrap();
+    let mut a = t.pop().unwrap();
+    let (a_base, a_quote) = (w.tok(&base, &a.addr()), w.tok(&quote, &a.addr()));
+    let (b_base, b_quote) = (w.tok(&base, &b.addr()), w.tok(&quote, &b.addr()));
+    let half = MAX_ORDER_AMOUNT / 2;
+    // a sells 2^99 base for 2^100 quote (price 2); b sells 2^100 quote for 2^99 base.
+    let r = w.net.run(vec![
+        place(&mut a, base, quote, half, MAX_ORDER_AMOUNT, 1),
+        place(&mut b, quote, base, MAX_ORDER_AMOUNT, half, 1),
+    ]);
+    r.iter().for_each(ok);
+    let fee = |v: u128| v * 10 / 10_000; // dex_fee_bps = 10
+    let c = w
+        .net
+        .state
+        .dex_last_price(&pair_id(&base, &quote))
+        .unwrap()
+        .unwrap();
+    assert_eq!((c.n, c.d), (2, 1), "price is quote per base");
+    assert_eq!(c.base_volume, half);
+    assert_eq!(c.quote_volume, MAX_ORDER_AMOUNT);
+    assert_eq!(w.tok(&base, &a.addr()), a_base - half);
+    assert_eq!(
+        w.tok(&quote, &a.addr()),
+        a_quote + MAX_ORDER_AMOUNT - fee(MAX_ORDER_AMOUNT)
+    );
+    assert_eq!(w.tok(&base, &b.addr()), b_base + half - fee(half));
+    assert_eq!(w.tok(&quote, &b.addr()), b_quote - MAX_ORDER_AMOUNT);
+    // Every unit is accounted for: holders plus vault plus fee account equal the supply.
+    for t in &w.tokens[2..] {
+        assert_eq!(token_total(w.net.state.store(), t), 1u128 << 110);
+    }
+    for t in [&base, &quote] {
+        assert_eq!(w.net.state.dex_vault_balance(t).unwrap(), 0);
+    }
+    assert!(w.net.state.dex_orders_of(&a.addr()).unwrap().is_empty());
+}
+
+#[test]
+fn wide_pro_rata_rationing_and_cancel_refund() {
+    let (mut w, [base, quote], mut t) = wide_world(3);
+    let (mut c, mut b, mut a) = (t.pop().unwrap(), t.pop().unwrap(), t.pop().unwrap());
+    let half = MAX_ORDER_AMOUNT / 2;
+    // One ask of 2^100 base at price 1 against bids for 2^99 + 1 and 2^99: the bids want one
+    // unit more than offered, so the long side is rationed. By hand: floors are 2^99 and
+    // 2^99 - 1 (remainders 2^99 and 2^99 + 1), the spare unit goes to the larger remainder.
+    let r = w.net.run(vec![
+        place(&mut a, base, quote, MAX_ORDER_AMOUNT, MAX_ORDER_AMOUNT, 1),
+        place(&mut b, quote, base, half + 1, half + 1, 1),
+        place(&mut c, quote, base, half, half, 1),
+    ]);
+    r.iter().for_each(ok);
+    let cl = w
+        .net
+        .state
+        .dex_last_price(&pair_id(&base, &quote))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cl.base_volume, MAX_ORDER_AMOUNT);
+    assert_eq!((cl.n, cl.d), (1, 1));
+    let filled = |who: &Wallet| w.net.state.dex_results_of(&who.addr(), 10).unwrap()[0].filled;
+    assert_eq!(filled(&a), MAX_ORDER_AMOUNT);
+    assert_eq!(filled(&b), half);
+    assert_eq!(filled(&c), half);
+    for t in &w.tokens[2..] {
+        assert_eq!(token_total(w.net.state.store(), t), 1u128 << 110);
+    }
+    // A big order cancelled returns its whole escrow, reported as 16 little-endian bytes.
+    let r = w.net.run(vec![place(
+        &mut c,
+        base,
+        quote,
+        MAX_ORDER_AMOUNT,
+        MAX_ORDER_AMOUNT * 3 / 4,
+        5,
+    )]);
+    ok(&r[0]);
+    let id = bytes32(&r[0].output);
+    let before = w.tok(&base, &c.addr());
+    let r = w.net.run(vec![cancel(&mut c, id)]);
+    ok(&r[0]);
+    assert_eq!(r[0].output, MAX_ORDER_AMOUNT.to_le_bytes().to_vec());
+    assert_eq!(w.tok(&base, &c.addr()), before + MAX_ORDER_AMOUNT);
+}
+
+#[test]
+fn amounts_above_the_cap_and_unaffordable_btb_are_refused() {
+    let (mut w, [base, quote], mut t) = wide_world(1);
+    let mut a = t.pop().unwrap();
+    let r = w.net.run(vec![
+        place(&mut a, base, quote, MAX_ORDER_AMOUNT + 1, 1, 1),
+        place(&mut a, base, quote, 1, MAX_ORDER_AMOUNT + 1, 1),
+        place(&mut a, base, quote, u128::MAX, u128::MAX, 1),
+    ]);
+    for rc in &r {
+        assert_eq!(revert(rc), DexError::AmountTooLarge);
+    }
+    // BTB balances are u64: an escrow above that is never affordable, and the conversion for
+    // the transaction's maximum cost saturates instead of wrapping.
+    let btb_over_u64 = u128::from(u64::MAX) + 1;
+    let r = w
+        .net
+        .run(vec![place(&mut a, Asset::Btb, base, btb_over_u64, 1, 1)]);
+    assert!(
+        matches!(r[0].status, Status::Invalid(_)),
+        "{:?}",
+        r[0].status
+    );
+    let op = DexOp::Place {
+        sell: Asset::Btb,
+        buy: base,
+        sell_amount: btb_over_u64,
+        buy_amount: 1,
+        batches: 1,
+    };
+    assert_eq!(op.debit(), u64::MAX);
+    assert!(w.net.state.dex_pairs().unwrap().is_empty());
+}
 
 // Front-running: order within a batch is irrelevant ---------------------------------------
 
@@ -833,8 +998,8 @@ fn random_orders(w: &mut World, rng: &mut Lcg, traders: usize, per: usize) -> Ve
                 &mut w.wallets[t],
                 assets[si],
                 assets[bi],
-                sell_amount,
-                buy_amount,
+                u128::from(sell_amount),
+                u128::from(buy_amount),
                 batches,
             ));
         }
@@ -971,8 +1136,8 @@ fn every_fill_in_a_batch_is_at_the_one_clearing_price() {
                     &mut w.wallets[t],
                     Asset::Btb,
                     gold,
-                    amt,
-                    amt * price + rng.below(3),
+                    u128::from(amt),
+                    u128::from(amt * price + rng.below(3)),
                     1,
                 )
             } else {
@@ -980,8 +1145,8 @@ fn every_fill_in_a_batch_is_at_the_one_clearing_price() {
                     &mut w.wallets[t],
                     gold,
                     Asset::Btb,
-                    amt * price + rng.below(5),
-                    amt,
+                    u128::from(amt * price + rng.below(5)),
+                    u128::from(amt),
                     1,
                 )
             });
@@ -1007,8 +1172,8 @@ fn every_fill_in_a_batch_is_at_the_one_clearing_price() {
                 continue;
             }
             checked += 1;
-            let v = res.filled * u128::from(c.n);
-            let (fl, ce) = (v / u128::from(c.d), v.div_ceil(u128::from(c.d)));
+            let (fl, rem) = btb_chain::dex::mul_div_checked(res.filled, c.n, c.d).unwrap();
+            let ce = fl + u128::from(rem != 0);
             match res.side {
                 Side::Ask => assert_eq!(res.quote_traded, fl),
                 Side::Bid => assert_eq!(res.quote_traded, ce),
@@ -1133,7 +1298,7 @@ fn dex_transactions_round_trip_and_unknown_sub_tags_are_rejected() {
             &mut w,
             Asset::Token([9; 32]),
             Asset::Token([3; 32]),
-            u64::MAX,
+            u128::MAX,
             1,
             u32::MAX,
         ),

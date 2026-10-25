@@ -1,6 +1,7 @@
 //! In-memory `Host` for tests and tooling.
 
-use crate::host::{Address, Host};
+use crate::host::{Address, Host, PriceRecord};
+use crate::rand::RandomSource;
 use crate::token::{TokenId, TokenInfo, TokenStore};
 use std::collections::BTreeMap;
 
@@ -25,6 +26,10 @@ pub struct MemHost {
     pub tokens: BTreeMap<TokenId, TokenInfo>,
     pub token_balances: BTreeMap<(TokenId, Address), u128>,
     pub token_nonces: BTreeMap<Address, u64>,
+    /// Randomness for `random_bytes`; `None` = the host has no beacon.
+    pub random: Option<RandomSource>,
+    /// Agreed prices by pair id.
+    pub prices: BTreeMap<u32, PriceRecord>,
 }
 
 impl TokenStore for MemHost {
@@ -137,6 +142,12 @@ impl Host for MemHost {
     }
     fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
         Some(self)
+    }
+    fn random_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
+        self.random.as_mut().map(|r| r.next(len))
+    }
+    fn price(&mut self, pair: u32) -> Option<PriceRecord> {
+        self.prices.get(&pair).copied()
     }
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
         let Some(t) = self.tables.get(table) else {

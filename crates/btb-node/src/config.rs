@@ -29,6 +29,11 @@ pub struct GenesisFile {
     pub epoch_len: u64,
     /// Bonded stake needed to be selected into a set.
     pub min_stake: u64,
+    /// Storage-node parameters (`btb_chain::storage`); the default suits a public network.
+    pub storage: btb_chain::StorageConfig,
+    /// Oracles (`btb_chain::oracle`): the beacon committee and the price feeds. `None`: no
+    /// oracles, `random_bytes` traps and `price` finds nothing.
+    pub oracle: Option<btb_chain::OracleGenesis>,
 }
 
 impl GenesisFile {
@@ -37,6 +42,7 @@ impl GenesisFile {
         c.gas_price = self.gas_price;
         c.staking.epoch_len = self.epoch_len;
         c.staking.min_stake = self.min_stake;
+        c.storage = self.storage;
         c
     }
 
@@ -77,6 +83,9 @@ impl GenesisFile {
     pub fn validate(&self) -> Result<(), String> {
         self.chain_config().validate()?;
         self.validator_set()?;
+        if let Some(o) = &self.oracle {
+            o.validate().map_err(|e| format!("oracle: {e}"))?;
+        }
         let sum: u128 = self.allocations.iter().map(|(_, v)| u128::from(*v)).sum();
         if sum != u128::from(TOTAL_SUPPLY) {
             return Err(format!(
@@ -94,6 +103,23 @@ impl GenesisFile {
             "gas_price": self.gas_price,
             "epoch_len": self.epoch_len,
             "min_stake": self.min_stake,
+            "storage": {
+                "epoch_blocks": self.storage.epoch_blocks,
+                "challenge_blocks": self.storage.challenge_blocks,
+                "repair_blocks": self.storage.repair_blocks,
+                "price_per_kib_period": self.storage.price_per_kib_period,
+                "deposit_per_kib": self.storage.deposit_per_kib,
+                "min_deposit": self.storage.min_deposit,
+                "slash_bps": self.storage.slash_bps,
+            },
+            "oracle": self.oracle.as_ref().map(|o| json!({
+                "group_key": hex::encode(&o.group_key),
+                "holders": o.holders.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
+                "max_age_blocks": o.max_age_blocks,
+                "pairs": o.pairs.iter()
+                    .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
+                    .collect::<Vec<_>>(),
+            })),
             "validators": self.validators.iter()
                 .map(|(k, s)| json!({"key": hex::encode(k), "stake": s})).collect::<Vec<_>>(),
             "allocations": self.allocations.iter()
@@ -126,7 +152,28 @@ impl GenesisFile {
             .iter()
             .map(|e| Ok((hex::decode32(&str_of(e, "address")?)?, u64_of(e, "amount")?)))
             .collect::<Result<Vec<_>, String>>()?;
+        let mut storage = btb_chain::StorageConfig::default();
+        if let Some(sv) = v.get("storage") {
+            let f = |k: &str, slot: &mut u64| {
+                if let Some(x) = sv.get(k).and_then(Value::as_u64) {
+                    *slot = x;
+                }
+            };
+            f("epoch_blocks", &mut storage.epoch_blocks);
+            f("challenge_blocks", &mut storage.challenge_blocks);
+            f("repair_blocks", &mut storage.repair_blocks);
+            f("price_per_kib_period", &mut storage.price_per_kib_period);
+            f("deposit_per_kib", &mut storage.deposit_per_kib);
+            f("min_deposit", &mut storage.min_deposit);
+            f("slash_bps", &mut storage.slash_bps);
+        }
+        let oracle = match v.get("oracle") {
+            None | Some(Value::Null) => None,
+            Some(o) => Some(oracle_from_json(o)?),
+        };
         let g = GenesisFile {
+            oracle,
+            storage,
             chain_id: u64_of(v, "chain_id")?,
             name: str_of(v, "name")?,
             timestamp: u64_of(v, "timestamp").unwrap_or(0),
@@ -148,6 +195,57 @@ impl GenesisFile {
     }
 }
 
+fn oracle_from_json(o: &Value) -> Result<btb_chain::OracleGenesis, String> {
+    let s = |k: &str| -> Result<&str, String> {
+        o.get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("genesis oracle: missing string `{k}`"))
+    };
+    let holders = o
+        .get("holders")
+        .and_then(Value::as_array)
+        .ok_or("genesis oracle: missing list `holders`")?
+        .iter()
+        .map(|h| hex::decode32(h.as_str().ok_or("genesis oracle: holder must be hex")?))
+        .collect::<Result<Vec<_>, String>>()?;
+    let pairs = o
+        .get("pairs")
+        .and_then(Value::as_array)
+        .ok_or("genesis oracle: missing list `pairs`")?
+        .iter()
+        .map(|p| {
+            Ok(btb_chain::PairConfig {
+                id: p
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .and_then(|x| u32::try_from(x).ok())
+                    .ok_or("genesis oracle: pair needs a u32 `id`")?,
+                name: p
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("genesis oracle: pair needs a `name`")?
+                    .to_string(),
+                decimals: p
+                    .get("decimals")
+                    .and_then(Value::as_u64)
+                    .and_then(|x| u8::try_from(x).ok())
+                    .ok_or("genesis oracle: pair needs `decimals`")?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let og = btb_chain::OracleGenesis {
+        group_key: hex::decode(s("group_key")?)?,
+        holders,
+        pairs,
+        max_age_blocks: o
+            .get("max_age_blocks")
+            .and_then(Value::as_u64)
+            .unwrap_or(100),
+    };
+    og.validate().map_err(|e| format!("genesis oracle: {e}"))?;
+    Ok(og)
+}
+
 /// Key file: `{"secret": "<64 hex digits>"}`. The same Ed25519 key signs consensus messages and
 /// is the node's libp2p identity (so the peer id is derived from the validator key).
 pub fn load_key(path: &Path) -> Result<SigningKey, String> {
@@ -159,6 +257,24 @@ pub fn load_key(path: &Path) -> Result<SigningKey, String> {
         .and_then(Value::as_str)
         .ok_or("key file needs a `secret` field")?;
     Ok(SigningKey::from_bytes(&hex::decode32(secret)?))
+}
+
+/// Beacon share file: `{"share": "<72 hex digits>"}` (index and secret, see `KeyShare::encode`).
+pub fn load_oracle_share(path: &Path) -> Result<btb_oracle::KeyShare, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read oracle share {}: {e}", path.display()))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("oracle share json: {e}"))?;
+    let raw = hex::decode(
+        v.get("share")
+            .and_then(Value::as_str)
+            .ok_or("oracle share file needs a `share` field")?,
+    )?;
+    btb_oracle::KeyShare::decode(&raw).ok_or_else(|| "oracle share is malformed".to_string())
+}
+
+pub fn save_oracle_share(path: &Path, share: &btb_oracle::KeyShare) -> Result<(), String> {
+    let text = json!({"share": hex::encode(&share.encode())});
+    write_private(path, &serde_json::to_string_pretty(&text).expect("json"))
 }
 
 pub fn save_key(path: &Path, key: &SigningKey) -> Result<(), String> {
@@ -236,6 +352,14 @@ pub struct NodeParams {
     /// How often a node whose chain stalled asks a peer for blocks, in milliseconds. `None`:
     /// the driver's default (1 s). A hosting node that follows a live chain sets it low.
     pub sync_poll_ms: Option<u64>,
+    /// This validator's share of the beacon key (`oracle.share` in the node config). `None`: the
+    /// node follows beacons made by others but releases no partials.
+    pub oracle_share: Option<btb_oracle::KeyShare>,
+    /// Where this validator's price observations come from (a mock in tests; real exchange
+    /// fetching is future work). `None`: the node reports no prices.
+    pub price_source: Option<crate::oracle::PriceSource>,
+    /// How often the validator observes and signs prices, milliseconds.
+    pub price_interval_ms: u64,
 }
 
 impl NodeParams {
@@ -255,6 +379,9 @@ impl NodeParams {
             test_exec_fault_from: None,
             serve_followers: None,
             sync_poll_ms: None,
+            oracle_share: None,
+            price_source: None,
+            price_interval_ms: 1_000,
         }
     }
 
@@ -311,6 +438,13 @@ impl NodeParams {
             _ => {}
         }
         p.sync_poll_ms = v.get("sync_poll_ms").and_then(Value::as_u64);
+        if let Some(f) = path_of("oracle_share_file") {
+            p.oracle_share = Some(load_oracle_share(&f)?);
+        }
+        p.price_interval_ms = v
+            .get("price_interval_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(p.price_interval_ms);
         let num = |k: &str, d: u64| v.get(k).and_then(Value::as_u64).unwrap_or(d);
         p.timing = Timing {
             tick_ms: num("tick_ms", p.timing.tick_ms),
@@ -328,6 +462,20 @@ pub fn init_testnet(
     chain_id: u64,
     base_port: u16,
     rpc_base_port: u16,
+) -> Result<Vec<PathBuf>, String> {
+    init_testnet_with(validators, dir, chain_id, base_port, rpc_base_port, false)
+}
+
+/// `init_testnet`, optionally with oracles: a beacon key dealt to the validators by a trusted
+/// dealer (this tool; it sees every share, so it is for local testnets only) and two demo price
+/// feeds (`BTC/USD` = pair 0, `ETH/USD` = pair 1).
+pub fn init_testnet_with(
+    validators: usize,
+    dir: &Path,
+    chain_id: u64,
+    base_port: u16,
+    rpc_base_port: u16,
+    oracle: bool,
 ) -> Result<Vec<PathBuf>, String> {
     use rand::RngCore;
     if validators == 0 || validators > 100 {
@@ -370,7 +518,36 @@ pub fn init_testnet(
         allocations,
         epoch_len: 600,
         min_stake: 100_000 * UNITS_PER_BTB,
+        storage: Default::default(),
+        oracle: None,
     };
+    let mut genesis = genesis;
+    let mut shares = Vec::new();
+    if oracle {
+        let mut entropy = [0u8; 32];
+        rng.fill_bytes(&mut entropy);
+        let (group, dealt) =
+            btb_oracle::trusted_deal(btb_oracle::Params::standard(validators), &entropy)
+                .map_err(|e| format!("beacon key: {e:?}"))?;
+        shares = dealt;
+        genesis.oracle = Some(btb_chain::OracleGenesis {
+            group_key: group.encode(),
+            holders: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
+            pairs: vec![
+                btb_chain::PairConfig {
+                    id: 0,
+                    name: "BTC/USD".into(),
+                    decimals: 8,
+                },
+                btb_chain::PairConfig {
+                    id: 1,
+                    name: "ETH/USD".into(),
+                    decimals: 8,
+                },
+            ],
+            max_age_blocks: 100,
+        });
+    }
     genesis.validate()?;
     let text = serde_json::to_string_pretty(&genesis.to_json()).expect("json");
     std::fs::write(dir.join("genesis.json"), text).map_err(|e| e.to_string())?;
@@ -399,6 +576,10 @@ pub fn init_testnet(
         });
         if cfg!(feature = "rocksdb") {
             cfg["data_dir"] = json!("data");
+        }
+        if let Some(share) = shares.get(i) {
+            save_oracle_share(&nd.join("oracle.share"), share)?;
+            cfg["oracle_share_file"] = json!("oracle.share");
         }
         std::fs::write(
             nd.join("node.json"),

@@ -58,6 +58,10 @@ pub struct RuntimeHost<'a, S: KvStore> {
     pub height: u64,
     pub read_only: bool,
     fault: Option<Fault>,
+    /// `Some(tx id)` once `enable_randomness` was called; the source is built lazily on the first
+    /// `random_bytes` so transactions that never ask do not read the beacon key.
+    rand_tx: Option<[u8; 32]>,
+    random: Option<btb_vm::rand::RandomSource>,
 }
 
 impl<'a, S: KvStore> RuntimeHost<'a, S> {
@@ -76,7 +80,24 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             height,
             read_only: false,
             fault: None,
+            rand_tx: None,
+            random: None,
         }
+    }
+
+    /// Development hosts (`btb dev`) have no beacon: derive from a fixed, public `seed`
+    /// instead. NOT random in any security sense; never used by the chain.
+    pub fn enable_dev_randomness(&mut self, seed: [u8; 32], tx_id: [u8; 32]) {
+        self.random = Some(btb_vm::rand::RandomSource::new(&seed, &tx_id));
+        self.rand_tx = Some(tx_id);
+    }
+
+    /// Let `random_bytes` calls derive from the block's beacon (`layout::oracle_seed_key`) and
+    /// this transaction id (a cron run passes its receipt id). Without this call, or on a chain
+    /// whose state has no beacon, `random_bytes` traps with `RandomnessUnavailable`. The VM
+    /// separately decides whether the entry point may ask at all.
+    pub fn enable_randomness(&mut self, tx_id: [u8; 32]) {
+        self.rand_tx = Some(tx_id);
     }
 
     /// The writes of the call, to be committed with `KvStore::commit`; or the first fault.
@@ -276,6 +297,30 @@ impl<S: KvStore> TokenStore for RuntimeHost<'_, S> {
 }
 
 impl<S: KvStore> Host for RuntimeHost<'_, S> {
+    fn random_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
+        if self.random.is_none() {
+            let tx = self.rand_tx?;
+            let r = self.kv.get(&layout::oracle_seed_key());
+            let rec = self.kv(r)?;
+            let seed: [u8; 32] = rec.get(8..40)?.try_into().ok()?;
+            self.random = Some(btb_vm::rand::RandomSource::new(&seed, &tx));
+        }
+        self.random.as_mut().map(|r| r.next(len))
+    }
+
+    fn price(&mut self, pair: u32) -> Option<btb_vm::host::PriceRecord> {
+        let r = self.kv.get(&layout::oracle_price_key(pair));
+        let b = self.kv(r)?;
+        if b.len() != 29 {
+            return None;
+        }
+        Some(btb_vm::host::PriceRecord {
+            price: u128::from_le_bytes(b[..16].try_into().ok()?),
+            height: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            decimals: b[24],
+        })
+    }
+
     fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
         Some(self)
     }

@@ -111,3 +111,17 @@ pub const HOST_TOKEN_MINT: u64 = 500;
 /// `token_burn`: flat (info read and write, balance read and write).
 pub const HOST_TOKEN_BURN: u64 = 400;
 pub const TOKEN_BYTE: u64 = 1;
+
+// ---- Oracles (randomness beacon and price feeds) ------------------------------------------------
+
+/// `random_bytes(out_ptr, len)`: base plus `RANDOM_BYTE` per byte requested (one SHA-256 per 32
+/// bytes of output). Charged before the call runs, whether or not the call is then refused.
+pub const HOST_RANDOM_BYTES: u64 = 300;
+pub const RANDOM_BYTE: u64 = 2;
+/// `price(pair, out_ptr)` in a query: flat (a state read). Queries are not billed, so a price
+/// read there is free to the caller.
+pub const HOST_PRICE_QUERY: u64 = 200;
+/// `price(pair, out_ptr)` in a mutation or cron: the same read plus a per-read fee, in gas, that
+/// is paid like all gas to the validator pool.
+pub const PRICE_READ_FEE: u64 = 10_000;
+pub const HOST_PRICE_MUTATION: u64 = HOST_PRICE_QUERY + PRICE_READ_FEE;

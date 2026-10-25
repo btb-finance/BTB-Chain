@@ -10,6 +10,9 @@ btb deploy [--rpc URL --key FILE [--gas-limit N]]
 btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]
 btb query --rpc URL <contract> <fn> [args]
 btb keygen <FILE>
+btb store <file> --rpc URL --key FILE [--k N --m N --periods N]
+btb fetch <root> --rpc URL [--out FILE]
+btb storage-node run --rpc URL --key FILE --dir DIR [--listen ADDR] [--endpoint URL] [--deposit UNITS]
 ```
 
 `build`, `dev` and `deploy` run inside a project (the directory with `Cargo.toml`). You need the pinned toolchain from `rust-toolchain.toml` with the `riscv64imac-unknown-none-elf` target and `rust-src`; `rustup` installs them on first use.
@@ -70,3 +73,7 @@ Writes a new account key (`{"secret", "public"}` JSON, mode 0600, the same forma
 `crates/btb-cli/tests/cli.rs` runs the real toolchain: `init` into a temp dir (sdk path pointing at this repo) then `build` succeeds and lists the entry points; the deploy manifest hash equals the SHA-256 of the ELF; `dev` on an ephemeral port reloads after a source edit, the new function becomes callable, old state is retained, a broken edit keeps the old build, and an open subscription gets the changed result.
 
 `crates/btb-cli/tests/chain.rs` starts an in-process 4-validator cluster (the `btb-node/tests/lite` helper), builds a copy of `examples/counter` with `every = "3 blocks"` on its cron and runs the real `btb` binary: `deploy --rpc` prints the contract address, `call increment` returns the new total, `query get` reads it and the cron makes it grow on its own; a failing call is a non-zero exit.
+
+## `btb store`, `btb fetch` and `btb storage-node run`
+
+Large files go to storage nodes, not to the chain ([STORAGE.md](STORAGE.md)). `btb store <file> --rpc URL --key FILE [--k 4] [--m 2] [--periods 12]` erasure-codes the file into `k` data + `m` parity pieces, pays the escrow with a `Store` transaction, uploads each piece to the node the chain assigned and prints `root: <hex>`. `btb fetch <root> --rpc URL [--out FILE]` downloads any `k` pieces that verify, decodes and checks the result against the root; it needs no key. `btb storage-node run` starts a storage node (piece store, HTTP API, challenge answering, repair) and, with `--deposit UNITS` and an account that is not registered yet, registers it.

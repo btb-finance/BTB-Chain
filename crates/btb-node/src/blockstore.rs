@@ -259,6 +259,12 @@ fn id_key(tag: u8, id: &Hash) -> Vec<u8> {
     k
 }
 
+fn beacon_key(height: u64) -> Vec<u8> {
+    let mut k = vec![b'K'];
+    k.extend_from_slice(&height.to_be_bytes());
+    k
+}
+
 fn proof_key(epoch: u64) -> Vec<u8> {
     let mut k = vec![b'P'];
     k.extend_from_slice(&epoch.to_be_bytes());
@@ -332,6 +338,20 @@ impl BlockStore {
         StoredBlock::decode(&self.kv.get(&block_key(height)).ok()??)
     }
 
+    /// The beacon (`btb_oracle::Beacon::encode`) block `height` was executed with. Kept as long
+    /// as the block is, so a node that is catching up can be served the value it needs.
+    pub fn beacon(&self, height: u64) -> Option<Vec<u8>> {
+        self.kv.get(&beacon_key(height)).ok()?
+    }
+
+    pub fn put_beacon(&mut self, height: u64, beacon: &[u8]) -> Result<(), String> {
+        let mut batch = WriteBatch::new();
+        batch.put(beacon_key(height), beacon.to_vec());
+        self.kv
+            .commit(batch)
+            .map_err(|e| format!("write block store: {e}"))
+    }
+
     /// A receipt by transaction id: (height, index in block, receipt).
     pub fn receipt(&self, id: &Hash) -> Option<(u64, usize, StoredReceipt)> {
         let loc = self.kv.get(&receipt_key(id)).ok()??;
@@ -374,7 +394,15 @@ impl BlockStore {
         let h = b.header.height;
         let mut batch = WriteBatch::new();
         batch.put(block_key(h), b.encode());
+        let mut seen = std::collections::HashSet::new();
         for (i, r) in b.receipts.iter().enumerate() {
+            // An `invalid` receipt means the transaction did nothing. A copy of a transaction
+            // that already executed (earlier block or earlier in this one) is invalid with
+            // `BadNonce`; it must never shadow the receipt of the real execution.
+            let first = seen.insert(r.id);
+            if r.status == "invalid" && (!first || self.receipt(&r.id).is_some()) {
+                continue;
+            }
             let mut loc = h.to_le_bytes().to_vec();
             loc.extend_from_slice(&(i as u32).to_le_bytes());
             batch.put(receipt_key(&r.id), loc);
@@ -419,6 +447,7 @@ impl BlockStore {
             }
         }
         batch.delete(block_key(h));
+        batch.delete(beacon_key(h));
         self.kv
             .commit(batch)
             .map_err(|e| format!("prune block store: {e}"))?;
@@ -524,6 +553,55 @@ mod tests {
         }
     }
 
+    /// Regression: a duplicate of a committed transaction fails with `BadNonce`; its invalid
+    /// receipt in a later block (or later in the same block) must not replace the real one.
+    #[test]
+    fn invalid_duplicate_receipt_never_shadows_the_real_one() {
+        let mut s = BlockStore::memory(100);
+        let id = [9u8; 32];
+        let rc = |status: &str| StoredReceipt {
+            id,
+            status: status.into(),
+            detail: String::new(),
+            gas_used: 1,
+            fee: 1,
+            output: Vec::new(),
+        };
+        let mut b1 = block(1);
+        b1.receipts = vec![rc("success")];
+        s.put(&b1).unwrap();
+        let mut b2 = block(2);
+        b2.receipts = vec![rc("invalid")];
+        s.put(&b2).unwrap();
+        let (h, _, r) = s.receipt(&id).unwrap();
+        assert_eq!((h, r.status.as_str()), (1, "success"));
+        // Same block: the first stays, even when an invalid copy follows it.
+        let id2 = [8u8; 32];
+        let mut b3 = block(3);
+        b3.receipts = vec![
+            StoredReceipt {
+                id: id2,
+                ..rc("success")
+            },
+            StoredReceipt {
+                id: id2,
+                ..rc("invalid")
+            },
+        ];
+        s.put(&b3).unwrap();
+        let (h, i, r) = s.receipt(&id2).unwrap();
+        assert_eq!((h, i, r.status.as_str()), (3, 0, "success"));
+        // An invalid transaction seen for the first time is still indexed.
+        let id3 = [7u8; 32];
+        let mut b4 = block(4);
+        b4.receipts = vec![StoredReceipt {
+            id: id3,
+            ..rc("invalid")
+        }];
+        s.put(&b4).unwrap();
+        assert_eq!(s.receipt(&id3).unwrap().2.status, "invalid");
+    }
+
     #[test]
     fn record_roundtrip_and_corruption() {
         let b = block(3);
@@ -576,7 +654,12 @@ mod tests {
             let mut b = block(h);
             b.tx_ids = txs.iter().map(Transaction::id).collect();
             b.receipts.clear();
-            b.consensus.payload = Batch { timestamp: 1, txs }.encode();
+            b.consensus.payload = Batch {
+                timestamp: 1,
+                txs,
+                observations: vec![],
+            }
+            .encode();
             b.consensus.payload_hash = ConsensusBlock::hash_payload(&b.consensus.payload);
             s.put(&b).unwrap();
         }

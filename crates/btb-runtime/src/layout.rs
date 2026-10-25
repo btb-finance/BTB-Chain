@@ -53,6 +53,9 @@ pub const TAG_DEPOSIT: u8 = 9;
 pub const TAG_TOKEN: u8 = 0x0A;
 pub const TAG_TOKEN_BALANCE: u8 = 0x0B;
 pub const TAG_TOKEN_NONCE: u8 = 0x0C;
+/// Oracle state written by `btb-chain` (`oracle.rs`) and read by the host calls: see
+/// `oracle_seed_key` and `oracle_price_key`.
+pub const TAG_ORACLE: u8 = 0x50;
 
 /// BTB (smallest unit) a contract locks per stored byte. A stored entry counts
 /// `key.len() + value.len()` bytes for storage keys (`0x01`), table rows (`0x02`) and index
@@ -69,6 +72,20 @@ pub fn is_metered(key: &[u8]) -> bool {
 /// The contract address embedded in a metered key.
 pub fn key_contract(key: &[u8]) -> Option<&[u8]> {
     key.get(1..33)
+}
+
+/// `50 02`: the beacon of the block being executed, `height:u64 LE || seed[32]`. Written at the
+/// start of every block of a chain with an oracle config; `random_bytes` derives from it.
+pub fn oracle_seed_key() -> Vec<u8> {
+    vec![TAG_ORACLE, 0x02]
+}
+
+/// `50 10 pair:u32be`: the agreed price of a pair, `price:u128 LE || height:u64 LE ||
+/// decimals:u8 || reporters:u32 LE` (29 bytes).
+pub fn oracle_price_key(pair: u32) -> Vec<u8> {
+    let mut k = vec![TAG_ORACLE, 0x10];
+    k.extend_from_slice(&pair.to_be_bytes());
+    k
 }
 
 pub fn usage_key(addr: &Address) -> Vec<u8> {
