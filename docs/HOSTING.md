@@ -65,7 +65,7 @@ const c = new BtbClient({ url: `http://host:8788/c/${contract}` });
 const n = await c.query("get", t.unit, [], t.u64);
 c.subscribe("get", t.unit, [], t.u64, (n) => render(n));
 const { result, proof } = await c.queryWithProof("get", t.unit, [], t.u64);
-await verifyProof(proof, { trustedRoot });
+await verifyProof(proof, { quorum: { chainId, epochs: { 0: epoch0.validators } } }); // or { trustedRoot }
 ```
 
 ### Queries and subscriptions
@@ -82,10 +82,16 @@ State is committed by a Jellyfish-style Merkle tree ([STATE.md](STATE.md#state-c
 { "version": 1, "height": 41, "state_root": "…",
   "entries": [{"key": "…", "value": "…" , "proof": {"siblings": [["…" x15], …], "leaf": ["…", "…"]}}],
   "header": {"height": 42, "parent_hash": "…", "timestamp": 0, "state_root": "…", "tx_root": "…", "hash": "…"},
-  "commit": {"epoch": 0, "sync": "<hex: consecutive consensus blocks of the epoch>"} }
+  "commit": {"epoch": 0, "sync": "<hex: consecutive consensus blocks of the epoch>"},
+  "attest": {"epoch": 0, "block": {"round": 7, "height": 44, "parent": "…", "justify": {…}, "proposer": 2,
+                                    "payload_hash": "…", "exec": "<claim: height 41, digest, receipts root>", "id": "…"},
+             "qc": {"round": 7, "block_id": "…", "votes": [[0, "<sig>"], …]},
+             "prev_digest": "…", "roots": ["<state root after 41>", …] } }
 ```
 
 `entries` say: after block `height`, the state under `state_root` held `value` at `key` (`null`: proven absent). `header` is the header of block `height + 1`, whose `state_root` field **is** the root after `height` ([CHAIN.md](CHAIN.md#blocks)). `commit` is the consensus evidence that block `height + 1` is committed: consecutive consensus blocks from it, whose quorum certificates satisfy the 2-chain rule, i.e. the same evidence block sync checks.
+
+`attest` is the **state root attestation**: a consensus block whose execution claim covers `height`, the quorum certificate for it, and the state roots from `height` up to the claimed height (usually one to three roots). Validators vote for a block only if its claim equals what they executed, so the certificate says that a quorum of the epoch's stake executed the chain to exactly these roots ([CONSENSUS.md](CONSENSUS.md#execution-attestation-validators-certify-state-roots)). The verifier folds the roots into the digest chain `d_h = SHA256("BTB/exec/v1" || d_{h-1} || h || root_h)`, compares `d_k` with the claim, recomputes the block id (so the claim is covered by the signatures), and checks the votes against the epoch's validator set. Heights near an epoch's end are attested by the next epoch's validators (`attest.epoch` says which).
 
 Which version: `?height=N` picks one. Without it the node returns the newest version whose next block is provably committed, which is about three blocks behind the head (block `height + 1` needs two more blocks after it for its certificate). `?proof=1` on a query proves the keys the query read **at the head**; the head's root is named by no header yet, so that bundle has `header: null`. Ask `/proof/...` for the same keys a few blocks later to anchor it.
 
@@ -97,7 +103,8 @@ Which version: `?height=N` picks one. Without it the node returns the newest ver
 | `state_root` equals one you trust (`trustedRoot`) | caller compares | yes |
 | header hash is right and its `state_root` is the proven root | yes | yes |
 | header's transactions are the committed payload's | yes | no |
-| a quorum of the epoch's validators committed block `height + 1` | yes, with a `Context` you build from a validator set you trust (`context_from_epoch_json`) | no (reports `hasConsensusEvidence`) |
+| a quorum of the epoch's validators committed block `height + 1` (its transactions) | yes, with a `Context` you build from a validator set you trust (`context_from_epoch_json`) | no (reports `hasConsensusEvidence`) |
+| **a quorum of an epoch's validators attested `state_root`** (they executed the chain to it) | yes: `verify_bundle` (one trusted context) or `verify_bundle_with` (a map epoch to context); `Verified::root_attested` | yes: `verifyProof(bundle, { quorum: { chainId, epochs: { 0: validators } } })`, `rootAttested` |
 
 **What is and is not provable:**
 
@@ -107,7 +114,14 @@ Which version: `?height=N` picks one. Without it the node returns the newest ver
 | a whole query result | **no**, not as a signed fact: a result is computed by the VM. `?proof=1` gives proofs of every key the query read, so anyone holding the contract code can re-run the query on proven inputs and compare |
 | a query that scanned a table or index range | the point reads are proven, ranges are not: the response says `"incomplete": true`. The tree is keyed by hash, so it cannot prove a range is complete; that needs an ordered commitment (future work) |
 
-**The one caveat to keep in mind: no validator signs the state root yet.** A consensus certificate covers a block's payload (its transactions); the header's `state_root` is what every node derived by executing the chain. So a bundle proves that the host's root is *consistent with* a committed block, not that a quorum attested the root. A lying host would need to forge a whole alternative state history that still matches committed transactions' ids, which the evidence rules out only if you also execute them. In practice: take `trustedRoot` from a validator's `btb_getBlock` (`state_root_after`) or from a second independent host, or run your own hosting node (it re-executes everything). Making validators sign the root (a field in the vote, or the next block's payload) closes this and is a consensus change that needs a Design Proposal.
+**Anchoring a root.** The Merkle proofs show that a value is what the tree under `state_root` holds; the attestation shows that `state_root` is the root a quorum of the validators executed. With fewer than a third of the stake faulty, a root that verifies with `root_attested` is the chain's root, and a lying host cannot produce one: it would need signatures from more than two thirds of the stake on a claim that the honest ones would not have signed. What you have to supply is the trust anchor, the validator set of the epoch (`btb_getEpoch`, genesis, or a checkpoint you trust, the usual weak-subjectivity assumption for proof of stake). `trustedRoot` still works and is independent (compare with a validator's `state_root_after` or a second host). In TypeScript, `quorum` rejects a bundle without a valid attestation unless `allowUnattested` is set.
+
+Details that matter:
+
+- A bundle carries an attestation only when the host holds the block that attests the height and the QC for it, which is about three blocks after the height in normal operation (slightly more after skipped rounds). `?proof=1` bundles at the head have none; ask `/proof/...` for the same keys a few blocks later, as before. Without `?height=` the host returns the newest height that has both the commit evidence and the attestation.
+- The attestation is for the *state after* block `height`. It does not say the answer to a query was computed correctly from it (see the table above), and it covers receipts only at the claimed height.
+- The validator set to check against is the one of `attest.epoch`, not of `height`: the last block of an epoch is attested by the next epoch's validators. `verify_bundle_with` takes the contexts of several epochs.
+- A forged root, a forged or short certificate, a claim changed after the fact, or a different validator set fail (`ProofError::BadAttestation` / `ProofError` in TypeScript). A bundle whose epoch you did not supply is not an error by itself in Rust (`root_attested` stays false) and is one in TypeScript unless `allowUnattested`.
 
 ## Websites
 
@@ -126,7 +140,7 @@ Serving: `GET /site/<contract>/<path>` (`/site/<contract>/` and `dir/` serve `in
 `crates/btb-host/tests/host.rs` runs a real 4-validator cluster (`crates/btb-node/tests/lite`, real QUIC and consensus) and a hosting node:
 
 - the follower stays in sync, its answers equal every validator's, and the state roots it proves equal the validators' recorded roots;
-- a proof verifies (with header and quorum evidence), and a changed value, key, root, sibling, header, payload, certificate or validator set fails; absence is provable; `?proof=1` proves the keys a query read; a real bundle is checked in as `sdk-ts/test/fixtures/proof.json` (`BTB_UPDATE_FIXTURES=1 cargo test -p btb-host --test host` regenerates it) and verified by Rust and by `sdk-ts/test/proof.test.ts`;
+- a proof verifies (with header, quorum evidence and the state root attestation, against a real 4-validator cluster), and a changed value, key, root, sibling, header, payload, certificate, claim, digest or validator set fails; a lie about every root consistently still fails because the signed digest does not fold from it; absence is provable; `?proof=1` proves the keys a query read; a real bundle is checked in as `sdk-ts/test/fixtures/proof.json` (`BTB_UPDATE_FIXTURES=1 cargo test -p btb-host --test host` regenerates it) and verified by Rust and by `sdk-ts/test/proof.test.ts`;
 - a subscription pushes after a commit, stays silent for unrelated commits, and is cleaned up when the client leaves;
 - a site is served with the right content types and hash after the deployer publishes it, a stranger's publish is refused on chain and the page is unchanged;
 - a follower fed forged sync responses by a validator key rejects them all;
@@ -140,5 +154,5 @@ Serving: `GET /site/<contract>/<path>` (`/site/<contract>/` and `dir/` serve `in
 - **No fees yet.** Hosting nodes are meant to earn per-request fees through payment-channel vouchers ([TOKENOMICS.md](TOKENOMICS.md)); this crate serves requests for free. The relay share of mutation fees is not paid either ([CHAIN.md](CHAIN.md#fees)).
 - **No transaction relay.** A hosting node does not accept signed transactions; send them to a validator. (Validators accept sync requests from followers but not transactions or consensus messages.)
 - **Reads share the block-execution thread** (see above), and the HTTP server is a simple thread-per-connection one with a connection cap (`max_connections`, 256).
-- **Head proofs are unanchored** until a few blocks later; ranges cannot be proven; roots are not validator-signed (see [Proofs](#proofs)).
+- **Head proofs are unanchored** until a few blocks later (the attestation and the commit evidence need the blocks after the height); ranges cannot be proven (see [Proofs](#proofs)). State roots *are* validator-attested; a client that does not pass the validator set still gets only the Merkle check.
 - **Epoch changes** work as for any observing node; a node absent for longer than validators keep epoch records for evidence would need state sync.

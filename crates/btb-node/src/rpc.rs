@@ -17,7 +17,9 @@
 //! | `btb_getEpoch` | `[epoch?]` | validator set of an epoch |
 //! | `btb_status` | `[]` | node status |
 //!
-//! `GET /explorer` serves the embedded block explorer page (no external assets).
+//! `GET /explorer` serves the embedded block explorer page (no external assets). `GET /dex`
+//! serves the native DEX page (order entry, book, clearing prices); its `btb_dex*` methods are
+//! in `dex_rpc`.
 //!
 //! DEV/TESTNET API: no authentication and no TLS, so it only binds to loopback. Put a proxy
 //! in front of it to expose it.
@@ -91,7 +93,8 @@ async fn handle(mut conn: TcpStream, tx: Sender<Input>) {
         .await;
         return;
     };
-    let (status, out) = match (method.as_str(), path.as_str()) {
+    // The DEX page takes `?seed=` (the query string is not part of the route).
+    let (status, out) = match (method.as_str(), path.split('?').next().unwrap_or("")) {
         ("GET", "/status") | ("GET", "/") => match call(&tx, "btb_status", json!([])).await {
             Ok(v) => ("200 OK", v),
             Err(e) => ("500 Internal Server Error", json!({"error": e.message})),
@@ -99,6 +102,10 @@ async fn handle(mut conn: TcpStream, tx: Sender<Input>) {
         ("GET", "/health") => ("200 OK", json!({"ok": true})),
         ("GET", "/explorer") | ("GET", "/explorer/") => {
             let _ = respond_html(&mut conn, crate::explorer::PAGE).await;
+            return;
+        }
+        ("GET", "/dex") | ("GET", "/dex/") => {
+            let _ = respond_html(&mut conn, crate::explorer::DEX_PAGE).await;
             return;
         }
         ("POST", "/") => ("200 OK", rpc_response(&tx, &body).await),

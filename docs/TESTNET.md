@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | Validator node | `crates/btb-node`, [NODE.md](NODE.md) | Consensus, execution, block history, JSON-RPC on loopback |
 | Explorer | `GET /explorer` on every node's RPC port | One embedded page (no CDN): latest blocks (polls once a second), block, transaction (receipt, gas, fee), account (balance, stake, recent transactions), validator set per epoch with stake and jailed flag, search |
+| DEX page | `GET /dex` on every node's RPC port (`?seed=<64 hex>` picks the browser account) | Order entry with signed transactions (WebCrypto Ed25519), live order book, last clearing prices and your orders; see [examples/native-dex](../examples/native-dex/README.md) |
 | Explorer API | `btb_getBlocks`, `btb_getTransaction`, `btb_getAccount`, `btb_getAccountTxs`, `btb_getEpoch` | Read endpoints behind the page; account history is indexed in the node's block store |
 | Faucet | `crates/btb-faucet` | HTTP service: `POST /drip` sends a `Transfer` from a funded key through node RPCs |
 | Local launcher | `scripts/testnet-local.sh` | 4 validators plus the faucet on `127.0.0.1` |

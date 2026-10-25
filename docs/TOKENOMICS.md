@@ -21,6 +21,10 @@ Every request pays the node that served or executed it:
 
 See [Scaling and earning](SCALING.md) for how these micro-payments let anyone, down to a phone, earn by doing a small part of the work.
 
+## DEX fees
+
+The native DEX ([CHAIN.md](CHAIN.md#native-dex)) charges a **clearing fee** of `dex_fee_bps` (genesis parameter, default 10 = 0.10%, maximum 10%) on what each side of a batch auction receives, plus rounding dust, plus the normal gas for placing or cancelling an order. The clearing is work done by validators in `end_block`, so BTB fees go to the validator pool and are paid out with the epoch rewards; fees in a user token wait in the DEX fee account until a distribution rule exists (for example swapping them to BTB in a batch). The DEX escrows funds in a vault and returns every unit: it creates no BTB and no token, and the supply invariant (and the token-supply tests) hold across clearings.
+
 ## Payment channels for per-request fees
 
 Paying for each query with an on-chain transaction would require consensus and defeat instant reads. Instead:

@@ -21,6 +21,8 @@ pub type ValidatorIndex = u32;
 pub const MAX_ROUND: Round = 1 << 62;
 /// Upper bound on validators (also bounds decoded vector lengths).
 pub const MAX_VALIDATORS: usize = 10_000;
+/// Upper bound on `Block::exec`.
+pub const MAX_EXEC_BYTES: usize = 128;
 
 /// SHA-256 over the concatenation of `parts`.
 pub fn sha256(parts: &[&[u8]]) -> Hash {
@@ -322,6 +324,12 @@ pub struct Block {
     pub payload_hash: Hash,
     /// Opaque application bytes (execution is out of scope for this crate).
     pub payload: Vec<u8>,
+    /// Opaque execution attestation (at most `MAX_EXEC_BYTES`), covered by the block id and
+    /// therefore by every vote. The embedder fills it through `Replica::set_exec_hooks` with
+    /// the result of executing the block's committed ancestor at height `exec_height`
+    /// (`docs/CONSENSUS.md`, "Execution attestation"), and honest voters vote only if it
+    /// matches their own execution. Empty when no hooks are installed.
+    pub exec: Vec<u8>,
 }
 
 impl Block {
@@ -331,13 +339,15 @@ impl Block {
 
     pub fn id(&self) -> Hash {
         sha256(&[
-            b"BTB/block/v1",
+            b"BTB/block/v2",
             &self.round.to_le_bytes(),
             &self.height.to_le_bytes(),
             &self.parent,
             &self.justify.digest(),
             &self.proposer.to_le_bytes(),
             &self.payload_hash,
+            &(self.exec.len() as u32).to_le_bytes(),
+            &self.exec,
         ])
     }
 }

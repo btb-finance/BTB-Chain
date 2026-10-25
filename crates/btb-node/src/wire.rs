@@ -301,6 +301,7 @@ mod tests {
             proposer: 1,
             payload_hash: Block::hash_payload(&[7, 7]),
             payload: vec![7, 7],
+            exec: vec![3; 72],
         };
         let r = SyncResponse {
             epoch: 2,

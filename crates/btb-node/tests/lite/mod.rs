@@ -151,6 +151,7 @@ impl Lite {
             p.listen = format!("/ip4/127.0.0.1/udp/{}/quic-v1", c.ports[i]);
             p.peers = (0..n).filter(|j| *j != i).map(|j| c.addr_of(j)).collect();
             p.timing = fast();
+            p.rpc = Some("127.0.0.1:0".parse().unwrap());
             p.serve_followers = followers;
             let state = open_chain(MemKv::new(), &c.genesis).unwrap();
             c.nodes[i] = Some(Node::start(p, state).unwrap());

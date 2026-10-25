@@ -13,6 +13,7 @@
 //! Unstake  (tag 4): amount:u64
 //! RegisterValidator (tag 5): consensus_key[32] || network_addr:bytes
 //! SubmitEvidence    (tag 6): epoch:u64 || evidence
+//! Dex               (tag 10): sub:u8 || fields (`dex.rs`: 0 place, 1 cancel)
 //! Site              (tag 9): sub:u8 || fields (`site.rs`: 0 publish, 1 remove)
 //! evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleVote)
 //!          | 1 || proposer:u32 || round:u64 || (id[32] || sig[64]) x2  (DoubleProposal)
@@ -200,6 +201,8 @@ pub enum TxKind {
     Channel(crate::channel::ChannelOp),
     /// Publish or remove a static site file of a contract (`crate::site`, deployer only).
     Site(crate::site::SiteOp),
+    /// A DEX order or cancellation (`crate::dex`).
+    Dex(crate::dex::DexOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -337,6 +340,10 @@ impl Encode for TxBody {
                 9u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Dex(op) => {
+                10u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
     }
 }
@@ -383,6 +390,10 @@ impl TxBody {
             },
             9 => match crate::site::SiteOp::decode_from(r)? {
                 Ok(op) => TxKind::Site(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            10 => match crate::dex::DexOp::decode_from(r)? {
+                Ok(op) => TxKind::Dex(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
             t => return Err(TxError::BadTag(t)),
@@ -488,6 +499,7 @@ impl Transaction {
             TxKind::SubmitEvidence { .. } => EVIDENCE_GAS,
             TxKind::Channel(op) => op.gas(),
             TxKind::Site(op) => op.gas(),
+            TxKind::Dex(op) => op.gas(),
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }

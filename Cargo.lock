@@ -234,7 +234,11 @@ dependencies = [
 name = "btb-cli"
 version = "0.1.0"
 dependencies = [
+ "btb-chain",
+ "btb-codec",
+ "btb-consensus",
  "btb-dev",
+ "btb-node",
  "btb-runtime",
  "btb-vm",
  "serde_json",

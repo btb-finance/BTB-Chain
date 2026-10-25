@@ -139,6 +139,7 @@ fn put_block(w: &mut W, b: &Block) {
     w.u32(b.proposer);
     w.hash(&b.payload_hash);
     w.bytes(&b.payload);
+    w.bytes(&b.exec);
 }
 fn get_block(r: &mut R) -> Option<Block> {
     Some(Block {
@@ -149,6 +150,7 @@ fn get_block(r: &mut R) -> Option<Block> {
         proposer: r.u32()?,
         payload_hash: r.hash()?,
         payload: r.bytes()?,
+        exec: r.bytes().filter(|e| e.len() <= MAX_EXEC_BYTES)?,
     })
 }
 fn put_opt_tc(w: &mut W, t: &Option<TimeoutCert>) {

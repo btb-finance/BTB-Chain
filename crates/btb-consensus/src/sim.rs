@@ -4,7 +4,61 @@
 
 use crate::*;
 use ed25519_dalek::SigningKey;
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::rc::Rc;
+
+/// A stand-in for the embedder's execution: the digest at each executed height depends on the
+/// whole committed chain, so two nodes agree on it exactly when they committed the same blocks.
+#[derive(Default)]
+pub struct FakeExec {
+    pub digests: BTreeMap<Height, Hash>,
+}
+
+pub fn fake_digest(prev: &Hash, height: Height, block_id: &Hash) -> Hash {
+    sha256(&[b"sim-exec", prev, &height.to_le_bytes(), block_id])
+}
+
+pub fn fake_claim(h: Height, d: &Hash) -> Vec<u8> {
+    let mut v = h.to_le_bytes().to_vec();
+    v.extend_from_slice(d);
+    v
+}
+
+impl FakeExec {
+    pub(crate) fn new() -> Self {
+        let mut f = Self::default();
+        f.digests.insert(0, sha256(&[b"sim-exec-genesis"]));
+        f
+    }
+    pub(crate) fn executed(&self) -> Height {
+        self.digests.keys().next_back().copied().unwrap_or(0)
+    }
+    pub(crate) fn on_commit(&mut self, b: &Block) {
+        if b.height == self.executed() + 1 {
+            let prev = self.digests[&(b.height - 1)];
+            self.digests
+                .insert(b.height, fake_digest(&prev, b.height, &b.id()));
+        }
+    }
+}
+
+pub(crate) fn exec_hooks(fx: &Rc<RefCell<FakeExec>>) -> (ExecProvider, ExecCheck) {
+    let a = fx.clone();
+    let b = fx.clone();
+    (
+        Box::new(move |h| a.borrow().digests.get(&h).map(|d| fake_claim(h, d))),
+        Box::new(move |blk, h| {
+            let fx = b.borrow();
+            match fx.digests.get(&h) {
+                None if h > fx.executed() => ExecVerdict::Defer,
+                None => ExecVerdict::Reject,
+                Some(d) if blk.exec == fake_claim(h, d) => ExecVerdict::Accept,
+                Some(_) => ExecVerdict::Reject,
+            }
+        }),
+    )
+}
 
 pub struct Rng(pub u64);
 impl Rng {
@@ -50,6 +104,8 @@ pub enum Behavior {
     Garbage {
         permille: u64,
     },
+    /// As leader, proposes (validly signed) blocks that attest a wrong execution result.
+    WrongExec,
 }
 
 impl Behavior {
@@ -87,6 +143,8 @@ pub struct Scenario {
     pub policy: LeaderPolicy,
     pub base_timeout: Tick,
     pub payload_every: Tick,
+    /// Run the execution attestation protocol with a fake execution function.
+    pub exec: bool,
 }
 
 impl Scenario {
@@ -104,6 +162,7 @@ impl Scenario {
             policy: LeaderPolicy::RoundRobin,
             base_timeout: 20,
             payload_every: 7,
+            exec: false,
         }
     }
 }
@@ -120,6 +179,10 @@ pub struct Outcome {
     pub sent: u64,
     pub dropped: u64,
     pub ctx: Context,
+    /// Ids of wrong-attestation proposals that `Behavior::WrongExec` leaders sent out.
+    pub wrong_exec_blocks: usize,
+    /// Committed blocks whose attestation was checked against the true execution.
+    pub attested_commits: usize,
 }
 
 impl Outcome {
@@ -136,6 +199,18 @@ impl Outcome {
             .min()
             .unwrap_or(0)
     }
+    /// As `min_honest_height`, ignoring replica `skip` (a Byzantine one whose own state is
+    /// not meaningful).
+    pub fn min_honest_height_excluding(&self, skip: usize) -> Height {
+        self.heights
+            .iter()
+            .zip(&self.honest)
+            .enumerate()
+            .filter(|(i, (_, h))| **h && *i != skip)
+            .map(|(_, (x, _))| *x)
+            .min()
+            .unwrap_or(0)
+    }
     /// Number of heights first committed (by any honest replica) after tick `t`.
     pub fn committed_after(&self, t: Tick) -> usize {
         self.first_commit_tick.values().filter(|x| **x > t).count()
@@ -146,6 +221,8 @@ struct Node {
     replica: Option<Replica>,
     storage: MemoryStorage,
     beh: Behavior,
+    /// The node's executed state; survives a restart like a database would.
+    fx: Rc<RefCell<FakeExec>>,
 }
 
 struct Sim<'a> {
@@ -164,6 +241,8 @@ struct Sim<'a> {
     global: BTreeMap<Height, Hash>,
     proposed_at: BTreeMap<Hash, Tick>,
     forged: BTreeMap<(usize, Round), Proposal>,
+    /// Block ids of the wrong-attestation proposals sent by `WrongExec` leaders.
+    wrong: BTreeSet<Hash>,
     out: Outcome,
 }
 
@@ -211,6 +290,7 @@ impl<'a> Sim<'a> {
             global: BTreeMap::new(),
             proposed_at: BTreeMap::new(),
             forged: BTreeMap::new(),
+            wrong: BTreeSet::new(),
             out: Outcome {
                 honest: sc.behaviors.iter().map(|b| b.is_honest()).collect(),
                 heights: vec![0; n],
@@ -222,32 +302,46 @@ impl<'a> Sim<'a> {
                 sent: 0,
                 dropped: 0,
                 ctx,
+                wrong_exec_blocks: 0,
+                attested_commits: 0,
             },
         };
         for i in 0..n {
             let storage = MemoryStorage::default();
+            let fx = Rc::new(RefCell::new(FakeExec::new()));
             let replica = if matches!(sc.behaviors[i], Behavior::Garbage { .. }) {
                 None
             } else {
-                Some(s.make_replica(i, &storage))
+                Some(s.make_replica(i, &storage, &fx))
             };
             s.nodes.push(Node {
                 replica,
                 storage,
                 beh: sc.behaviors[i].clone(),
+                fx,
             });
         }
         s
     }
 
-    fn make_replica(&self, i: usize, storage: &MemoryStorage) -> Replica {
-        Replica::new(
+    fn make_replica(
+        &self,
+        i: usize,
+        storage: &MemoryStorage,
+        fx: &Rc<RefCell<FakeExec>>,
+    ) -> Replica {
+        let mut r = Replica::new(
             self.cfg.clone(),
             self.set.clone(),
             self.keys[i].clone(),
             Some(Box::new(storage.clone())),
         )
-        .unwrap()
+        .unwrap();
+        if self.sc.exec {
+            let (p, c) = exec_hooks(fx);
+            r.set_exec_hooks(p, c);
+        }
+        r
     }
 
     fn partitioned(&self, a: usize, b: usize) -> bool {
@@ -319,6 +413,26 @@ impl<'a> Sim<'a> {
                 }
                 res
             }
+            Behavior::WrongExec => list
+                .into_iter()
+                .map(|(to, mut m)| {
+                    if let Message::Propose(p) = &mut m {
+                        if p.block.proposer as usize == i {
+                            let r = self.nodes[i].replica.as_ref().unwrap();
+                            if p.block.exec.is_empty() {
+                                p.block.exec = vec![0; 40];
+                            }
+                            let last = p.block.exec.len() - 1;
+                            p.block.exec[last] ^= 0x55;
+                            let id = p.block.id();
+                            p.sig =
+                                r.sign_for_test(&r.context().proposal_bytes(p.block.round, &id));
+                            self.wrong.insert(id);
+                        }
+                    }
+                    (to, m)
+                })
+                .collect(),
             Behavior::EquivLeader { both } => {
                 let mut res = Vec::new();
                 for (to, m) in list {
@@ -353,6 +467,7 @@ impl<'a> Sim<'a> {
         let n = self.nodes.len();
         let honest = self.out.honest[i];
         let mut list: Vec<(usize, Message)> = Vec::new();
+        let mut committed = false;
         for a in actions {
             match a {
                 Action::Send { to, msg } => list.push((to as usize, msg)),
@@ -370,14 +485,35 @@ impl<'a> Sim<'a> {
                     if honest {
                         self.check_commit(i, &b);
                     }
+                    self.nodes[i].fx.borrow_mut().on_commit(&b);
+                    committed = true;
                 }
                 Action::Evidence(e) => self.out.evidence.push((i, e)),
             }
         }
         for (to, m) in self.tamper(i, list) {
             if to < n {
+                self.check_vote(i, &m);
                 self.transmit(i, to, &m);
             }
+        }
+        // Like the node: after executing commits, let the replica continue what waited for them.
+        if committed && self.sc.exec {
+            if let Some(r) = self.nodes[i].replica.as_mut() {
+                let more = r.resume();
+                self.apply(i, more);
+            }
+        }
+    }
+
+    /// No honest replica may ever vote for a block that attests a wrong execution result.
+    fn check_vote(&self, from: usize, m: &Message) {
+        if let (true, Message::Vote(v)) = (self.out.honest[from], m) {
+            assert!(
+                !self.wrong.contains(&v.block_id),
+                "seed {}: honest replica {from} voted for a wrong-attestation block",
+                self.sc.seed
+            );
         }
     }
 
@@ -402,6 +538,27 @@ impl<'a> Sim<'a> {
             ),
             None => {
                 self.global.insert(b.height, id);
+            }
+        }
+        if self.sc.exec {
+            // The attestation of a committed (hence certified) block is the true execution
+            // result at the height the ancestry fixes. All honest replicas hold the same chain,
+            // so any honest replica's executed state that has reached the height must agree.
+            assert!(
+                !self.wrong.contains(&id),
+                "seed {seed}: wrong attestation committed"
+            );
+            let k = u64::from_le_bytes(b.exec[..8].try_into().expect("8 bytes"));
+            let truth = self.nodes[i].fx.borrow().digests.get(&k).copied();
+            if let Some(d) = truth {
+                assert_eq!(
+                    b.exec,
+                    fake_claim(k, &d),
+                    "seed {seed}: certified a wrong root"
+                );
+                self.out.attested_commits += 1;
+            } else {
+                panic!("seed {seed}: attested height {k} not executed by replica {i} at commit");
             }
         }
         self.last_commit[i] = (b.height, id);
@@ -432,7 +589,8 @@ impl<'a> Sim<'a> {
                     }
                     if restart == Some(now) {
                         let st = self.nodes[i].storage.clone();
-                        let mut r = self.make_replica(i, &st);
+                        let fx = self.nodes[i].fx.clone();
+                        let mut r = self.make_replica(i, &st, &fx);
                         let a = r.on_timeout(now);
                         self.nodes[i].replica = Some(r);
                         self.apply(i, a);
@@ -473,6 +631,7 @@ impl<'a> Sim<'a> {
                 }
             }
         }
+        self.out.wrong_exec_blocks = self.wrong.len();
         for i in 0..n {
             if let Some(r) = &self.nodes[i].replica {
                 self.out.heights[i] = r.committed_height();

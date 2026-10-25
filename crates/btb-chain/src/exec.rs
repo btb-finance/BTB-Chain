@@ -81,6 +81,8 @@ pub enum Revert {
     Channel(crate::channel::ChannelError),
     /// A site transaction was refused (nothing changed).
     Site(crate::site::SiteError),
+    /// A DEX transaction was refused (nothing changed).
+    Dex(crate::dex::DexError),
     Vm(String),
 }
 
@@ -153,6 +155,7 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
     match &tx.body.kind {
         TxKind::Transfer { amount, .. } | TxKind::Stake { amount, .. } => fee.checked_add(*amount),
         TxKind::Channel(op) => fee.checked_add(op.debit()),
+        TxKind::Dex(op) => fee.checked_add(op.debit()),
         _ => Some(fee),
     }
 }
@@ -223,7 +226,7 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::BadSignature);
             }
         }
-        TxKind::SubmitEvidence { .. } | TxKind::Channel(_) => {
+        TxKind::SubmitEvidence { .. } | TxKind::Channel(_) | TxKind::Dex(_) => {
             if !tx.verify_signature() {
                 return Err(Invalid::BadSignature);
             }
@@ -623,6 +626,23 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::channel::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Dex(op) => {
+                let (nonce, height) = (tx.body.nonce, self.height);
+                let gas_used = tx.intrinsic_gas();
+                match crate::dex::apply(&mut self.overlay, &sender, nonce, height, op) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::dex::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Dex(e)),
+                    },
+                    Err(crate::dex::Fail::State(e)) => return Err(e),
+                }
+            }
             TxKind::Site(op) => {
                 let gas_used = tx.intrinsic_gas();
                 match crate::site::apply(&mut self.overlay, &sender, op) {
@@ -976,6 +996,7 @@ impl Executor {
             }
         }
         ctx.run_crons(&mut receipts)?;
+        crate::dex::end_block(&mut ctx.overlay, &cfg, h.height)?;
         staking::end_block(&mut ctx.overlay, &cfg.staking, h.height, h.hash())?;
         let new_head = Head {
             height: h.height,

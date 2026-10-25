@@ -12,7 +12,7 @@ const contract = process.env.BTB_HOST_CONTRACT;
 const start = BigInt(process.env.BTB_HOST_EXPECT ?? "0");
 
 describe.skipIf(!url)("BtbClient against btb-host", () => {
-  const client = new BtbClient({ url: url!, caller: "alice" });
+  const client = new BtbClient({ url: url ?? "http://unused", caller: "alice" });
 
   it("queries like it does against btb-dev", async () => {
     expect(await client.query("get", t.unit, [], t.u64)).toBeGreaterThanOrEqual(start);

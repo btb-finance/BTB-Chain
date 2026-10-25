@@ -4,7 +4,7 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 
 **Action.** A function kind that calls the outside world (for example an HTTPS request) and then writes a result the validators have agreed on. See [Oracles](ORACLES.md#3-custom-web-data-https-requests).
 
-**Batch auction.** The way the native DEX settles swaps: all swaps on a pool in one block get the same price, so transaction ordering gives no front-running advantage. See [Architecture](ARCHITECTURE.md#front-running-protection).
+**Batch auction.** The way the native DEX settles swaps: all swaps on a pool in one block get the same price, so transaction ordering gives no front-running advantage. See [Architecture](ARCHITECTURE.md#front-running-protection) and [Chain: Native DEX](CHAIN.md#native-dex).
 
 **Blob storage.** The layer that holds large files. Files are erasure-coded into pieces on storage nodes, and only the hash and piece assignments are on-chain. See [Scaling](SCALING.md#2-storage-split-files-across-many-nodes).
 

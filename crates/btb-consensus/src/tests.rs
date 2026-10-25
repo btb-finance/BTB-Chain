@@ -81,6 +81,7 @@ impl Fixture {
             proposer: proposer as u32,
             payload_hash: Block::hash_payload(payload),
             payload: payload.to_vec(),
+            exec: Vec::new(),
         }
     }
     fn proposal(&self, b: Block, tc: Option<TimeoutCert>) -> Proposal {
@@ -1135,7 +1136,7 @@ fn crash_and_restart_with_persisted_state() {
 
 // ------------------------------------------------------------------ property test
 
-fn random_scenario(seed: u64) -> Scenario {
+pub(crate) fn random_scenario(seed: u64) -> Scenario {
     let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0xC0FFEE);
     let n = [4usize, 4, 4, 5, 7][rng.below(5) as usize];
     let mut sc = Scenario::new(seed, n);

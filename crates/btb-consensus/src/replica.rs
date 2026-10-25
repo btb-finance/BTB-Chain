@@ -83,6 +83,10 @@ pub struct Stats {
     pub rejected_messages: u64,
     /// Times a commit candidate did not extend the committed chain. Must stay 0 under < 1/3 faults.
     pub conflicting_commits: u64,
+    /// Proposals not voted for because their execution attestation did not match ours.
+    pub exec_rejected: u64,
+    /// Times a vote (or proposal) had to wait until the embedder executed an ancestor.
+    pub exec_deferred: u64,
 }
 
 const MAX_SYNC_BLOCKS: usize = 64;
@@ -152,10 +156,35 @@ pub struct Replica {
     payload_check: Option<PayloadCheck>,
     /// Do not propose an empty block on one's own initiative; wait for `propose`.
     hold_empty: bool,
+    /// Execution attestation hooks (see `set_exec_hooks`).
+    exec_hooks: Option<(ExecProvider, ExecCheck)>,
+    /// For every linked block `P`: the height of the block whose execution result a child of
+    /// `P` must attest (`exec_height`), a pure function of the ancestry.
+    exec_base: BTreeMap<Hash, Height>,
+    /// The proposal for the current round that waits for the embedder to execute commits.
+    deferred: Option<(Proposal, Hash)>,
 }
 
 /// See `Replica::set_payload_check`.
 pub type PayloadCheck = Box<dyn Fn(&Block) -> bool>;
+
+/// Outcome of an execution attestation check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecVerdict {
+    /// The attestation matches the embedder's own execution.
+    Accept,
+    /// It does not (or is malformed): never vote for this block.
+    Reject,
+    /// The embedder has not executed the attested height yet; ask again after `resume`.
+    Defer,
+}
+
+/// Produces the attestation for a block this replica is about to propose: the execution
+/// result at the given height, or `None` while that height is not executed yet.
+pub type ExecProvider = Box<dyn Fn(Height) -> Option<Vec<u8>>>;
+
+/// Checks `block.exec` against the embedder's execution at the given height.
+pub type ExecCheck = Box<dyn Fn(&Block, Height) -> ExecVerdict>;
 
 impl Replica {
     /// Create a replica. `key` must belong to a validator in `set`. If `storage` holds
@@ -210,9 +239,12 @@ impl Replica {
             proposer: 0,
             payload_hash: Block::hash_payload(&[]),
             payload: Vec::new(),
+            exec: Vec::new(),
         };
         let mut blocks = BTreeMap::new();
         blocks.insert(ctx.root, genesis_block);
+        let mut exec_base = BTreeMap::new();
+        exec_base.insert(ctx.root, anchor_height);
         let round = (safety.high_qc.round + 1)
             .max(safety.last_voted_round)
             .max(safety.last_proposed_round)
@@ -252,6 +284,9 @@ impl Replica {
             ended: false,
             payload_check: None,
             hold_empty: false,
+            exec_hooks: None,
+            exec_base,
+            deferred: None,
             cfg: config,
             storage,
             now: 0,
@@ -313,6 +348,42 @@ impl Replica {
     /// may fail to form quorums (safety is unaffected: not voting is always safe).
     pub fn set_payload_check(&mut self, check: PayloadCheck) {
         self.payload_check = Some(check);
+    }
+
+    /// Install the execution attestation hooks. `provider(h)` returns the bytes a proposal
+    /// carries in `Block::exec` (the execution result at height `h`, or `None` while `h` is not
+    /// executed yet), `check(block, h)` judges a received block's `exec` against the
+    /// embedder's own execution. `h` is always `Replica::exec_height` of the block's parent: a
+    /// block that has `QC(P)` as its justify attests the execution of the highest block that
+    /// `QC(P)` (together with the chain below it) commits. Every honest replica of a
+    /// validator set must use equivalent hooks. `Defer` and `None` mean "executed later": the
+    /// embedder executes the `Commit` actions it was handed, then calls `resume`.
+    pub fn set_exec_hooks(&mut self, provider: ExecProvider, check: ExecCheck) {
+        self.exec_hooks = Some((provider, check));
+    }
+
+    /// The height whose execution result a child of `parent` attests: the newest block the
+    /// ancestry of `parent` commits by the 2-chain rule (`P.parent` when `P` and its parent
+    /// are in consecutive rounds, else the same for `P`'s parent), or the epoch's anchor.
+    /// `None` if `parent` is not a linked block.
+    pub fn exec_height(&self, parent: &Hash) -> Option<Height> {
+        self.exec_base.get(parent).copied()
+    }
+
+    /// Continue what waited for the embedder's execution (a vote on a deferred proposal, a
+    /// proposal whose attestation could not be produced yet). Call it after executing the
+    /// blocks of `Action::Commit` (and after block sync executed some).
+    pub fn resume(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        if self.ended {
+            return out;
+        }
+        if let Some((p, id)) = self.deferred.take() {
+            self.try_vote(&p, id, &mut out);
+        }
+        self.pump(&mut out);
+        out.append(&mut self.outbox);
+        out
     }
 
     /// When set, a leader with no queued payload does not propose by itself; the embedder
@@ -475,6 +546,12 @@ impl Replica {
             return;
         }
         self.round = r;
+        if self.hold_empty {
+            // The embedder queues a payload for the round it is leading; one that could not
+            // be proposed in time (it waited for execution) must not resurface later, when
+            // the transactions in it may have been included elsewhere.
+            self.payloads.clear();
+        }
         self.failures = if by_qc { 0 } else { self.failures + 1 };
         self.round_deadline = self.now.saturating_add(self.timeout_duration());
     }
@@ -643,6 +720,7 @@ impl Replica {
             || b.round > MAX_ROUND
             || b.payload.len() > self.cfg.max_payload_bytes
             || b.payload_hash != Block::hash_payload(&b.payload)
+            || b.exec.len() > MAX_EXEC_BYTES
             || b.parent != b.justify.block_id
             || b.justify.round >= b.round
             || (b.proposer as usize) >= self.ctx.set.len()
@@ -730,6 +808,7 @@ impl Replica {
             return false;
         };
         let (ph, pr) = (parent.height, parent.round);
+        let parent_base = self.exec_base.get(&b.parent).copied().unwrap_or(ph);
         if b.height != ph + 1 || pr != b.justify.round || b.round <= pr {
             self.reject();
             return false;
@@ -738,6 +817,10 @@ impl Replica {
             self.reject();
             return false;
         }
+        // What a child of this block attests: the parent is committed by the 2-chain rule when
+        // this block is in the next round, else whatever the parent's own ancestry committed.
+        let base = if b.round == pr + 1 { ph } else { parent_base };
+        self.exec_base.insert(id, base);
         self.blocks.insert(id, b.clone());
         true
     }
@@ -763,6 +846,24 @@ impl Replica {
         if let Some(check) = &self.payload_check {
             if !check(b) {
                 return self.reject();
+            }
+        }
+        // Execution attestation: vote only for a block whose claimed execution result is ours.
+        if let Some((_, check)) = &self.exec_hooks {
+            let Some(h) = self.exec_base.get(&b.parent).copied() else {
+                return self.reject();
+            };
+            match check(b, h) {
+                ExecVerdict::Accept => {}
+                ExecVerdict::Reject => {
+                    self.stats.exec_rejected += 1;
+                    return self.reject();
+                }
+                ExecVerdict::Defer => {
+                    self.stats.exec_deferred += 1;
+                    self.deferred = Some((p.clone(), id));
+                    return;
+                }
             }
         }
         // Write-ahead: persist before the vote can leave this function.
@@ -1050,6 +1151,23 @@ impl Replica {
                 _ => return,
             }
         };
+        // The attestation must exist before a payload is taken from the queue.
+        let exec = match &self.exec_hooks {
+            None => Vec::new(),
+            Some((provider, _)) => {
+                let Some(h) = self.exec_base.get(&justify.block_id).copied() else {
+                    return;
+                };
+                match provider(h) {
+                    Some(e) if e.len() <= MAX_EXEC_BYTES => e,
+                    Some(_) => return,
+                    None => {
+                        self.stats.exec_deferred += 1;
+                        return;
+                    }
+                }
+            }
+        };
         let end = self.cfg.end_height;
         let payload = if end != 0 && height > end {
             Vec::new()
@@ -1069,6 +1187,7 @@ impl Replica {
             proposer: self.me,
             payload_hash: Block::hash_payload(&payload),
             payload,
+            exec,
         };
         let id = block.id();
         let sig = self.sign(&self.ctx.proposal_bytes(r, &id));
@@ -1085,6 +1204,7 @@ impl Replica {
     #[cfg(test)]
     pub(crate) fn forge_proposal(&self, payload: Vec<u8>) -> Option<Proposal> {
         let justify = self.safety.high_qc.clone();
+        let justify_id = justify.block_id;
         let parent = self.blocks.get(&justify.block_id)?;
         let tc = if justify.round + 1 == self.round {
             None
@@ -1099,6 +1219,12 @@ impl Replica {
             proposer: self.me,
             payload_hash: Block::hash_payload(&payload),
             payload,
+            exec: self.exec_hooks.as_ref().map_or_else(Vec::new, |(p, _)| {
+                self.exec_base
+                    .get(&justify_id)
+                    .and_then(|h| p(*h))
+                    .unwrap_or_default()
+            }),
         };
         let id = block.id();
         Some(Proposal {
@@ -1106,6 +1232,11 @@ impl Replica {
             block,
             tc,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_payloads(&self) -> usize {
+        self.payloads.len()
     }
 
     #[cfg(test)]
@@ -1210,6 +1341,7 @@ impl Replica {
             }
             if b.payload.len() > self.cfg.max_payload_bytes
                 || b.payload_hash != Block::hash_payload(&b.payload)
+                || b.exec.len() > MAX_EXEC_BYTES
                 || b.parent != b.justify.block_id
                 || b.justify.round >= b.round
             {

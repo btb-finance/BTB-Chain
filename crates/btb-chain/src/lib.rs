@@ -8,6 +8,7 @@
 
 pub mod block;
 pub mod channel;
+pub mod dex;
 pub mod exec;
 pub mod mempool;
 pub(crate) mod parallel;
@@ -18,6 +19,7 @@ pub mod tx;
 
 pub use block::{Block, Header};
 pub use channel::{channel_id, Channel, ChannelError, ChannelOp};
+pub use dex::{dex_fees, dex_vault, Asset, DexError, DexOp};
 pub use exec::{BlockError, ExecMode, Executor, Invalid, Origin, Receipt, Revert, Status};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
 pub use parallel::ParStats;
@@ -57,6 +59,10 @@ pub const EVIDENCE_GAS: u64 = 100_000;
 /// Payment channels: open, top-up and finalize cost `CHANNEL_GAS`; a voucher check adds a signature verification.
 pub const CHANNEL_GAS: u64 = 10_000;
 pub const CHANNEL_VOUCHER_GAS: u64 = 30_000;
+/// DEX: placing an order escrows funds and writes the book; cancelling refunds. Clearing work
+/// is paid for by the clearing fee (`ChainConfig::dex_fee_bps`), not per transaction.
+pub const DEX_PLACE_GAS: u64 = 30_000;
+pub const DEX_CANCEL_GAS: u64 = 15_000;
 /// Blocks the payee has to submit a higher voucher after the payer starts a timeout close.
 pub const CHANNEL_CHALLENGE_BLOCKS: u64 = 600;
 

@@ -290,7 +290,7 @@ fn anchored_bundle(e: &Env, key: &str) -> ProofBundle {
     e.c.wait_until("an anchored proof", 30, || {
         let r = e.get(&format!("/proof/{}?key={}", hex::encode(&e.ctr), key));
         let b = ProofBundle::from_json(&r.json()).unwrap();
-        let ok = b.commit.is_some() && b.entries[0].value.is_some();
+        let ok = b.commit.is_some() && b.attest.is_some() && b.entries[0].value.is_some();
         out = Some(b);
         ok
     });
@@ -310,6 +310,10 @@ fn proofs_verify_and_tampering_fails() {
 
     let v = proof::verify_bundle(&b, Some(&ctx)).expect("an honest bundle verifies");
     assert!(v.header_bound && v.quorum_committed);
+    assert!(
+        v.root_attested && v.attested_epoch == Some(0),
+        "the root is anchored to a quorum"
+    );
     assert_eq!(v.entries.len(), 1);
     assert_eq!(v.entries[0].0, full_key);
     assert_eq!(u64_of(&hex::encode(v.entries[0].1.as_ref().unwrap())), 7);
@@ -318,9 +322,113 @@ fn proofs_verify_and_tampering_fails() {
     assert_eq!(blk["state_root_after"], hex::encode(&v.state_root));
     // Without a trust anchor the quorum evidence is simply not checked.
     let weak = proof::verify_bundle(&b, None).unwrap();
-    assert!(weak.header_bound && !weak.quorum_committed);
+    assert!(weak.header_bound && !weak.quorum_committed && !weak.root_attested);
     // And survives a trip through JSON.
     assert_eq!(ProofBundle::from_json(&b.to_json()).unwrap(), b);
+
+    // --- the state root attestation: forged roots, certificates and claims are rejected
+    let trust: BTreeMap<u64, btb_consensus::Context> = BTreeMap::from([(0, ctx.clone())]);
+    let att = b.attest.clone().unwrap();
+    let bad_att = |t: &ProofBundle| match proof::verify_bundle_with(t, &trust) {
+        Err(ProofError::BadAttestation(m)) => m,
+        other => panic!("expected BadAttestation, got {other:?}"),
+    };
+    // Another root with the same certificate: the Merkle proofs, the roots and the claim all
+    // have to agree, so every way of swapping the root breaks something.
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().roots[0][0] ^= 1;
+    assert!(bad_att(&t).contains("not the bundle's root"));
+    let mut t = b.clone();
+    for r in t.attest.as_mut().unwrap().roots.iter_mut() {
+        r[1] ^= 1; // a consistent lie about every attested root
+    }
+    t.state_root[1] ^= 1;
+    assert_eq!(
+        proof::verify_bundle_with(&t, &trust),
+        Err(ProofError::BadEntry(0))
+    );
+    // The lie also fails when the Merkle proofs are replaced to fit it: the claim's digest
+    // is signed and does not fold from the forged roots.
+    let mut t = b.clone();
+    t.entries.clear();
+    t.header = None;
+    t.commit = None;
+    t.state_root[1] ^= 1;
+    {
+        let a = t.attest.as_mut().unwrap();
+        a.roots[0] = t.state_root;
+    }
+    assert!(bad_att(&t).contains("fold"));
+    // A forged claim (its block id changes, so the certificate no longer matches) ...
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().block.exec[9] ^= 1;
+    assert!(bad_att(&t).contains("another block"));
+    // ... and a claim re-certified by a minority of the validators: a flipped signature, too
+    // few signers, and a certificate of another block all fail the quorum check.
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().qc.votes[0].1 .0[0] ^= 1;
+    assert!(bad_att(&t).contains("quorum"));
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().qc.votes.truncate(1);
+    assert!(bad_att(&t).contains("quorum"));
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().qc.block_id[0] ^= 1;
+    assert!(bad_att(&t).contains("another block"));
+    // Wrong height bookkeeping.
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().roots.pop();
+    assert!(!bad_att(&t).is_empty());
+    let mut t = b.clone();
+    t.attest.as_mut().unwrap().prev_digest = Some([5; 32]);
+    assert!(bad_att(&t).contains("fold"));
+    // Validators of another epoch or another set cannot vouch for it.
+    let other_set = btb_consensus::Context::for_epoch(
+        &btb_chain::staking::consensus_chain_id(CHAIN_ID),
+        0,
+        btb_consensus::ValidatorSet::new(
+            (60..64u8)
+                .map(|i| btb_consensus::Validator {
+                    key: key_of(i),
+                    stake: 10,
+                })
+                .collect(),
+        )
+        .unwrap(),
+        None,
+    );
+    let mut only_att = b.clone();
+    only_att.header = None;
+    only_att.commit = None;
+    assert!(matches!(
+        proof::verify_bundle_with(&only_att, &BTreeMap::from([(0, other_set)])),
+        Err(ProofError::BadAttestation(_))
+    ));
+    assert!(
+        proof::verify_bundle_with(&only_att, &trust)
+            .unwrap()
+            .root_attested
+    );
+    // No context for the attestation's epoch: not an error, simply not attested.
+    let none = proof::verify_bundle_with(&b, &BTreeMap::new()).unwrap();
+    assert!(!none.root_attested);
+    // The certified claim is about this very chain: the validators' own record of the block
+    // the certificate is for names the same digest.
+    let att_blk =
+        e.c.node(0)
+            .call("btb_getBlock", json!([att.block.height]))
+            .unwrap();
+    assert_eq!(
+        att_blk["attests_height"],
+        att.roots.len() as u64 - 1 + b.height
+    );
+    assert_eq!(att.roots[0], v.state_root);
+    // JSON round trip keeps the attestation; a forged block id is refused while parsing.
+    let mut j = b.to_json();
+    j["attest"]["block"]["exec"] = json!("00");
+    assert!(matches!(
+        ProofBundle::from_json(&j),
+        Err(ProofError::Format(_))
+    ));
 
     // --- tampering
     let mut t = b.clone();
@@ -491,7 +599,7 @@ fn check_fixture() {
     let ctx =
         proof::context_from_epoch_json(f["chain_id"].as_u64().unwrap(), 0, &f["epoch"]).unwrap();
     let v = proof::verify_bundle(&b, Some(&ctx)).expect("checked-in fixture verifies");
-    assert!(v.header_bound && v.quorum_committed);
+    assert!(v.header_bound && v.quorum_committed && v.root_attested);
 }
 
 #[test]

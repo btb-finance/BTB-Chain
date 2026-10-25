@@ -86,7 +86,7 @@ BTB state is a database, not a raw key-value store. Tables, indexes and everythi
 
 ## Front-running protection
 
-Block producers choose transaction order and earn fees, so they could front-run large swaps. The native DEX module uses **batch auctions**: all swaps on a pool in one block settle at the same price, so ordering gives no advantage.
+Block producers choose transaction order and earn fees, so they could front-run large swaps. The native DEX module uses **batch auctions**: all swaps on a pool in one block settle at the same price, so ordering gives no advantage. Implemented as limit-order batch auctions with one exact clearing price per pair and escrowed funds; see [CHAIN.md](CHAIN.md#native-dex).
 
 ## Tech stack
 

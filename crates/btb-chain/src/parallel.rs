@@ -510,6 +510,7 @@ fn run_workers<T: Send>(
 /// | `Deploy` | sender, the new contract address |
 /// | `Stake`, `Unstake`, `RegisterValidator` | sender |
 /// | `SubmitEvidence` | sender, the slash vault |
+/// | `Dex` | sender (escrow and clearing touch the vault: always the sequential path) |
 /// | `Channel` | sender (settlements also pay the payee: always the sequential path) |
 /// | `Call` | sender, the contract (a contract may also move tokens to other accounts) |
 ///
@@ -530,7 +531,13 @@ fn classify(txs: &[Transaction]) -> (Vec<Vec<usize>>, Vec<usize>) {
         }
         x
     }
-    let special = [validator_pool(), relay_pool(), slash_vault()];
+    let special = [
+        validator_pool(),
+        relay_pool(),
+        slash_vault(),
+        crate::dex_vault(),
+        crate::dex_fees(),
+    ];
     let mut tx_acct: Vec<usize> = Vec::with_capacity(txs.len());
     let mut bad: Vec<bool> = Vec::new(); // per account id: special address
     let mut id_of = |a: Address, parent: &mut Vec<usize>, bad: &mut Vec<bool>| -> usize {

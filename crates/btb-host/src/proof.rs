@@ -17,20 +17,27 @@
 //! * With consensus evidence and the validator set of the epoch (a trust anchor the caller
 //!   supplies): block `height + 1` **with these transactions** was committed by a quorum.
 //!
-//! What no validator signs today is the state root itself. A consensus certificate covers the
-//! block payload (the transactions), and the header's `state_root` is what every node derived by
-//! executing the chain before it. So a proof shows that the host's claimed root is consistent
-//! with a committed block, not that a quorum attested the root. To rely on a root, compare it
-//! with a validator's `btb_getBlock` (`state_root_after`) or another independent host, or
-//! re-execute. Validator-signed state roots are a planned consensus change (`docs/HOSTING.md`).
+//! The **state root attestation** ([`Attestation`]) anchors the root to a quorum. Every
+//! consensus block carries a claim about the execution of one of its ancestors (the newest
+//! block its ancestry commits, `docs/CONSENSUS.md`) and honest validators vote only when the
+//! claim equals their own execution. A bundle therefore carries that block, the quorum
+//! certificate for it and the state roots from `height` up to the claimed height; the verifier
+//! checks the certificate against the epoch's validator set (a trust anchor the caller
+//! supplies) and recomputes the claim's digest chain from the roots. With
+//! [`Verified::root_attested`] set, `state_root` is the root a quorum of that epoch's validators
+//! executed, not just a root consistent with committed transactions. Without a validator set
+//! (or without an attestation in the bundle) compare the root with a validator's `btb_getBlock`
+//! (`state_root_after`) or another independent host, or re-execute.
 
 use btb_chain::{Block, Header};
-use btb_consensus::Context;
+use btb_consensus::{Block as ConsensusBlock, Context, QuorumCert, Sig};
+use btb_node::attest::{genesis_digest, next_digest, Claim};
 use btb_node::hex;
 use btb_node::sync::{self, Expect};
 use btb_node::wire::{Batch, SyncResponse};
 use btb_runtime::merkle::{self, Proof};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 pub type Hash = [u8; 32];
 
@@ -52,6 +59,22 @@ pub struct Commit {
     pub sync: SyncResponse,
 }
 
+/// Proof that a quorum of an epoch's validators attested the state root of the bundle's height.
+///
+/// `block` is a consensus block (without its payload; the id covers `payload_hash`) whose
+/// `exec` claim names height `k >= height` and the digest chain value `d_k`; `qc` is the
+/// quorum certificate for that block. `roots` are the state roots after blocks `height ..= k`
+/// (the first is the bundle's `state_root`) and `prev_digest` is `d_{height-1}` (`None` for
+/// height 0). Folding `roots` into the chain starting at `prev_digest` must give `d_k`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attestation {
+    pub epoch: u64,
+    pub block: ConsensusBlock,
+    pub qc: QuorumCert,
+    pub prev_digest: Option<Hash>,
+    pub roots: Vec<Hash>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProofBundle {
     /// State version: the state after block `height` (genesis is 0).
@@ -61,6 +84,8 @@ pub struct ProofBundle {
     /// Header of block `height + 1`, if the host has executed it.
     pub header: Option<Header>,
     pub commit: Option<Commit>,
+    /// Quorum attestation of `state_root`, if the host could build one.
+    pub attest: Option<Attestation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +100,9 @@ pub enum ProofError {
     BadCommit(String),
     /// Consensus evidence without a header.
     CommitWithoutHeader,
+    /// The state root attestation is malformed, does not match the root, or its certificate
+    /// is not a quorum of the epoch's validators.
+    BadAttestation(String),
 }
 
 /// What a bundle established.
@@ -89,12 +117,43 @@ pub struct Verified {
     /// Block `height + 1`, with the transactions its header commits to, was committed by a
     /// quorum of the validators in the context the caller supplied.
     pub quorum_committed: bool,
+    /// A quorum of the validators in the supplied context of the attestation's epoch attested
+    /// `state_root` (their votes cover an execution claim that includes it).
+    pub root_attested: bool,
+    /// The epoch whose validators attested the root, when `root_attested`.
+    pub attested_epoch: Option<u64>,
 }
 
 /// Check a bundle. `ctx` is the consensus context of the epoch of block `height + 1`, built by
 /// the caller from a validator set it trusts (see [`context_from_epoch_json`]); without it the
 /// consensus evidence is not checked and `quorum_committed` stays false.
 pub fn verify_bundle(b: &ProofBundle, ctx: Option<&Context>) -> Result<Verified, ProofError> {
+    // The one context is for the epoch of the commit evidence; the attestation may come from
+    // another epoch (the next one for the last blocks of an epoch), so it is checked only if
+    // it is from the same epoch. Use [`verify_bundle_with`] to supply several epochs.
+    let mut trust = BTreeMap::new();
+    if let (Some(ctx), Some(c)) = (ctx, &b.commit) {
+        trust.insert(c.epoch, ctx.clone());
+    }
+    verify_with(b, ctx, &trust)
+}
+
+/// As [`verify_bundle`], with the trusted contexts of several epochs: the commit evidence is
+/// checked against the context of its epoch and the state root attestation against that of
+/// its epoch. A missing epoch leaves the corresponding claim unchecked (false in [`Verified`]).
+pub fn verify_bundle_with(
+    b: &ProofBundle,
+    trust: &BTreeMap<u64, Context>,
+) -> Result<Verified, ProofError> {
+    let ctx = b.commit.as_ref().and_then(|c| trust.get(&c.epoch));
+    verify_with(b, ctx, trust)
+}
+
+fn verify_with(
+    b: &ProofBundle,
+    ctx: Option<&Context>,
+    trust: &BTreeMap<u64, Context>,
+) -> Result<Verified, ProofError> {
     for (i, e) in b.entries.iter().enumerate() {
         if !merkle::verify(&b.state_root, &e.key, e.value.as_deref(), &e.proof) {
             return Err(ProofError::BadEntry(i));
@@ -110,12 +169,35 @@ pub fn verify_bundle(b: &ProofBundle, ctx: Option<&Context>) -> Result<Verified,
             .collect(),
         header_bound: false,
         quorum_committed: false,
+        root_attested: false,
+        attested_epoch: None,
     };
+    check_header_and_commit(b, ctx, &mut out)?;
+    if let Some(a) = &b.attest {
+        check_attestation(b, a)?;
+        if let Some(ctx) = trust.get(&a.epoch) {
+            if !ctx.verify_qc(&a.qc) {
+                return Err(ProofError::BadAttestation(
+                    "the certificate is not a quorum of the epoch's validators".into(),
+                ));
+            }
+            out.root_attested = true;
+            out.attested_epoch = Some(a.epoch);
+        }
+    }
+    Ok(out)
+}
+
+fn check_header_and_commit(
+    b: &ProofBundle,
+    ctx: Option<&Context>,
+    out: &mut Verified,
+) -> Result<(), ProofError> {
     let Some(h) = &b.header else {
         return if b.commit.is_some() {
             Err(ProofError::CommitWithoutHeader)
         } else {
-            Ok(out)
+            Ok(())
         };
     };
     if h.height != b.height + 1 || h.state_root != b.state_root {
@@ -123,7 +205,7 @@ pub fn verify_bundle(b: &ProofBundle, ctx: Option<&Context>) -> Result<Verified,
     }
     out.header_bound = true;
     let Some(c) = &b.commit else {
-        return Ok(out);
+        return Ok(());
     };
     let bad = |m: &str| ProofError::BadCommit(m.to_string());
     let first = c.sync.blocks.first().ok_or_else(|| bad("no blocks"))?;
@@ -141,7 +223,7 @@ pub fn verify_bundle(b: &ProofBundle, ctx: Option<&Context>) -> Result<Verified,
         return Err(bad("header does not match the committed payload"));
     }
     let Some(ctx) = ctx else {
-        return Ok(out);
+        return Ok(());
     };
     let expect = Expect {
         ctx,
@@ -155,8 +237,42 @@ pub fn verify_bundle(b: &ProofBundle, ctx: Option<&Context>) -> Result<Verified,
         Ok(_) => return Err(bad("block not proven committed")),
         Err(e) => return Err(ProofError::BadCommit(format!("{e:?}"))),
     }
-    Ok(out)
+    Ok(())
 }
+
+/// Everything about an attestation that needs no trust anchor: the certificate is for the
+/// block, the block's claim covers the bundle's height, and the roots fold into the claim.
+fn check_attestation(b: &ProofBundle, a: &Attestation) -> Result<(), ProofError> {
+    let bad = |m: &str| ProofError::BadAttestation(m.to_string());
+    let claim = Claim::decode(&a.block.exec).ok_or_else(|| bad("malformed claim"))?;
+    if a.qc.block_id != a.block.id() || a.qc.round != a.block.round {
+        return Err(bad("the certificate is for another block"));
+    }
+    if claim.height < b.height || claim.height >= a.block.height {
+        return Err(bad("the claim does not cover this height"));
+    }
+    if a.roots.len() as u64 != claim.height - b.height + 1 || a.roots.len() > MAX_ROOTS {
+        return Err(bad("wrong number of roots"));
+    }
+    if a.roots[0] != b.state_root {
+        return Err(bad("the attested root is not the bundle's root"));
+    }
+    let mut d = match (b.height, a.prev_digest) {
+        (0, _) => genesis_digest(&a.roots[0]),
+        (h, Some(prev)) => next_digest(&prev, h, &a.roots[0]),
+        (_, None) => return Err(bad("missing previous digest")),
+    };
+    for (i, root) in a.roots.iter().enumerate().skip(1) {
+        d = next_digest(&d, b.height + i as u64, root);
+    }
+    if d != claim.digest {
+        return Err(bad("the roots do not fold into the attested digest"));
+    }
+    Ok(())
+}
+
+/// Most state roots one attestation carries.
+pub const MAX_ROOTS: usize = 256;
 
 /// Build the consensus context of an epoch from the JSON a validator returns for
 /// `btb_getEpoch` (`validators: [{key, stake}]`, `anchor`).
@@ -250,6 +366,91 @@ fn header_from_json(v: &Value) -> Result<Header, String> {
     Ok(h)
 }
 
+fn qc_json(q: &QuorumCert) -> Value {
+    json!({
+        "round": q.round,
+        "block_id": hex::encode(&q.block_id),
+        "votes": q.votes.iter().map(|(i, s)| json!([i, hex::encode(&s.0)])).collect::<Vec<_>>(),
+    })
+}
+
+fn qc_from_json(v: &Value) -> Result<QuorumCert, String> {
+    let votes = v["votes"]
+        .as_array()
+        .ok_or("votes")?
+        .iter()
+        .map(|p| {
+            let i = u32::try_from(p[0].as_u64().ok_or("vote index")?).map_err(|_| "vote index")?;
+            let raw = hex::decode(p[1].as_str().ok_or("vote signature")?)?;
+            let sig: [u8; 64] = raw.try_into().map_err(|_| "signature length")?;
+            Ok((i, Sig(sig)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(QuorumCert {
+        round: v["round"].as_u64().ok_or("qc round")?,
+        block_id: hex::decode32(v["block_id"].as_str().ok_or("qc block_id")?)?,
+        votes,
+    })
+}
+
+fn attest_json(a: &Attestation) -> Value {
+    let b = &a.block;
+    json!({
+        "epoch": a.epoch,
+        "block": {
+            "round": b.round,
+            "height": b.height,
+            "parent": hex::encode(&b.parent),
+            "justify": qc_json(&b.justify),
+            "proposer": b.proposer,
+            "payload_hash": hex::encode(&b.payload_hash),
+            "exec": hex::encode(&b.exec),
+            "id": hex::encode(&b.id()),
+        },
+        "qc": qc_json(&a.qc),
+        "prev_digest": a.prev_digest.as_ref().map(|d| hex::encode(d)),
+        "roots": a.roots.iter().map(|r| hex::encode(r)).collect::<Vec<_>>(),
+    })
+}
+
+fn attest_from_json(v: &Value) -> Result<Attestation, String> {
+    let b = &v["block"];
+    let block = ConsensusBlock {
+        round: b["round"].as_u64().ok_or("block round")?,
+        height: b["height"].as_u64().ok_or("block height")?,
+        parent: hex::decode32(b["parent"].as_str().ok_or("block parent")?)?,
+        justify: qc_from_json(&b["justify"])?,
+        proposer: u32::try_from(b["proposer"].as_u64().ok_or("proposer")?)
+            .map_err(|_| "proposer")?,
+        payload_hash: hex::decode32(b["payload_hash"].as_str().ok_or("payload_hash")?)?,
+        payload: Vec::new(),
+        exec: hex::decode(b["exec"].as_str().ok_or("exec")?)?,
+    };
+    // The claimed id must be the real one: a forged field cannot hide behind it.
+    if hex::decode32(b["id"].as_str().ok_or("block id")?)? != block.id() {
+        return Err("block id does not match its fields".into());
+    }
+    let roots = v["roots"]
+        .as_array()
+        .ok_or("roots")?
+        .iter()
+        .map(|r| hex::decode32(r.as_str().ok_or("root")?))
+        .collect::<Result<Vec<_>, String>>()?;
+    if roots.is_empty() || roots.len() > MAX_ROOTS {
+        return Err("roots".into());
+    }
+    Ok(Attestation {
+        epoch: v["epoch"].as_u64().ok_or("attest epoch")?,
+        block,
+        qc: qc_from_json(&v["qc"])?,
+        prev_digest: match &v["prev_digest"] {
+            Value::Null => None,
+            d => Some(hex::decode32(d.as_str().ok_or("prev_digest")?)?),
+        },
+        roots,
+    })
+}
+
 impl ProofBundle {
     pub fn to_json(&self) -> Value {
         json!({
@@ -266,6 +467,7 @@ impl ProofBundle {
                 "epoch": c.epoch,
                 "sync": hex::encode(&c.sync.encode()),
             })),
+            "attest": self.attest.as_ref().map(attest_json),
         })
     }
 
@@ -318,6 +520,10 @@ impl ProofBundle {
             entries,
             header,
             commit,
+            attest: match &v["attest"] {
+                Value::Null => None,
+                a => Some(attest_from_json(a).map_err(ProofError::Format)?),
+            },
         })
     }
 }

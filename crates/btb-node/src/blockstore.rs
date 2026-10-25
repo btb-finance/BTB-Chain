@@ -44,11 +44,20 @@ pub struct StoredReceipt {
     pub output: Vec<u8>,
 }
 
+/// What executing a block added to the execution attestation chain (`attest`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecRecord {
+    /// `d_h`: the state root digest chain ending at this block.
+    pub digest: Hash,
+    pub receipts_root: Hash,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBlock {
     pub header: Header,
     pub hash: Hash,
     pub state_root_after: Hash,
+    pub exec: ExecRecord,
     pub consensus_round: u64,
     pub tx_ids: Vec<Hash>,
     pub receipts: Vec<StoredReceipt>,
@@ -97,7 +106,7 @@ impl R<'_> {
     }
 }
 
-const MAGIC: &[u8; 4] = b"BTR1";
+const MAGIC: &[u8; 4] = b"BTR2";
 
 fn account_key(a: &Address, height: u64, index: u32) -> Vec<u8> {
     let mut k = vec![b'A'];
@@ -152,6 +161,8 @@ impl StoredBlock {
         w.hash(&h.tx_root);
         w.hash(&self.hash);
         w.hash(&self.state_root_after);
+        w.hash(&self.exec.digest);
+        w.hash(&self.exec.receipts_root);
         w.u64(self.consensus_round);
         w.u64(self.tx_ids.len() as u64);
         for id in &self.tx_ids {
@@ -188,6 +199,10 @@ impl StoredBlock {
         };
         let hash = r.hash()?;
         let state_root_after = r.hash()?;
+        let exec = ExecRecord {
+            digest: r.hash()?,
+            receipts_root: r.hash()?,
+        };
         let consensus_round = r.u64()?;
         let n = r.count(32)?;
         let tx_ids = (0..n).map(|_| r.hash()).collect::<Option<Vec<_>>>()?;
@@ -217,6 +232,7 @@ impl StoredBlock {
             header,
             hash,
             state_root_after,
+            exec,
             consensus_round,
             tx_ids,
             receipts,
@@ -481,6 +497,10 @@ mod tests {
             },
             hash: [h as u8; 32],
             state_root_after: [4; 32],
+            exec: ExecRecord {
+                digest: [6; 32],
+                receipts_root: [7; 32],
+            },
             consensus_round: h + 1,
             tx_ids: vec![[h as u8; 32]],
             receipts: vec![StoredReceipt {
@@ -499,6 +519,7 @@ mod tests {
                 proposer: 0,
                 payload_hash: ConsensusBlock::hash_payload(&[5]),
                 payload: vec![5],
+                exec: vec![8; 72],
             },
         }
     }

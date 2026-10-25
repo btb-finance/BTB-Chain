@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTB Native DEX</title>
+<style>
+  :root { --bg:#0f1318; --panel:#171d25; --line:#2a3340; --fg:#e6ebf2; --dim:#8b97a8; --ask:#ff6b6b; --bid:#3ecf8e; --acc:#6aa9ff; --warn:#f5b84a; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f7fa; --panel:#fff; --line:#d8dee8; --fg:#18202b; --dim:#5d6b7e; --ask:#c62f3a; --bid:#10854f; --acc:#1d5fd1; --warn:#b36b00; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:8px 24px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; }
+  header span { color:var(--dim); }
+  header b { color:var(--fg); font-variant-numeric:tabular-nums; }
+  main { display:grid; grid-template-columns:minmax(0,340px) minmax(0,1fr); gap:16px; padding:16px; }
+  @media (max-width:820px) { main { grid-template-columns:1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:16px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  label { display:block; color:var(--dim); font-size:12px; margin-top:8px; }
+  input, select, button { width:100%; padding:7px 8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font:inherit; }
+  button { cursor:pointer; background:var(--acc); color:#fff; border:0; font-weight:600; margin-top:10px; }
+  button.sell { background:var(--ask); } button.buy { background:var(--bid); }
+  button.small { width:auto; padding:2px 8px; margin:0; font-size:12px; background:var(--line); color:var(--fg); }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th { color:var(--dim); font-weight:500; text-align:right; font-size:12px; padding:2px 6px; }
+  td { text-align:right; padding:2px 6px; position:relative; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  td .bar { position:absolute; inset:1px 0 1px auto; opacity:.18; }
+  .ask { color:var(--ask); } .bid { color:var(--bid); }
+  .ask .bar { background:var(--ask); } .bid .bar { background:var(--bid); }
+  #last { font-size:26px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .dim { color:var(--dim); } .mono { font-family:ui-monospace,monospace; font-size:12px; word-break:break-all; }
+  #msg { min-height:20px; margin-top:8px; } #msg.err { color:var(--ask); } #msg.ok { color:var(--bid); }
+  .scroll { overflow-x:auto; }
+  .note { font-size:12px; color:var(--dim); margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BTB Native DEX</h1>
+  <span>block <b id="height">-</b></span>
+  <span>batch window <b id="window">-</b> block(s)</span>
+  <span>next clearing at block <b id="next">-</b></span>
+  <span>fee <b id="fee">-</b> bps</span>
+  <span>chain <b id="chain">-</b></span>
+</header>
+<main>
+  <div>
+    <section>
+      <h2>Account</h2>
+      <div class="mono" id="addr">loading</div>
+      <label>Seed (32 bytes, hex) <span class="dim">stored in this browser only</span></label>
+      <div class="row"><input id="seed" spellcheck="false"><button class="small" id="newseed" style="max-width:70px">New</button></div>
+      <div class="note" id="balances"></div>
+    </section>
+    <section>
+      <h2>Place a limit order</h2>
+      <div class="row">
+        <div><label>Base asset</label><select id="asset-a"></select></div>
+        <div><label>Quote asset</label><select id="asset-b"></select></div>
+      </div>
+      <div class="note" id="pairinfo"></div>
+      <label>Amount (base units)</label><input id="amount" value="100" inputmode="numeric">
+      <label>Limit price (quote units per base unit)</label><input id="price" value="10" inputmode="decimal">
+      <label>Lives for (batches)</label><input id="batches" value="3" inputmode="numeric">
+      <div class="row">
+        <button class="buy" id="buy">Buy base</button>
+        <button class="sell" id="sell">Sell base</button>
+      </div>
+      <div id="msg"></div>
+      <div class="note">All orders of a batch clear together at one price, so the order of transactions inside a block gives no advantage. Funds are escrowed when you place an order and refunded when it ends.</div>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Last clearing price</h2>
+      <div id="last">-</div>
+      <div class="dim" id="lastinfo"></div>
+    </section>
+    <section>
+      <h2>Order book (open orders, resting until their next clearing)</h2>
+      <div class="scroll"><table id="book"><thead><tr><th>Price</th><th>Size (base)</th><th>Orders</th></tr></thead><tbody id="asks"></tbody><tbody id="spread"></tbody><tbody id="bids"></tbody></table></div>
+    </section>
+    <section>
+      <h2>Recent clearings</h2>
+      <div class="scroll"><table><thead><tr><th>Block</th><th>Price</th><th>Base volume</th><th>Quote volume</th><th>Orders</th></tr></thead><tbody id="history"></tbody></table></div>
+    </section>
+    <section>
+      <h2>My open orders</h2>
+      <div class="scroll"><table><thead><tr><th>Order</th><th>Side</th><th>Left</th><th>Limit</th><th>Escrow</th><th>Batches left</th><th></th></tr></thead><tbody id="orders"></tbody></table></div>
+    </section>
+    <section>
+      <h2>My closed orders</h2>
+      <div class="scroll"><table><thead><tr><th>Order</th><th>Side</th><th>Outcome</th><th>Filled (base)</th><th>Avg price</th><th>Closed at</th></tr></thead><tbody id="results"></tbody></table></div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+const hex = u8 => Array.from(u8, b => b.toString(16).padStart(2, '0')).join('');
+const unhex = s => Uint8Array.from((s.match(/../g) || []), h => parseInt(h, 16));
+const cat = (...a) => { const o = new Uint8Array(a.reduce((n, x) => n + x.length, 0)); let p = 0; for (const x of a) { o.set(x, p); p += x.length; } return o; };
+const U64 = (1n << 64n) - 1n;
+const le = (v, n) => { v = BigInt(v); const o = new Uint8Array(n); for (let i = 0; i < n; i++) { o[i] = Number(v & 0xffn); v >>= 8n; } return o; };
+const sha256 = async d => new Uint8Array(await crypto.subtle.digest('SHA-256', d));
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const short = h => h.slice(0, 8);
+
+async function rpc(method, params = []) {
+  const r = await fetch('/', { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  return j.result;
+}
+
+// ---- keys and transactions (the same wire format as btb-chain's tx.rs) ----
+const PKCS8 = Uint8Array.from([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20]);
+const K = { priv: null, pub: null, addr: null, hexAddr: '', nonce: 0, chainId: 0n };
+
+async function loadSeed(seedHex) {
+  const seed = unhex(seedHex);
+  if (seed.length !== 32) throw new Error('seed must be 32 bytes of hex');
+  K.priv = await crypto.subtle.importKey('pkcs8', cat(PKCS8, seed), { name: 'Ed25519' }, true, ['sign']);
+  const jwk = await crypto.subtle.exportKey('jwk', K.priv);
+  const b64 = jwk.x.replace(/-/g, '+').replace(/_/g, '/');
+  K.pub = Uint8Array.from(atob(b64 + '='.repeat((4 - b64.length % 4) % 4)), c => c.charCodeAt(0));
+  K.addr = await sha256(cat(enc.encode('btb.account.v1'), K.pub));
+  K.hexAddr = hex(K.addr);
+  K.nonce = -1;
+  $('addr').textContent = K.hexAddr;
+  try { localStorage.setItem('btb-dex-seed', seedHex); } catch (e) {}
+}
+
+async function signTx(kindBytes) {
+  const info = await rpc('btb_getBalance', [K.hexAddr]);
+  if (K.nonce < Number(info.nonce)) K.nonce = Number(info.nonce);
+  const body = cat(le(K.chainId, 8), le(K.nonce, 8), kindBytes);
+  const hash = await sha256(cat(enc.encode('btb.tx.sig.v1'), body));
+  const sig = new Uint8Array(await crypto.subtle.sign('Ed25519', K.priv, hash));
+  return { wire: cat(body, K.pub, sig), nonce: K.nonce };
+}
+
+async function waitReceipt(id, tries = 120) {
+  for (let i = 0; i < tries; i++) {
+    const r = await rpc('btb_getReceipt', [id]);
+    if (r) return r;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  throw new Error('timed out waiting for the transaction to be included');
+}
+
+async function send(kindBytes) {
+  const { wire } = await signTx(kindBytes);
+  try {
+    const { id } = await rpc('btb_sendTransaction', [hex(wire)]);
+    K.nonce += 1;
+    return await waitReceipt(id);
+  } catch (e) { K.nonce = -1; throw e; }
+}
+
+const assetBytes = a => a === 'btb' ? Uint8Array.of(0) : cat(Uint8Array.of(1), unhex(a));
+const str = s => { const b = enc.encode(s); return cat(le(b.length, 4), b); };
+const bytes = b => cat(le(b.length, 4), b);
+const T = {
+  place: (sell, buy, sellAmount, buyAmount, batches) =>
+    cat(Uint8Array.of(10, 0), assetBytes(sell), assetBytes(buy), le(sellAmount, 8), le(buyAmount, 8), le(batches, 4)),
+  cancel: id => cat(Uint8Array.of(10, 1), unhex(id)),
+  transfer: (to, amount) => cat(Uint8Array.of(2), unhex(to), le(amount, 8)),
+  deploy: (code, name) => cat(Uint8Array.of(0), bytes(code), str(name), le(0, 4), le(0, 4)),
+  call: (contract, fn, args, gas = 2000000n) =>
+    cat(Uint8Array.of(1), unhex(contract), Uint8Array.of(1), str(fn), bytes(args), le(gas, 8), le(U64, 8)),
+};
+
+// ---- decimals and rationals ----
+function parsePrice(s) {
+  const m = /^\s*(\d+)(?:\.(\d{1,12}))?\s*$/.exec(s);
+  if (!m) throw new Error('price must be a positive decimal number');
+  const frac = m[2] || '';
+  const num = BigInt(m[1] + frac), den = 10n ** BigInt(frac.length);
+  if (num === 0n) throw new Error('price must be above zero');
+  return [num, den];
+}
+const ceilDiv = (a, b) => (a + b - 1n) / b;
+function fmtPrice(n, d) {
+  n = BigInt(n); d = BigInt(d);
+  const whole = n / d; let rem = n % d, frac = '';
+  for (let i = 0; i < 6 && rem; i++) { rem *= 10n; frac += (rem / d).toString(); rem %= d; }
+  return whole.toString() + (frac ? '.' + frac : '');
+}
+
+// ---- state ----
+const S = { assets: [], pair: null, book: null, cfg: null, acct: null };
+const label = a => a ? (a.symbol || a.id.slice(0, 6)) : '?';
+
+async function loadAssets() {
+  S.assets = await rpc('btb_dexAssets');
+  for (const id of ['asset-a', 'asset-b']) {
+    const sel = $(id), cur = sel.value;
+    sel.innerHTML = S.assets.map(a => `<option value="${esc(a.id)}">${esc(a.symbol)}${a.kind === 'token' ? ' (' + esc(a.id.slice(0, 6)) + ')' : ''}</option>`).join('');
+    if (cur && S.assets.some(a => a.id === cur)) sel.value = cur;
+  }
+  if ($('asset-a').value === $('asset-b').value && S.assets.length > 1) $('asset-b').selectedIndex = ($('asset-a').selectedIndex + 1) % S.assets.length;
+}
+
+async function refresh() {
+  try {
+    const cfg = await rpc('btb_dexConfig');
+    S.cfg = cfg;
+    $('height').textContent = cfg.height; $('window').textContent = cfg.batch_blocks;
+    $('next').textContent = cfg.next_clearing; $('fee').textContent = cfg.fee_bps;
+    const have = S.assets.length;
+    const assets = await rpc('btb_dexAssets');
+    if (assets.length !== have) await loadAssets();
+    const a = $('asset-a').value, b = $('asset-b').value;
+    if (a && b && a !== b) {
+      S.pair = await rpc('btb_dexPair', [a, b]);
+      $('pairinfo').textContent = `Pair ${label(S.pair.base)}/${label(S.pair.quote)}: price = ${label(S.pair.quote)} per ${label(S.pair.base)} (base is ${S.pair.base.id === a ? 'the first' : 'the second'} asset)`;
+      S.book = await rpc('btb_dexBook', [S.pair.id]);
+      renderBook();
+    }
+    if (K.hexAddr) {
+      S.acct = await rpc('btb_dexAccount', [K.hexAddr]);
+      await renderAccount();
+    }
+  } catch (e) { setMsg(String(e.message || e), true); }
+}
+
+function levels(orders) {
+  const m = new Map();
+  for (const o of orders) {
+    let a = BigInt(o.price.n), b = BigInt(o.price.d);
+    while (b) [a, b] = [b, a % b];
+    const key = (BigInt(o.price.n) / a) + '/' + (BigInt(o.price.d) / a);
+    const l = m.get(key) || { n: o.price.n, d: o.price.d, size: 0n, count: 0 };
+    l.size += BigInt(o.base_remaining); l.count++; m.set(key, l);
+  }
+  return [...m.values()];
+}
+
+function renderBook() {
+  const bk = S.book;
+  const rows = (ls, cls) => {
+    const max = ls.reduce((m, l) => l.size > m ? l.size : m, 1n);
+    return ls.map(l => `<tr class="${cls}"><td>${fmtPrice(l.n, l.d)}</td><td>${l.size}<span class="bar" style="width:${Number(l.size * 100n / max)}%"></span></td><td>${l.count}</td></tr>`).join('');
+  };
+  const asks = levels(bk.asks).reverse(), bids = levels(bk.bids);
+  $('asks').innerHTML = rows(asks, 'ask') || '<tr><td colspan="3" class="dim">no asks</td></tr>';
+  $('bids').innerHTML = rows(bids, 'bid') || '<tr><td colspan="3" class="dim">no bids</td></tr>';
+  $('spread').innerHTML = '<tr><td colspan="3" class="dim">-</td></tr>';
+  const last = bk.history[0];
+  $('last').textContent = last ? fmtPrice(last.price.n, last.price.d) : '-';
+  $('lastinfo').textContent = last ? `block ${last.height}: ${last.base_volume} ${label(bk.base)} for ${last.quote_volume} ${label(bk.quote)} in ${last.orders} orders, one price for all` : 'no trade yet';
+  $('history').innerHTML = bk.history.map(h => `<tr><td>${h.height}</td><td>${fmtPrice(h.price.n, h.price.d)}</td><td>${h.base_volume}</td><td>${h.quote_volume}</td><td>${h.orders}</td></tr>`).join('') || '<tr><td colspan="5" class="dim">none</td></tr>';
+}
+
+async function renderAccount() {
+  const sym = id => { const a = S.assets.find(x => x.id === id); return a ? a.symbol : id.slice(0, 6); };
+  $('orders').innerHTML = S.acct.orders.map(o => `<tr class="${o.side}"><td class="mono">${short(o.id)}</td><td>${o.side === 'ask' ? 'sell' : 'buy'} ${esc(sym(o.base))}/${esc(sym(o.quote))}</td><td>${o.base_remaining}</td><td>${fmtPrice(o.price.n, o.price.d)}</td><td>${o.escrow}</td><td>${o.batches_left}</td><td><button class="small" data-cancel="${o.id}">Cancel</button></td></tr>`).join('') || '<tr><td colspan="7" class="dim">none</td></tr>';
+  $('results').innerHTML = S.acct.results.slice().sort((a, b) => b.closed_at - a.closed_at).map(r => {
+    const f = BigInt(r.filled), q = BigInt(r.quote_traded);
+    return `<tr class="${r.side}"><td class="mono">${short(r.id)}</td><td>${r.side === 'ask' ? 'sell' : 'buy'} ${esc(sym(r.base))}/${esc(sym(r.quote))}</td><td>${r.outcome}</td><td>${r.filled}</td><td>${f > 0n ? fmtPrice(q, f) : '-'}</td><td>${r.closed_at}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="dim">none</td></tr>';
+  const bal = [];
+  for (const a of S.assets) bal.push(`${esc(a.symbol)}: ${await rpc('btb_dexBalance', [K.hexAddr, a.id])}`);
+  $('balances').innerHTML = 'Balances (base units): ' + bal.join(' &middot; ');
+}
+
+function setMsg(t, err) { const m = $('msg'); m.textContent = t; m.className = err ? 'err' : (t ? 'ok' : ''); }
+
+async function order(buy) {
+  try {
+    if (!S.pair) throw new Error('choose two different assets');
+    const amount = BigInt($('amount').value.trim() || '0');
+    const [n, d] = parsePrice($('price').value);
+    const batches = Number($('batches').value);
+    if (amount <= 0n) throw new Error('amount must be above zero');
+    const quote = ceilDiv(amount * n, d);
+    if (amount > U64 || quote > U64) throw new Error('amount or price too large for a 64-bit order');
+    const base = S.pair.base.id, q = S.pair.quote.id;
+    const kind = buy ? T.place(q, base, quote, amount, batches) : T.place(base, q, amount, quote, batches);
+    setMsg('Signing and sending...');
+    const r = await send(kind);
+    const ok = r.status === 'success';
+    setMsg(ok ? `Order ${short(r.output)} placed in block ${r.height}` : `Order refused: ${r.status} ${r.detail || ''}`, !ok);
+    await refresh();
+  } catch (e) { setMsg(String(e.message || e), true); }
+}
+
+document.addEventListener('click', async ev => {
+  const c = ev.target.closest && ev.target.closest('[data-cancel]');
+  if (!c) return;
+  try {
+    setMsg('Cancelling...');
+    const r = await send(T.cancel(c.dataset.cancel));
+    setMsg(r.status === 'success' ? `Order ${short(c.dataset.cancel)} cancelled and refunded` : `Cancel refused: ${r.status} ${r.detail || ''}`, r.status !== 'success');
+    await refresh();
+  } catch (e) { setMsg(String(e.message || e), true); }
+});
+$('buy').onclick = () => order(true);
+$('sell').onclick = () => order(false);
+$('asset-a').onchange = $('asset-b').onchange = refresh;
+$('newseed').onclick = async () => { const s = hex(crypto.getRandomValues(new Uint8Array(32))); $('seed').value = s; await loadSeed(s); refresh(); };
+$('seed').onchange = async () => { try { await loadSeed($('seed').value.trim()); refresh(); } catch (e) { setMsg(String(e.message || e), true); } };
+
+// A scripting surface for the demo and the smoke test.
+window.dexApp = { rpc, send, T, loadSeed, refresh, state: S, key: K, hex, unhex, fmtPrice };
+
+(async () => {
+  try {
+    const st = await rpc('btb_status');
+    K.chainId = BigInt(st.chain_id); $('chain').textContent = st.chain_id;
+    let seed = new URLSearchParams(location.search).get('seed');
+    if (!seed) { try { seed = localStorage.getItem('btb-dex-seed'); } catch (e) {} }
+    if (!seed) seed = hex(crypto.getRandomValues(new Uint8Array(32)));
+    $('seed').value = seed;
+    await loadSeed(seed);
+    await loadAssets();
+    await refresh();
+    document.body.dataset.ready = '1';
+    setInterval(refresh, 1000);
+  } catch (e) { setMsg(String(e.message || e), true); }
+})();
+</script>
+</body>
+</html>

@@ -12,7 +12,7 @@
 //! | `0x25` meta | `25 01` / `25 02` | config / head `(height, hash, timestamp)` |
 //! | `0x32` site file | `32 C path` | `SHA-256(content) \|\| content` (`site.rs`) |
 //!
-//! Payment channels add `0x30`/`0x31` (see `channel.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
+//! Payment channels add `0x30`/`0x31` (see `channel.rs`), the DEX `0x34`..`0x38` (see `dex.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
 //! entries (accounts, contracts, the fee pools and the slash vault share them); storage
 //! deposits are its `0x09` entries; bonded stake is `0x26` and unbonding stake `0x27`.
 
@@ -83,6 +83,11 @@ pub struct ChainConfig {
     pub query_gas: u64,
     /// Validator staking, epochs, slashing.
     pub staking: StakingConfig,
+    /// DEX batch window in blocks: orders are cleared together at every height that is a
+    /// multiple of this. 1 = every block.
+    pub dex_batch_blocks: u64,
+    /// Clearing fee in basis points of what each side receives (see `dex.rs`).
+    pub dex_fee_bps: u64,
 }
 
 impl ChainConfig {
@@ -99,6 +104,8 @@ impl ChainConfig {
             vm_memory: 1 << 20,
             query_gas: 50_000_000,
             staking: StakingConfig::default(),
+            dex_batch_blocks: 1,
+            dex_fee_bps: 10,
         }
     }
 
@@ -121,6 +128,12 @@ impl ChainConfig {
             return Err("vm_memory too small".into());
         }
         self.staking.validate()?;
+        if !(1..=1_000_000).contains(&self.dex_batch_blocks) {
+            return Err("dex_batch_blocks must be 1..=1000000".into());
+        }
+        if self.dex_fee_bps > crate::dex::MAX_FEE_BPS {
+            return Err("dex_fee_bps above the maximum".into());
+        }
         Ok(())
     }
 
@@ -140,6 +153,7 @@ impl ChainConfig {
         ]
         .into_iter()
         .chain(self.staking.fields())
+        .chain([self.dex_batch_blocks, self.dex_fee_bps])
         {
             v.encode_to(&mut o);
         }
@@ -161,6 +175,8 @@ impl ChainConfig {
             vm_memory: n()? as u32,
             query_gas: n()?,
             staking: StakingConfig::from_fields([n()?, n()?, n()?, n()?, n()?, n()?]),
+            dex_batch_blocks: n()?,
+            dex_fee_bps: n()?,
         };
         Ok(cfg)
     }

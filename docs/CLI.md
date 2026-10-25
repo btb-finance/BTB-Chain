@@ -6,7 +6,10 @@
 btb init <name> [--sdk-path DIR | --sdk-git URL]
 btb build
 btb dev [--port N] [--data DIR]
-btb deploy
+btb deploy [--rpc URL --key FILE [--gas-limit N]]
+btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]
+btb query --rpc URL <contract> <fn> [args]
+btb keygen <FILE>
 ```
 
 `build`, `dev` and `deploy` run inside a project (the directory with `Cargo.toml`). You need the pinned toolchain from `rust-toolchain.toml` with the `riscv64imac-unknown-none-elf` target and `rust-src`; `rustup` installs them on first use.
@@ -41,13 +44,29 @@ Same limits as the dev server: one contract, no auth, development only. Never ex
 
 ## `btb deploy`
 
-There is no chain yet, so `deploy` builds and writes a **deploy bundle** to `target/btb/deploy/`:
+Builds and writes a **deploy bundle** to `target/btb/deploy/`:
 
 - `<name>.elf`, the contract;
 - `manifest.json`: `name`, `elf`, `size`, `code_hash` (SHA-256 of the ELF, lowercase hex), `hash_algorithm`, `entry_points` (`{kind, name}`), `crons` (`{function, every_blocks}`, from `#[btb::cron(every = "N blocks")]`) and `indexes`.
 
-It then prints the hash and a note that deploying to a network arrives in Phase 4, when the same bundle becomes the deploy transaction payload.
+Without `--rpc` that is all: it prints the hash and where the bundle is.
+
+With `--rpc URL --key FILE` it also deploys the bundle to a node ([NODE.md](NODE.md#json-rpc--http)): the ELF and the manifest's name, crons and indexes become a `Deploy` transaction (binary `Manifest`, see [CHAIN.md](CHAIN.md#transactions)), signed with the key file. It reads `chain_id` from `btb_status` and the nonce from `btb_getBalance`, submits with `btb_sendTransaction`, polls `btb_getReceipt` until the transaction is in a block (a reverted deploy is an error) and prints `deployed: contract <address>` (the address is derived from the sender and the nonce). `--gas-limit N` is only checked against the deploy cost (a deploy always uses exactly its intrinsic gas). The contract account needs a balance for crons to pay their gas, so fund it with a transfer.
+
+`URL` is `host:port` or `http://host:port` (the node's RPC is plain HTTP on loopback; put a proxy in front for remote use).
+
+## `btb keygen <FILE>`
+
+Writes a new account key (`{"secret", "public"}` JSON, mode 0600, the same format `btb-node init-testnet` writes for `faucet.key`) and prints the account address. It refuses to overwrite a file. Any `init-testnet` key file works for `--key`.
+
+## `btb call` and `btb query`
+
+`btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]` signs and sends a `mutation` (default gas limit 2,000,000), waits for the receipt and prints `output` (hex), `gas_used` and `height`. `btb query --rpc URL <contract> <fn> [args]` runs a read-only `btb_query` and prints `output` and `gas_used`; it needs no key.
+
+`contract` is the 64-character hex address. `args` is either the canonical encoding as hex ([ENCODING.md](ENCODING.md)) or a JSON array: integers become `u64` (negative ones `i64`), booleans one byte, `"0x"` plus 64 hex characters a raw 32-byte address, any other string a length-prefixed string. Omit it for no arguments. Outputs are hex of the canonical encoding.
 
 ## Tests
 
 `crates/btb-cli/tests/cli.rs` runs the real toolchain: `init` into a temp dir (sdk path pointing at this repo) then `build` succeeds and lists the entry points; the deploy manifest hash equals the SHA-256 of the ELF; `dev` on an ephemeral port reloads after a source edit, the new function becomes callable, old state is retained, a broken edit keeps the old build, and an open subscription gets the changed result.
+
+`crates/btb-cli/tests/chain.rs` starts an in-process 4-validator cluster (the `btb-node/tests/lite` helper), builds a copy of `examples/counter` with `every = "3 blocks"` on its cron and runs the real `btb` binary: `deploy --rpc` prints the contract address, `call increment` returns the new total, `query get` reads it and the cron makes it grow on its own; a failing call is a non-zero exit.

@@ -19,6 +19,9 @@ btb-vm = { path = "../btb-vm" }
 btb-runtime = { path = "../btb-runtime" }
 btb-dev = { path = "../btb-dev" }
 sha2 = "0.11.1"
+btb-chain = { path = "../btb-chain" }
+btb-codec = { path = "../btb-codec" }
+serde_json = "1"
 
 [features]
 default = []
@@ -26,4 +29,7 @@ default = []
 rocksdb = ["btb-dev/rocksdb", "btb-runtime/rocksdb"]
 
 [dev-dependencies]
-serde_json = "1"
+btb-node = { path = "../btb-node" }
+btb-consensus = { path = "../btb-consensus" }
+btb-runtime = { path = "../btb-runtime" }
+btb-codec = { path = "../btb-codec" }

@@ -2,7 +2,7 @@
 
 BTB Chain orders blocks with a **Jolteon-style 2-chain HotStuff** protocol (pipelined HotStuff-2 family): proof-of-stake, stake-weighted quorums, a timeout-certificate pacemaker, and no forks once a block is final. The `btb-consensus` crate is the **consensus core only**: a deterministic state machine with no networking, no clock, no execution and no disk. The node (Phase 4) wires it to libp2p, a real timer and the executor in `btb-chain`.
 
-Status: core implemented and tested in a deterministic simulator. Epoch changes (validator-set rotation) are implemented and simulated; see [Epochs](#epochs-and-validator-set-changes). Still open for Phase 4: real networking, measuring ~1 s finality on real links, and signature aggregation. The staking and slashing logic that consumes the evidence lives in `btb-chain` ([CHAIN.md](CHAIN.md#staking-epochs-and-slashing)).
+Status: core implemented and tested in a deterministic simulator, including [execution attestation](#execution-attestation-validators-certify-state-roots) (a quorum certificate certifies the post-execution state root). Epoch changes (validator-set rotation) are implemented and simulated; see [Epochs](#epochs-and-validator-set-changes). Still open for Phase 4: real networking, measuring ~1 s finality on real links, and signature aggregation. The staking and slashing logic that consumes the evidence lives in `btb-chain` ([CHAIN.md](CHAIN.md#staking-epochs-and-slashing)).
 
 ## What it guarantees
 
@@ -45,7 +45,7 @@ Time is divided into **rounds**. Round `r` has one **leader**, `leader(r)`, a pu
 
 **Types** (all signatures Ed25519, all signed bytes domain separated and bound to the chain id and validator set through the genesis id):
 
-- `Block { round, height, parent, justify, proposer, payload_hash, payload }`: `justify` is the QC for `parent`.
+- `Block { round, height, parent, justify, proposer, payload_hash, payload, exec }`: `justify` is the QC for `parent`; `exec` is the execution attestation (below), covered by the block id.
 - `Vote { round, block_id, voter, sig }`: a signature over `(round, block_id)`. It also carries the proposer's signature on the block (`proposal_sig`) so conflicting votes expose an equivocating leader.
 - **QC** (quorum certificate): votes from validators holding **more than 2/3 of total stake** for the same block in the same round. Stored as a sorted list of `(validator, signature)`; BLS aggregation can replace this later without changing the rules.
 - `Timeout { round, high_qc, voter, sig }`: a signature over `(round, high_qc.round)`.
@@ -101,6 +101,48 @@ Where the other rules matter: rule 3 (TC and consecutive-round conditions) is ab
 
 *Liveness sketch.* After the network becomes synchronous: timeouts and retransmissions make all honest replicas converge on the same round (f+1 amplification, TCs, `Catchup`), and exponential backoff makes the round timer exceed the network delay. In a round with an honest leader every honest replica has the same high QC (it was delivered inside the TC), all accept the proposal, vote, and a QC forms. Two consecutive honest-led rounds commit a block (the votes are broadcast, so the QC of the second block forms without a third honest leader). If fewer than half of the schedule's seats are faulty, such a pair exists in every cycle.
 
+## Execution attestation: validators certify state roots
+
+A QC covers the block id, i.e. the *payload* (the transactions), not what executing the transactions produces. Without more, a hosting node's Merkle proof could only be anchored to a root that every node derived locally. Execution attestation closes that gap without changing the safety rules above: it adds one more condition to the voting rule and one field to the block.
+
+**The field.** `Block::exec` (at most 128 bytes, opaque to this crate, hashed into the block id) says "the execution result at height `k` is `X`". The embedder (`btb-node`) fills it with `(k, d_k, receipts_root_k)`, where `d_k` is a hash chain over all state roots up to `k` (`docs/NODE.md`). Installing the hooks (`Replica::set_exec_hooks(provider, check)`) switches the rule on.
+
+**Which `k`: the committed ancestor, a function of the ancestry.** Execution lags consensus: when `B` is proposed its parent is not committed yet (2-chain), so `B` cannot attest its parent's result. It attests the newest block that `B`'s own ancestry commits. Define, for every linked block `P`:
+
+```
+attested(P) = height of P.parent        if P.round == P.parent.round + 1   (QC(P) commits P.parent)
+            = attested(P.parent)        otherwise
+attested(genesis block of the epoch) = the epoch's anchor height
+
+k(B) = attested(B.parent)               (Replica::exec_height(&B.parent))
+```
+
+Equivalently, `k(B) = exec_height(B.parent)` is the highest block committed by the QCs that appear in `B`'s chain, `B.justify = QC(P)` last. Properties:
+
+1. *Well defined.* It depends only on rounds and heights along `B`'s ancestry, so proposer and voters compute the same `k` (the replica keeps it per linked block, `Replica::exec_height`). It is never chosen by the proposer; a block cannot name another height.
+2. *Committed.* Any replica that holds `B.justify = QC(P)` and the chain below it has, by the commit rule, already emitted `Commit` for every block up to `k(B)`. So an honest replica that is about to vote on `B` has been *told* to commit height `k(B)`; it has only to *execute* it.
+3. *Monotone and bounded lag.* `k` never decreases along a chain and `k(B) <= B.height - 2`. In the common case (consecutive rounds) `k(B) = B.height - 2`; every skipped round holds it back until two consecutive rounds recur.
+4. *Epoch boundaries.* The first blocks of epoch `e + 1` have `k` = the anchor, the last block `L` of epoch `e`. `L` itself is attested by epoch `e + 1`'s first block (its validators executed `L` to start the epoch). The tail blocks of epoch `e` (empty payload, still carry `exec`) attest up to `L - 1`. Hence every height is attested by the epoch whose validators were in office when it became committed, or by the next one for `L`.
+
+**The voting rule gains condition 5.** Vote only if, in addition to 1 to 4: `check(B, k(B))` returns `Accept`, i.e. `B.exec` names exactly `k(B)` and the result the voter computed itself by executing height `k(B)`.
+
+- `Reject` (a different result, a different height, a malformed or missing claim): no vote, ever; the round times out if the leader is faulty (counted in `Stats::exec_rejected`).
+- `Defer` (the voter has not executed `k(B)` yet): the proposal is parked (one per round) and `Replica::resume` re-runs the vote once the embedder executed the commits. A deferral does not touch `last_voted_round` (it is not a vote), so safety is unaffected, and a deferred round simply times out like a slow leader if execution never catches up.
+
+**The proposer** takes `provider(k)` and may only propose when its own execution has reached `k` (otherwise `pump` returns without taking a payload from the queue; `resume` retries). In a happy path the leader of round `r + 1` forms QC(`r`) and executes the newly committed block in the same step, so there is no delay.
+
+### Why a QC certifies the state root
+
+**Theorem (attested roots are correct).** Let fewer than 1/3 of the stake be faulty and let `QC(B)` exist, with `B.exec` naming `(k, X)`. Then `X` is the result of executing the committed chain up to height `k`, as computed by an honest replica.
+
+*Proof.* `QC(B)` holds more than 2/3 of the stake, so (quorum intersection) at least one honest validator `v` voted for `B`. By condition 5, `check(B, k(B))` accepted, so `B.exec = (k(B), X)` with `X` equal to `v`'s own execution of height `k(B)`. Block `k(B)` is committed in `B`'s ancestry (property 2), and by the Safety Theorem every honest replica commits the same chain, so the block at that height is the same for all of them. Execution is deterministic ([NODE.md](NODE.md#how-a-block-is-made)), so every honest executor obtains `X`. (End of proof.)
+
+*Corollaries.* (a) A byzantine leader that attests a wrong root gets no vote from any honest replica, so with fewer than 1/3 faulty stake it cannot form a QC, and the chain continues in the next round (the block is simply never certified). (b) Because `d_k` is a hash chain over the roots of heights `1..=k`, one certificate also binds every earlier root; a proof for height `h <= k` ships the roots `h..=k` and `d_{h-1}` (`docs/HOSTING.md`). (c) A committed block was certified, so every honest node that executes it can compare the claim with its own result. A mismatch means the node's execution is broken or more than 1/3 of the stake is faulty, and `btb-node` stops with `state divergence` instead of building on it.
+
+**Liveness.** Condition 5 adds waiting but no new way to be stuck. After GST, honest replicas receive the same QCs, hence emit the same `Commit` actions, hence execute the same heights; the leader of an honest round has executed `k` before it proposes (it holds the same commits as the voters, see property 2), and every honest voter's `check` is `Accept` after at most its own execution time. Execution time per block is bounded by gas, and the round timer already grows by backoff until it exceeds the network and execution delay. A voter whose execution is permanently stuck behind (it needs block sync) counts toward the faulty or offline stake for as long as it lags, as before.
+
+**Sync and restart.** Block sync checks the same thing: a synced block must carry a well-formed claim for an earlier height (`btb_node::sync::verify`), and executing it compares the claim with the node's own digest chain (`state divergence` otherwise). A restarted node rebuilds its record of recent digests from the block store and, for heights without a record, from the chain state's Merkle roots (the receipts of such a height are then unknown: the node does not vote on claims about that single height until the commit point moves past it). Nothing about attestation is persisted in the consensus safety file: `k(B)` is recomputed when the replica relinks the chain.
+
 ## Epochs and validator-set changes
 
 The validator set is fixed inside an **epoch** and changes only at an epoch boundary. An epoch is a *fresh consensus instance*, not a reconfiguration of a running one:
@@ -145,6 +187,8 @@ Messages are rejected before any expensive work where possible: membership and r
 
 `cargo test -p btb-consensus` runs unit tests for every rejection path and scenario tests (crash up to `f`, equivocating leader, double voter, bad signatures and garbage, minority partition, even split and heal, crash with restart) plus a seeded property test over randomised scenarios (safety, liveness after the network heals, catch-up, sound evidence, no honest validator ever accused). `cargo test -p btb-consensus --release -- --ignored --nocapture` runs the long soak over thousands of seeds.
 
+`crates/btb-consensus/src/exec_tests.rs` and the simulators cover execution attestation with a fake execution function (a digest chain over the committed blocks): unit tests for deferral, resume, rejection of wrong, missing and oversized claims; scenario tests where a `WrongExec` leader (validly signed proposals with a wrong root) never gets a vote and the chain continues; a majority of such leaders (liveness lost on purpose) still gets no wrong root certified; crash/restart with loss under stake-weighted leaders; and a seeded property test over `random_scenario`. On every vote the simulator asserts that no honest replica votes for a wrong-attestation block, and on every commit that the certified claim equals the true execution result. `epoch_sim` runs the same checks across four epochs with complete validator turnover, joiners and laggards.
+
 `crates/btb-consensus/src/epoch_sim.rs` simulates epoch changes: sets that change completely over three epochs (nodes joining and leaving), unequal stakes with `StakeWeighted` leaders, an offline new member below 1/3, a validator that is offline across a boundary and must catch up through the ended replicas, a leaver that disappears right after the boundary, and a lossy network before GST over many seeds. On every commit it checks gap-free heights across epochs, that each epoch's first block extends the anchor, that nothing above an epoch's last height is committed, and that no two replicas ever disagree at a height. Unit tests cover tail blocks, ended replicas and signature separation between epochs.
 
 ## Not done yet
@@ -154,3 +198,4 @@ Messages are rejected before any expensive work where possible: membership and r
 - A commit proof that lets a node joining from far behind verify the last block of an old epoch without replaying it (today: sync the executed chain, or use an ended replica's `Catchup` and sync).
 - Block and payload persistence, state sync from snapshots, and a vote-collection mode that avoids the `O(n^2)` vote broadcast.
 - Byzantine-leader payload checks beyond size and hash (the executor validates transactions).
+- Receipts roots are attested only at the claimed height `k` (state roots are chained for every height). Chaining receipts too would let a proof cover the receipt of any height; it is a hash change only.

@@ -119,6 +119,8 @@ struct Cluster {
     faucet: Wallet,
     /// Keep chain state and block history in RocksDB under the node's data dir.
     disk: bool,
+    /// `(node, height)`: that node's executor "diverges" from the height on.
+    exec_fault: Option<(usize, u64)>,
     // Last: nodes must stop before their data directory disappears.
     _dir: tempfile::TempDir,
 }
@@ -183,6 +185,7 @@ impl Cluster {
             delay_ms,
             faucet,
             disk,
+            exec_fault: None,
         };
         for i in 0..running {
             c.start(i);
@@ -205,6 +208,7 @@ impl Cluster {
         p.data_dir = Some(self._dir.path().join(format!("node{i}")));
         p.timing = self.timing;
         p.test_one_way_delay_ms = self.delay_ms;
+        p.test_exec_fault_from = self.exec_fault.filter(|(n, _)| *n == i).map(|(_, h)| h);
         #[cfg(feature = "rocksdb")]
         if self.disk {
             let dir = self._dir.path().join(format!("node{i}"));
@@ -498,6 +502,53 @@ fn killed_node_does_not_stop_progress_and_catches_up_after_restart() {
     );
 }
 
+/// A validator whose executor diverges (it computes another state root) must not drag the
+/// chain with it: the others never vote for what it attests, and it stops at the first
+/// committed block that contradicts its own result instead of building on a wrong state.
+#[test]
+fn divergent_executor_cannot_get_a_wrong_root_certified_and_halts() {
+    let _g = serial();
+    let mut c = Cluster::new(4, 0, fast(), 0, 600);
+    c.exec_fault = Some((3, 3));
+    for i in 0..4 {
+        c.start(i);
+    }
+    c.wait_connected(3);
+    let bob = account_address(&key(77).verifying_key().to_bytes());
+    // 3 of 4 (>2/3) keep finalizing no matter how node 3 behaves.
+    for k in 0..10u64 {
+        let via = (k % 3) as usize;
+        let id = c.send_transfer(via, bob, 1_000 + k);
+        assert_eq!(c.receipt(via, &id)["status"], "success");
+    }
+    // Node 3 halts with a state divergence (its RPC answers "shutting down").
+    c.wait_until("the divergent node to stop", 30, || {
+        c.node(3).call("btb_status", json!([])).is_err()
+    });
+    let head = (0..3).map(|i| c.height(i)).min().unwrap();
+    assert!(head >= 10);
+    // Honest nodes agree on every block's attested execution digest, and the blocks they
+    // committed attest the digest of the honest execution (not node 3's corrupted one).
+    for h in 1..=head {
+        let blocks: Vec<Value> = (0..3)
+            .map(|i| c.node(i).call("btb_getBlock", json!([h])).unwrap())
+            .collect();
+        for b in &blocks {
+            assert_eq!(b["exec_digest"], blocks[0]["exec_digest"], "height {h}");
+            assert_eq!(b["state_root_after"], blocks[0]["state_root_after"]);
+            if let Some(k) = b["attests_height"].as_u64() {
+                assert!(k < h);
+            }
+        }
+    }
+    println!(
+        "divergent executor: honest exec_rejected = {:?}",
+        (0..3)
+            .map(|i| c.status(i)["consensus"]["exec_rejected"].clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A validator that sends garbage, floods, and equivocates (two different votes in a round).
 struct Byzantine {
     stop: Arc<AtomicBool>,
@@ -763,6 +814,31 @@ fn consensus_instances_rotate_every_epoch() {
     assert_eq!(ep["start_height"], 32);
     assert_eq!(ep["validators"].as_array().unwrap().len(), 4);
     assert_eq!(c.evidence_total(), 0);
+
+    // The execution attestation crosses the boundaries: the first block of every epoch
+    // attests the previous epoch's last block (the epoch's own validators executed it), and
+    // all attested digests are the ones every node recorded.
+    let head = (0..4).map(|i| c.height(i)).min().unwrap();
+    for e in 1..4u64 {
+        let first = c.node(0).call("btb_getBlock", json!([e * 8 + 1])).unwrap();
+        assert_eq!(first["attests_height"], e * 8, "epoch {e} first block");
+    }
+    for h in 1..=head {
+        let b = c.node(0).call("btb_getBlock", json!([h])).unwrap();
+        let k = b["attests_height"].as_u64().unwrap();
+        assert!(
+            k < h && (h <= 8 || k >= 8 * ((h - 1) / 8)),
+            "block {h} attests {k}"
+        );
+        for i in 1..4 {
+            let o = c.node(i).call("btb_getBlock", json!([h])).unwrap();
+            assert_eq!(o["exec_digest"], b["exec_digest"], "node {i} height {h}");
+            assert_eq!(
+                o["receipts_root"], b["receipts_root"],
+                "node {i} height {h}"
+            );
+        }
+    }
 }
 
 fn epoch_of(c: &Cluster, i: usize) -> u64 {

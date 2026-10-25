@@ -13,6 +13,7 @@
 //! signature against the epoch's set, in the epoch's signature domain) proves every earlier block
 //! of the response. The first block must extend what the node already executed.
 
+use crate::attest::Claim;
 use crate::wire::{SyncResponse, MAX_PAYLOAD, MAX_SYNC_CHAIN};
 use btb_consensus::{Block, Context, Hash};
 
@@ -27,7 +28,8 @@ pub enum SyncError {
     BadStart,
     /// Block `n` does not extend block `n - 1` (hash, height, round or justify mismatch).
     BadLink(usize),
-    /// Payload does not match its hash (a truncated or altered block), or is too big.
+    /// Payload does not match its hash (a truncated or altered block), or is too big, or the
+    /// block's execution attestation is malformed (not a claim about an earlier height).
     BadPayload(usize),
     /// The certificate is not a quorum of the epoch's validators (forged, short, or signed in
     /// another epoch's domain).
@@ -77,6 +79,11 @@ pub fn verify(resp: &SyncResponse, e: &Expect) -> Result<usize, SyncError> {
     }
     for (i, b) in chain.iter().enumerate() {
         if b.payload.len() > MAX_PAYLOAD || Block::hash_payload(&b.payload) != b.payload_hash {
+            return Err(SyncError::BadPayload(i));
+        }
+        // The attestation is covered by the block id (so by the certificate); a block without
+        // a well-formed one can never have been certified by honest validators.
+        if !Claim::decode(&b.exec).is_some_and(|c| c.height < b.height) {
             return Err(SyncError::BadPayload(i));
         }
         if i == 0 {
@@ -179,9 +186,19 @@ mod tests {
                 proposer: (k % 4) as u32,
                 payload_hash: Block::hash_payload(&payload),
                 payload,
+                exec: test_claim(),
             });
         }
         out
+    }
+
+    fn test_claim() -> Vec<u8> {
+        Claim {
+            height: 0,
+            digest: [1; 32],
+            receipts_root: [2; 32],
+        }
+        .encode()
     }
 
     fn expect<'a>(n: &'a Net, end: u64) -> Expect<'a> {
@@ -223,6 +240,36 @@ mod tests {
         let c = chain(&n, 1, 2);
         let q = qc_for(&n, c[1].round, c[1].id(), 3);
         assert_eq!(verify(&resp(c, Some(q)), &expect(&n, 10)), Ok(1));
+    }
+
+    #[test]
+    fn blocks_without_a_wellformed_attestation_are_rejected() {
+        let n = net(0);
+        let mut c = chain(&n, 1, 3);
+        let q = qc_for(&n, c[2].round, c[2].id(), 3);
+        // Re-link the chain after changing block 1's attestation (the id covers it).
+        let mut bad = c.clone();
+        for variant in [
+            vec![],
+            vec![7; 71],
+            Claim {
+                height: 2,
+                digest: [0; 32],
+                receipts_root: [0; 32],
+            }
+            .encode(),
+        ] {
+            bad[1].exec = variant;
+            bad[2].parent = bad[1].id();
+            bad[2].justify = qc_for(&n, bad[1].round, bad[1].id(), 3);
+            let q2 = qc_for(&n, bad[2].round, bad[2].id(), 3);
+            assert_eq!(
+                verify(&resp(bad.clone(), Some(q2)), &expect(&n, 10)),
+                Err(SyncError::BadPayload(1))
+            );
+        }
+        c[1].exec = test_claim();
+        assert!(verify(&resp(c, Some(q)), &expect(&n, 10)).is_ok());
     }
 
     #[test]
@@ -380,6 +427,7 @@ mod tests {
                 parent,
                 justify,
                 proposer: 0,
+                exec: test_claim(),
                 payload_hash: Block::hash_payload(&[]),
                 payload: vec![],
             });

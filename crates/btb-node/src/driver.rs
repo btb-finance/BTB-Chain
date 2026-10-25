@@ -19,6 +19,7 @@
 //! (`blockstore`), and it serves and uses block sync (`serve_sync`, `apply_sync`) so a node
 //! that is arbitrarily far behind can catch up from its peers' history.
 
+use crate::attest;
 use crate::blockstore::{BlockStore, StoredBlock, StoredReceipt};
 use crate::config::NodeParams;
 use crate::explorer::tx_json;
@@ -41,8 +42,10 @@ use btb_consensus::{
 use btb_runtime::KvStore;
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -160,6 +163,8 @@ struct Driver<S: KvStore + 'static> {
     inflight_ttl: Duration,
 
     store: BlockStore,
+    /// What this node executed recently, for the execution attestation hooks.
+    exec_win: Rc<RefCell<attest::Window>>,
     sync: SyncState,
     /// Blocks just above an epoch's last height seen in proposals and sync answers, by epoch:
     /// candidates for the certificate that finalizes the epoch's last block.
@@ -237,6 +242,18 @@ impl<S: KvStore + 'static> Driver<S> {
         };
         let chain_cfg = *state.config();
         let epoch = state.current_epoch().map_err(|e| e.to_string())?;
+        let mut exec_win = attest::Window::load(
+            &store,
+            |h| {
+                btb_runtime::merkle::root(state.store(), h)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("the chain state has no root for height {h}"))
+            },
+            exec_log.done().height,
+        )?;
+        if let Some(h) = p.test_exec_fault_from {
+            exec_win.inject_fault(h);
+        }
         let now = Instant::now();
         let mut d = Driver {
             replica: None,
@@ -259,6 +276,7 @@ impl<S: KvStore + 'static> Driver<S> {
             idle_block: Duration::from_millis(t.idle_block_ms),
             inflight_ttl: Duration::from_millis(t.round_timeout_ms.saturating_mul(2)),
             store,
+            exec_win: Rc::new(RefCell::new(exec_win)),
             sync: SyncState::default(),
             tails: Vec::new(),
             proofs_wanted: Vec::new(),
@@ -345,6 +363,8 @@ impl<S: KvStore + 'static> Driver<S> {
         .map_err(|e| format!("replica for epoch {epoch}: {e}"))?;
         let chain_cfg = *self.state.config();
         replica.set_payload_check(Box::new(move |b| payload_ok(&b.payload, &chain_cfg)));
+        let (provide, check) = attest::hooks(&self.exec_win);
+        replica.set_exec_hooks(provide, check);
         replica.set_hold_empty_proposals(true);
         let acts = replica.start();
         self.replica = Some(replica);
@@ -526,6 +546,7 @@ impl<S: KvStore + 'static> Driver<S> {
     /// Carry out what the replica of `epoch` asked for.
     fn apply(&mut self, actions: Vec<Action>, epoch: u64) {
         let current = epoch == self.epoch;
+        let mut executed = false;
         for a in actions {
             match a {
                 Action::Send { to, msg } => {
@@ -551,7 +572,8 @@ impl<S: KvStore + 'static> Driver<S> {
                 }
                 Action::Commit(block) => {
                     if current {
-                        self.execute_commit(block)
+                        self.execute_commit(block);
+                        executed = true;
                     }
                 }
                 Action::Evidence(e) => {
@@ -569,6 +591,25 @@ impl<S: KvStore + 'static> Driver<S> {
                     self.evidence.push(what);
                     self.queue_evidence(epoch, e);
                 }
+            }
+        }
+        if executed {
+            self.resume_replica();
+        }
+    }
+
+    /// The replica may have waited for execution (a vote on a block whose attestation names a
+    /// height we had not executed yet, a proposal of our own that needs our execution result).
+    /// Tell it that blocks were executed.
+    fn resume_replica(&mut self) {
+        if self.fatal.is_some() {
+            return;
+        }
+        let epoch = self.epoch;
+        if let Some(rep) = self.replica.as_mut() {
+            let acts = rep.resume();
+            if !acts.is_empty() {
+                self.apply(acts, epoch);
             }
         }
     }
@@ -670,6 +711,19 @@ impl<S: KvStore + 'static> Driver<S> {
     }
 
     fn try_execute(&mut self, block: btb_consensus::Block) -> Result<(), String> {
+        // A committed block was certified by a quorum, and every honest voter checked its
+        // attestation against its own execution. If ours differs, either this node computed
+        // another state (a bug) or more than a third of the stake is faulty. Either way it
+        // must not go on.
+        self.exec_win
+            .borrow()
+            .check_executing(&block)
+            .map_err(|e| {
+                format!(
+                    "state divergence at block {} (round {}): {e}",
+                    block.height, block.round
+                )
+            })?;
         let head = self.state.head().map_err(|e| e.to_string())?;
         let root = self.state.root().map_err(|e| e.to_string())?;
         let (ts, txs) = match Batch::decode(&block.payload) {
@@ -704,12 +758,31 @@ impl<S: KvStore + 'static> Driver<S> {
                 (empty, r, nr)
             }
         };
+        // Record the attestation chain and the block before the executed height is settled: a
+        // crash after the state commit then still finds this record on restart.
+        let h = chain_block.header.height;
+        let stored_receipts: Vec<StoredReceipt> = receipts.iter().map(stored_receipt).collect();
+        let exec = self
+            .exec_win
+            .borrow_mut()
+            .record(h, &new_root, &stored_receipts)?;
+        let tx_ids: Vec<Hash> = chain_block.txs.iter().map(Transaction::id).collect();
+        let stored = StoredBlock {
+            header: chain_block.header,
+            hash: chain_block.hash(),
+            state_root_after: new_root,
+            exec,
+            consensus_round: block.round,
+            tx_ids: tx_ids.clone(),
+            receipts: stored_receipts,
+            consensus: block,
+        };
+        self.store.put(&stored)?;
         self.exec_log.finish()?;
 
         let now = Instant::now();
         self.last_progress = now;
         self.last_commit_at = Some(now);
-        let tx_ids: Vec<Hash> = chain_block.txs.iter().map(Transaction::id).collect();
         for id in &tx_ids {
             if let Some(t) = self.submitted.remove(id) {
                 self.latencies
@@ -725,19 +798,8 @@ impl<S: KvStore + 'static> Driver<S> {
         self.inflight
             .retain(|(a, n), _| state.nonce(a).unwrap_or(0) <= *n);
 
-        let h = chain_block.header.height;
         let epoch = self.state.config().staking.epoch_of_block(h);
         let is_epoch_end = h == self.state.config().staking.epoch_end(epoch);
-        let stored = StoredBlock {
-            header: chain_block.header,
-            hash: chain_block.hash(),
-            state_root_after: new_root,
-            consensus_round: block.round,
-            tx_ids,
-            receipts: receipts.iter().map(stored_receipt).collect(),
-            consensus: block,
-        };
-        self.store.put(&stored)?;
         if let Some(hook) = self.hook.as_mut() {
             hook(&mut self.state, &stored);
         }
@@ -1088,6 +1150,7 @@ impl<S: KvStore + 'static> Driver<S> {
             }
         }
         self.check_epoch_switch();
+        self.resume_replica();
         Ok(n as u64)
     }
 
@@ -1483,6 +1546,7 @@ impl<S: KvStore + 'static> Driver<S> {
                     }),
                 })
             }
+            m if m.starts_with("btb_dex") => crate::dex_rpc::handle(&self.state, m, arr),
             _ => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {method}"),
@@ -1535,6 +1599,8 @@ impl<S: KvStore + 'static> Driver<S> {
                 "proposals_made": st.proposals_made,
                 "rejected_messages": st.rejected_messages,
                 "evidence_found": st.evidence_found,
+                "exec_rejected": st.exec_rejected,
+                "exec_deferred": st.exec_deferred,
             },
             "evidence": self.evidence,
             "evidence_submitted": self.evidence_submitted,
@@ -1614,6 +1680,9 @@ fn block_json(h: u64, b: &StoredBlock) -> Value {
         "timestamp": b.header.timestamp,
         "state_root_before": hex::encode(&b.header.state_root),
         "state_root_after": hex::encode(&b.state_root_after),
+        "exec_digest": hex::encode(&b.exec.digest),
+        "receipts_root": hex::encode(&b.exec.receipts_root),
+        "attests_height": crate::attest::Claim::decode(&b.consensus.exec).map(|c| c.height),
         "tx_root": hex::encode(&b.header.tx_root),
         "consensus_round": b.consensus_round,
         "proposer": b.consensus.proposer,

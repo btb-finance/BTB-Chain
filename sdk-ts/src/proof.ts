@@ -5,12 +5,21 @@
 // Merkle proofs of the bundle against its root and, when the bundle carries it, the header of
 // block `height + 1` (whose `state_root` field names that root).
 //
-// What this proves: each value is exactly what the tree under the root holds. What it does not
-// prove: that the root is the chain's. No validator signs state roots yet, so a root is only
-// as trustworthy as where you got it. Pass `trustedRoot` (taken from a validator's
-// `btb_getBlock`.`state_root_after`, or another independent host) to close that gap, or verify
-// the consensus evidence in the bundle with the Rust verifier (`btb-host`), which checks the
-// quorum certificates. The evidence is not checked here.
+// What this proves: each value is exactly what the tree under the root holds. By itself that
+// says nothing about whether the root is the chain's. Three ways to close that gap:
+//
+//  * `quorum` (recommended): the validators of an epoch (as returned by a validator's
+//    `btb_getEpoch`, a trust anchor you supply) attested the root. Every consensus block
+//    carries a claim about the execution of one of its ancestors and honest validators vote
+//    only if it matches their own execution, so the bundle's `attest` section (a block, the
+//    quorum certificate for it, and the state roots up to the claimed height) proves that a
+//    quorum of the epoch's stake executed the chain to exactly this root. `verifyProof` checks
+//    the Ed25519 signatures, the stake threshold, the block id and the digest chain. See
+//    docs/CONSENSUS.md ("Execution attestation") and docs/HOSTING.md.
+//  * `trustedRoot`: a root you got elsewhere (a validator's `btb_getBlock`.`state_root_after`
+//    or another independent host) must equal the bundle's.
+//  * the Rust verifier (`btb-host`) also checks the consensus evidence for the next block's
+//    transactions (`commit`), which is not checked here.
 
 import { fromHex, toHex } from "./codec.js";
 
@@ -45,6 +54,36 @@ export interface ProofHeader {
   hash: string;
 }
 
+export interface AttestQc {
+  round: number;
+  block_id: string;
+  /** `[validator index, signature hex]`, sorted by index. */
+  votes: [number, string][];
+}
+
+export interface AttestBlock {
+  round: number;
+  height: number;
+  parent: string;
+  justify: AttestQc;
+  proposer: number;
+  payload_hash: string;
+  /** The execution claim (hex): attested height (u64 LE), digest chain value, receipts root. */
+  exec: string;
+  id: string;
+}
+
+/** Proof that a quorum of an epoch's validators attested the bundle's state root. */
+export interface Attestation {
+  epoch: number;
+  block: AttestBlock;
+  qc: AttestQc;
+  /** Digest chain value before the bundle's height (null at height 0). */
+  prev_digest: string | null;
+  /** State roots after blocks `height ..= claimed height`; the first is the bundle's root. */
+  roots: string[];
+}
+
 export interface ProofBundle {
   version: number;
   /** The state after this block. */
@@ -55,6 +94,8 @@ export interface ProofBundle {
   header: ProofHeader | null;
   /** Consensus evidence (opaque here; see the Rust verifier). */
   commit: { epoch: number; sync: string } | null;
+  /** Quorum attestation of `state_root` (absent on bundles without enough following blocks). */
+  attest?: Attestation | null;
 }
 
 export interface VerifiedProof {
@@ -63,13 +104,39 @@ export interface VerifiedProof {
   entries: { key: string; value: Uint8Array | null }[];
   /** The header of block `height + 1` was present, hashes correctly and names `stateRoot`. */
   headerBound: boolean;
-  /** The bundle carries consensus evidence (not verified by this function). */
+  /** The bundle carries consensus evidence for the next block (not verified by this function). */
   hasConsensusEvidence: boolean;
+  /** A quorum of the supplied validators of `attestedEpoch` attested `stateRoot`. */
+  rootAttested: boolean;
+  attestedEpoch: number | null;
+}
+
+/** A validator as `btb_getEpoch` returns it (extra fields are ignored). */
+export interface ValidatorInfo {
+  /** Consensus key (32 bytes hex). */
+  key: string;
+  /** Stake (decimal string or number). */
+  stake: string | number;
+}
+
+/** Validator sets you trust, by epoch, and the chain they belong to. */
+export interface QuorumTrust {
+  /** The chain id of genesis (`btb_chainId`). */
+  chainId: number | bigint;
+  /** Epoch number to that epoch's validators in consensus order. */
+  epochs: Record<number, ValidatorInfo[]>;
 }
 
 export interface VerifyOptions {
   /** A root you trust (for example a validator's `state_root_after` for `height`): must match. */
   trustedRoot?: string;
+  /**
+   * Validator sets to check the state root attestation against. When given, a bundle without
+   * a valid attestation for one of these epochs is rejected unless `allowUnattested` is set.
+   */
+  quorum?: QuorumTrust;
+  /** With `quorum`: accept a bundle that carries no attestation (`rootAttested` stays false). */
+  allowUnattested?: boolean;
   /** Keys (hex) and values that must be among the proven entries; `null` means proven absent. */
   expect?: { key: string; value: Uint8Array | null }[];
 }
@@ -106,6 +173,14 @@ function hash32(hex: string, what: string): Uint8Array {
   }
   if (b.length !== 32) throw new ProofError(`${what}: expected 32 bytes`);
   return b;
+}
+
+function le(n: number | bigint, bytes: number): Uint8Array {
+  const out = new Uint8Array(bytes);
+  const v = new DataView(out.buffer);
+  if (bytes === 8) v.setBigUint64(0, BigInt(n), true);
+  else v.setUint32(0, Number(n), true);
+  return out;
 }
 
 function nibble(h: Uint8Array, depth: number): number {
@@ -164,6 +239,117 @@ export async function headerHash(h: ProofHeader): Promise<string> {
   );
 }
 
+// ------------------------------------------------------------------ state root attestation
+
+async function qcDigest(q: AttestQc): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [le(q.round, 8), hash32(q.block_id, "qc block_id"), le(q.votes.length, 4)];
+  for (const [i, sig] of q.votes) {
+    const sb = fromHex(sig);
+    if (sb.length !== 64) throw new ProofError("signature: expected 64 bytes");
+    parts.push(le(i, 4), sb);
+  }
+  return sha256(utf8("BTB/qc/v1"), ...parts);
+}
+
+/** The id of a consensus block: what the validators' votes sign (mirrors `Block::id`). */
+export async function attestBlockId(b: AttestBlock): Promise<string> {
+  const exec = fromHex(b.exec);
+  return toHex(
+    await sha256(
+      utf8("BTB/block/v2"),
+      le(b.round, 8),
+      le(b.height, 8),
+      hash32(b.parent, "block parent"),
+      await qcDigest(b.justify),
+      le(b.proposer, 4),
+      hash32(b.payload_hash, "payload_hash"),
+      le(exec.length, 4),
+      exec,
+    ),
+  );
+}
+
+interface SetContext {
+  genesis: Uint8Array;
+  keys: Uint8Array[];
+  stakes: bigint[];
+  total: bigint;
+}
+
+async function setContext(chainId: number | bigint, epoch: number, vals: ValidatorInfo[]): Promise<SetContext> {
+  const keys = vals.map((v) => hash32(v.key, "validator key"));
+  const stakes = vals.map((v) => BigInt(v.stake));
+  const digestParts: Uint8Array[] = [utf8("BTB/valset/v1")];
+  keys.forEach((k, i) => digestParts.push(k, le(stakes[i]!, 8)));
+  const setDigest = await sha256(...digestParts);
+  const chain = new Uint8Array([...utf8("btb-chain-"), ...le(chainId, 8)]);
+  const genesis = await sha256(utf8("BTB/genesis/v2"), le(chain.length, 8), chain, le(epoch, 8), setDigest);
+  return { genesis, keys, stakes, total: stakes.reduce((a, b) => a + b, 0n) };
+}
+
+/** Whether `qc` holds votes of more than 2/3 of the stake of `set` (mirrors `Context::verify_qc`). */
+async function verifyQc(set: SetContext, qc: AttestQc): Promise<boolean> {
+  if (qc.round <= 0 || qc.round > 2 ** 53) return false;
+  const msg = new Uint8Array([
+    ...utf8("BTB/vote/v1"),
+    ...set.genesis,
+    ...le(qc.round, 8),
+    ...hash32(qc.block_id, "qc block_id"),
+  ]);
+  let stake = 0n;
+  let prev = -1;
+  for (const [who, sigHex] of qc.votes) {
+    if (!Number.isInteger(who) || who <= prev || who >= set.keys.length) return false;
+    prev = who;
+    const sig = fromHex(sigHex);
+    if (sig.length !== 64) return false;
+    try {
+      const key = await globalThis.crypto.subtle.importKey("raw", set.keys[who]! as BufferSource, "Ed25519", false, [
+        "verify",
+      ]);
+      if (!(await globalThis.crypto.subtle.verify("Ed25519", key, sig as BufferSource, msg as BufferSource))) return false;
+    } catch {
+      return false;
+    }
+    stake += set.stakes[who]!;
+  }
+  return stake * 3n > set.total * 2n;
+}
+
+/**
+ * Check an attestation against the bundle: the certificate is for the block, the block's claim
+ * covers the bundle's height, and the roots fold into the claimed digest chain value. Throws
+ * `ProofError`; the quorum check against validators is separate (`verifyQc`).
+ */
+async function checkAttestation(bundle: ProofBundle, a: Attestation): Promise<void> {
+  const claim = fromHex(a.block.exec);
+  if (claim.length !== 72) throw new ProofError("attestation: malformed claim");
+  const kClaim = Number(new DataView(claim.buffer, claim.byteOffset, 8).getBigUint64(0, true));
+  const digest = claim.slice(8, 40);
+  if ((await attestBlockId(a.block)) !== a.block.id) throw new ProofError("attestation: block id does not match its fields");
+  if (a.qc.block_id !== a.block.id || a.qc.round !== a.block.round) {
+    throw new ProofError("attestation: the certificate is for another block");
+  }
+  if (kClaim < bundle.height || kClaim >= a.block.height) {
+    throw new ProofError("attestation: the claim does not cover this height");
+  }
+  if (a.roots.length !== kClaim - bundle.height + 1 || a.roots.length > 256) {
+    throw new ProofError("attestation: wrong number of roots");
+  }
+  if (a.roots[0] !== bundle.state_root) throw new ProofError("attestation: the attested root is not the bundle's root");
+  let d: Uint8Array;
+  if (bundle.height === 0) {
+    d = await sha256(utf8("BTB/exec/genesis/v1"), hash32(a.roots[0]!, "root"));
+  } else {
+    if (a.prev_digest === null) throw new ProofError("attestation: missing previous digest");
+    d = await sha256(utf8("BTB/exec/v1"), hash32(a.prev_digest, "prev_digest"), le(bundle.height, 8), hash32(a.roots[0]!, "root"));
+  }
+  for (let i = 1; i < a.roots.length; i++) {
+    d = await sha256(utf8("BTB/exec/v1"), d, le(bundle.height + i, 8), hash32(a.roots[i]!, "root"));
+  }
+  if (!eq(d, digest)) throw new ProofError("attestation: the roots do not fold into the attested digest");
+}
+
 /**
  * Verify a proof bundle from a hosting node. Throws `ProofError` if anything does not check out;
  * otherwise returns the proven `(key, value)` pairs. See the file header for what that means.
@@ -196,11 +382,34 @@ export async function verifyProof(bundle: ProofBundle, opts: VerifyOptions = {})
   } else if (bundle.commit) {
     throw new ProofError("consensus evidence without a header");
   }
+  let rootAttested = false;
+  let attestedEpoch: number | null = null;
+  if (opts.quorum) {
+    const a = bundle.attest;
+    if (!a) {
+      if (!opts.allowUnattested) throw new ProofError("no state root attestation in the bundle");
+    } else {
+      await checkAttestation(bundle, a);
+      const vals = opts.quorum.epochs[a.epoch];
+      if (!vals) {
+        if (!opts.allowUnattested) throw new ProofError(`no validator set supplied for epoch ${a.epoch}`);
+      } else {
+        const set = await setContext(opts.quorum.chainId, a.epoch, vals);
+        if (!(await verifyQc(set, a.qc))) {
+          throw new ProofError("attestation: the certificate is not a quorum of the epoch's validators");
+        }
+        rootAttested = true;
+        attestedEpoch = a.epoch;
+      }
+    }
+  }
   return {
     height: bundle.height,
     stateRoot: bundle.state_root,
     entries,
     headerBound,
     hasConsensusEvidence: bundle.commit !== null,
+    rootAttested,
+    attestedEpoch,
   };
 }

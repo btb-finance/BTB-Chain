@@ -1,8 +1,9 @@
 //! Building proof bundles on the node (runs on the driver thread, between two blocks).
 
-use crate::proof::{Commit, Entry, ProofBundle};
+use crate::proof::{Attestation, Commit, Entry, ProofBundle, MAX_ROOTS};
 use crate::state::HostState;
 use btb_consensus::{Block as ConsensusBlock, Context};
+use btb_node::attest::Claim;
 use btb_node::blockstore::StoredBlock;
 use btb_node::sync::{self, Expect};
 use btb_node::wire::{SyncResponse, MAX_SYNC_CHAIN};
@@ -13,7 +14,7 @@ use std::collections::VecDeque;
 pub const MAX_KEYS: usize = 64;
 /// How far behind the head [`newest_anchored`] looks for a version whose next block is
 /// provably committed.
-const ANCHOR_SEARCH: u64 = 8;
+const ANCHOR_SEARCH: u64 = 16;
 
 fn block_at(log: &VecDeque<StoredBlock>, height: u64) -> Option<&StoredBlock> {
     let first = log.front()?.header.height;
@@ -72,6 +73,62 @@ fn commit_for(st: &HostState, log: &VecDeque<StoredBlock>, version: u64) -> Opti
     })
 }
 
+/// The quorum attestation of the state root after block `version`: the first consensus block
+/// whose execution claim covers `version` and whose own certificate is in the log (the
+/// `justify` of the next block), with the state roots from `version` up to the claimed height.
+fn attestation_for(
+    st: &HostState,
+    log: &VecDeque<StoredBlock>,
+    version: u64,
+) -> Option<Attestation> {
+    let head = log.back()?.header.height;
+    let cfg = st.config().staking;
+    let prev_digest = match version {
+        0 => None,
+        v => Some(block_at(log, v - 1)?.exec.digest),
+    };
+    // A block attesting `version` has height at least `version + 2`; its certificate is the
+    // justify of the next block, so it must not be the head.
+    for x in (version + 2)..head.min(version + 2 + MAX_ROOTS as u64) {
+        let b = block_at(log, x)?;
+        let Some(claim) = Claim::decode(&b.consensus.exec) else {
+            continue;
+        };
+        if claim.height < version {
+            continue;
+        }
+        let qc = &block_at(log, x + 1)?.consensus.justify;
+        let id = b.consensus.id();
+        if qc.block_id != id || qc.round != b.consensus.round {
+            continue; // the next block belongs to another epoch (its justify is not this QC)
+        }
+        let roots: Option<Vec<_>> = (version..=claim.height)
+            .map(|j| block_at(log, j).map(|s| s.state_root_after))
+            .collect();
+        let mut block = b.consensus.clone();
+        block.payload = Vec::new(); // the id covers `payload_hash`; the payload is not needed
+        return Some(Attestation {
+            epoch: cfg.epoch_of_block(x),
+            block,
+            qc: qc.clone(),
+            prev_digest,
+            roots: roots.filter(|r| r.len() <= MAX_ROOTS).or_else(|| {
+                // Height 0 has no stored block; its root is the version-0 root.
+                (version == 0).then(|| {
+                    let mut r = vec![merkle::root(st.store(), 0).ok().flatten()?];
+                    r.extend(
+                        (1..=claim.height)
+                            .map(|j| block_at(log, j).map(|s| s.state_root_after))
+                            .collect::<Option<Vec<_>>>()?,
+                    );
+                    Some(r)
+                })?
+            })?,
+        });
+    }
+    None
+}
+
 /// A bundle for `keys` at `version`. With `log`, it carries the next block's header and, when
 /// enough blocks followed, the consensus evidence for it.
 pub fn bundle(
@@ -95,12 +152,14 @@ pub fn bundle(
         (Some(l), Some(_)) => commit_for(st, l, version),
         _ => None,
     };
+    let attest = log.and_then(|l| attestation_for(st, l, version));
     Ok(ProofBundle {
         height: version,
         state_root,
         entries,
         header,
         commit,
+        attest,
     })
 }
 
@@ -112,6 +171,13 @@ pub fn newest_anchored(
     keys: &[Vec<u8>],
 ) -> Result<ProofBundle, String> {
     let head = st.head().map_err(|e| e.0)?.height;
+    for v in (head.saturating_sub(ANCHOR_SEARCH)..head).rev() {
+        if let Ok(b) = bundle(st, Some(log), v, keys) {
+            if b.commit.is_some() && b.attest.is_some() {
+                return Ok(b);
+            }
+        }
+    }
     for v in (head.saturating_sub(ANCHOR_SEARCH)..head).rev() {
         if let Ok(b) = bundle(st, Some(log), v, keys) {
             if b.commit.is_some() {

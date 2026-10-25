@@ -7,8 +7,9 @@
  * signed with Ed25519, byte for byte what Rust produces (`test/fixtures/voucher.json`).
  *
  * Uses WebCrypto (Ed25519 and SHA-256: Node 20+, current browsers), so everything is async.
- * Verification here follows WebCrypto, which is slightly looser than the chain's strict check
- * (for example it may accept some non-canonical signatures); the chain has the last word.
+ * WebCrypto verification is looser than the chain's `ed25519-dalek` `verify_strict`, so
+ * `verifyVoucher` first applies the strict checks itself (see `isStrictEd25519`): S < L, and R
+ * and the public key must be canonical encodings of points that are not of small order.
  */
 
 const DOMAIN = new TextEncoder().encode("btb.voucher.v1");
@@ -106,9 +107,97 @@ export async function signVoucher(v: Voucher, seed: Uint8Array): Promise<SignedV
   return { voucher: v, signature: new Uint8Array(sig) };
 }
 
+// Edwards25519, for the strictness checks only (never on secret data).
+const P = (1n << 255n) - 19n;
+const L = (1n << 252n) + 27742317777372353535851937790883648493n;
+const D = (((P - 121665n) % P) * inv(121666n)) % P;
+const SQRT_M1 = pow(2n, (P - 1n) / 4n);
+
+function mod(a: bigint): bigint {
+  const r = a % P;
+  return r < 0n ? r + P : r;
+}
+function pow(b: bigint, e: bigint): bigint {
+  let r = 1n;
+  b = mod(b);
+  for (; e > 0n; e >>= 1n) {
+    if (e & 1n) r = mod(r * b);
+    b = mod(b * b);
+  }
+  return r;
+}
+function inv(a: bigint): bigint {
+  return pow(a, P - 2n);
+}
+function leInt(b: Uint8Array): bigint {
+  let x = 0n;
+  for (let i = b.length - 1; i >= 0; i--) x = (x << 8n) | BigInt(b[i]!);
+  return x;
+}
+function leBytes(x: bigint): Uint8Array {
+  const b = new Uint8Array(32);
+  for (let i = 0; i < 32; i++, x >>= 8n) b[i] = Number(x & 0xffn);
+  return b;
+}
+
+type Pt = [bigint, bigint];
+
+/** Decode a point the way ed25519-dalek does (y is reduced mod p); null if not on the curve. */
+function decompress(enc: Uint8Array): Pt | null {
+  const sign = (enc[31]! >> 7) & 1;
+  const y = mod(leInt(enc) & ((1n << 255n) - 1n));
+  const y2 = mod(y * y);
+  const u = mod(y2 - 1n);
+  const v = mod(D * y2 + 1n);
+  let x = mod(u * inv(v));
+  x = pow(x, (P + 3n) / 8n);
+  // x is a candidate root of x^2 = u/v; fix it up by sqrt(-1) or reject.
+  if (mod(v * x * x) !== u) x = mod(x * SQRT_M1);
+  if (mod(v * x * x) !== u) return null;
+  if (Number(x & 1n) !== sign) x = mod(-x);
+  return [x, y];
+}
+
+function compress([x, y]: Pt): Uint8Array {
+  const b = leBytes(y);
+  b[31] = b[31]! | Number((x & 1n) << 7n);
+  return b;
+}
+
+function double([x, y]: Pt): Pt {
+  // Unified twisted Edwards addition (a = -1) of the point with itself.
+  const xy = mod(x * y);
+  const dxy2 = mod(D * xy * xy);
+  const x3 = mod(2n * xy * inv(mod(1n + dxy2)));
+  const y3 = mod((y * y + x * x) * inv(mod(1n - dxy2)));
+  return [x3, y3];
+}
+
+/** Whether the encoding is canonical, on the curve and not of small order (order dividing 8). */
+function strictPoint(enc: Uint8Array): boolean {
+  const pt = decompress(enc);
+  if (!pt) return false;
+  const re = compress(pt);
+  if (!re.every((v, i) => v === enc[i])) return false; // y >= p, or "negative zero"
+  let q = pt;
+  for (let i = 0; i < 3; i++) q = double(q);
+  return !(q[0] === 0n && q[1] === 1n);
+}
+
+/**
+ * The checks `ed25519-dalek`'s `verify_strict` makes beyond RFC 8032 verification: S < L
+ * (malleability), and R and the public key canonical and not of small order.
+ */
+export function isStrictEd25519(signature: Uint8Array, publicKey: Uint8Array): boolean {
+  if (signature.length !== 64 || publicKey.length !== 32) return false;
+  if (leInt(signature.subarray(32)) >= L) return false;
+  return strictPoint(signature.subarray(0, 32)) && strictPoint(publicKey);
+}
+
 /** Whether `payerKey` (32-byte Ed25519 public key) signed exactly this voucher. */
 export async function verifyVoucher(sv: SignedVoucher, payerKey: Uint8Array): Promise<boolean> {
   if (sv.signature.length !== 64 || payerKey.length !== 32) return false;
+  if (!isStrictEd25519(sv.signature, payerKey)) return false;
   try {
     const key = await crypto.subtle.importKey("raw", bufs(payerKey), "Ed25519", false, ["verify"]);
     const digest = await voucherDigest(sv.voucher);

@@ -226,6 +226,10 @@ pub struct NodeParams {
     pub rate_burst: f64,
     /// Testing only: delay every inbound message by this many milliseconds to emulate a WAN.
     pub test_one_way_delay_ms: u64,
+    /// Testing only: from this height on, this node records a wrong execution digest (as if
+    /// its executor diverged): it proposes wrong attestations, refuses to vote for right ones
+    /// and stops at the first committed block that contradicts it.
+    pub test_exec_fault_from: Option<u64>,
     /// Serve block sync to non-validator followers (hosting nodes). `None` (the default):
     /// only validators are served. See `docs/HOSTING.md`.
     pub serve_followers: Option<crate::net::FollowerPolicy>,
@@ -248,6 +252,7 @@ impl NodeParams {
             rate_per_sec: 2_000.0,
             rate_burst: 4_000.0,
             test_one_way_delay_ms: 0,
+            test_exec_fault_from: None,
             serve_followers: None,
             sync_poll_ms: None,
         }

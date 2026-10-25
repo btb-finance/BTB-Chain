@@ -49,7 +49,7 @@ The full developer experience on one node, so developers can build real apps.
 **Deliverables**
 
 - [x] `btb` CLI: `init`, `dev` (hot reload), `deploy`
-  - `crates/btb-cli`, see [docs/CLI.md](docs/CLI.md); `deploy` writes a local bundle until the chain exists (Phase 4)
+  - `crates/btb-cli`, see [docs/CLI.md](docs/CLI.md); `deploy` writes a local bundle, and with `--rpc URL --key FILE` sends it to a node as a signed `Deploy` transaction; also `call`, `query`, `keygen`
 - [x] TypeScript SDK with React hooks (`useQuery`, `useMutation`)
 - [x] Dashboard to browse contract tables like a database
   - `GET /dashboard` and `/admin/...` in `crates/btb-dev`, see [docs/DEV_SERVER.md](docs/DEV_SERVER.md#dashboard-and-admin-endpoints)
@@ -93,7 +93,7 @@ Everything that makes BTB a decentralized cloud.
 **Deliverables**
 
 - [x] Cron jobs and scheduled functions (prepaid balances, per-block scheduled-gas cap)
-  - `#[btb::cron(every = "N blocks")]` flows into the deploy bundle `crons`; the chain runs it from the contract balance, pauses when empty and defers fairly under the cap ([CHAIN.md](docs/CHAIN.md#cron-jobs)); building the `Deploy` transaction from a bundle comes with `btb deploy` to a network (Phase 4)
+  - `#[btb::cron(every = "N blocks")]` flows into the deploy bundle `crons`; the chain runs it from the contract balance, pauses when empty and defers fairly under the cap ([CHAIN.md](docs/CHAIN.md#cron-jobs)); `btb deploy --rpc` builds the `Deploy` transaction from the bundle (manifest with crons and indexes) and prints the contract address
 - [x] Hosting nodes: queries, subscriptions, websites, Merkle proofs on answers ([design](docs/HOSTING.md); `crates/btb-host`, no fees or storage-node files yet)
 - [x] Payment channels and signed vouchers for per-request fees
   - `TxKind::Channel` (open, top-up, payee close, payer timeout close with a challenge period) in `btb-chain`, locked funds in the supply invariant, parallel-equivalence tested; `btb-voucher` crate and `sdk-ts/src/voucher.ts` with a cross-language fixture ([CHAIN.md](docs/CHAIN.md#payment-channels)); hosting nodes that sell requests against vouchers come with the hosting-node item
@@ -101,11 +101,14 @@ Everything that makes BTB a decentralized cloud.
   - the 80/20 split is accounted in `btb-chain`, but the relay share only accumulates in `relay_pool()`: paying it needs a signed `relayer` field and a hosting-node registry, see the design note in [CHAIN.md](docs/CHAIN.md#fees)
 - [ ] Storage nodes ([design](docs/SCALING.md)): erasure-coded file pieces, random piece assignment, storage challenges, automatic repair
 - [ ] Edge caching for popular content
-- [ ] Native DEX module with batch auctions (front-running protection)
+- [x] Native DEX module with batch auctions (front-running protection)
+  - `TxKind::Dex` in `btb-chain` (BTB and user-token pairs, escrowed limit orders, one uniform clearing price per pair every `dex_batch_blocks`, pro-rata fills, fee to the validator pool), tested against a brute-force reference, for supply conservation, reordering and parallel equivalence ([CHAIN.md](docs/CHAIN.md#native-dex)); page at `GET /dex` of every node ([examples/native-dex](examples/native-dex)); constant-product liquidity in the batch is not done
 - [ ] Oracles ([design](docs/ORACLES.md)): threshold-BLS randomness beacon, built-in price feeds, HTTPS actions with transforms, signed reports for other chains
 - [ ] Cross-chain: threshold signatures and native-asset vaults (Ethereum, Bitcoin, Solana)
 
 **Gate:** a full DEX runs end to end on testnet, frontend included.
+
+Shown locally so far (not yet on a public testnet, so the gate stays open): on `scripts/testnet-local.sh` (4 validators), `node examples/native-dex/web/smoke.js` deploys the launcher contract, creates two user tokens, and drives three browser tabs through the page served at `GET /dex`: signed limit orders are placed from the browser, a resting ask shows up live in another tab's order book, a crossing bid clears in one batch at one price (shown as the last clearing price, with the fee and the exact token amounts checked over RPC), a cancel refunds the escrow, a token/token pair trades, and the token supplies are conserved across holders, vault and fee account. The Rust side (`cargo test -p btb-chain --test dex`) covers the clearing price against a brute-force reference, uniform price, pro-rata rounding, conservation of BTB and every token, cancel and expiry refunds, hostile inputs, order-independence inside a batch and parallel/sequential equivalence.
 
 ## Phase 6 — Mainnet
 

@@ -12,6 +12,9 @@ use serde_json::{json, Value};
 /// The explorer page (single file, no external requests).
 pub const PAGE: &str = include_str!("../web/explorer.html");
 
+/// The DEX page (`examples/native-dex/web`, single file, no external requests).
+pub const DEX_PAGE: &str = include_str!("../../../examples/native-dex/web/index.html");
+
 /// Short name of a transaction kind.
 pub fn kind_name(k: &TxKind) -> &'static str {
     match k {
@@ -24,6 +27,7 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::SubmitEvidence { .. } => "submit_evidence",
         TxKind::Channel(_) => "channel",
         TxKind::Site(_) => "site",
+        TxKind::Dex(_) => "dex",
     }
 }
 
@@ -89,6 +93,12 @@ pub fn tx_json(tx: &Transaction) -> Value {
             o.insert("op".into(), json!(what));
             o.insert("contract".into(), json!(hex::encode(contract)));
             o.insert("path".into(), json!(path));
+        }
+        TxKind::Dex(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
         }
     }
     v

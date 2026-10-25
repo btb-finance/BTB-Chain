@@ -7,10 +7,12 @@
 //! previous one (the first of an epoch extends the epoch's anchor), no two replicas ever
 //! disagree about a height, and nothing above an epoch's last height is committed in it.
 
-use crate::sim::Rng;
+use crate::sim::{exec_hooks, fake_claim, fake_digest, FakeExec, Rng};
 use crate::*;
 use ed25519_dalek::SigningKey;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 struct Scenario {
@@ -25,6 +27,8 @@ struct Scenario {
     gst: Tick,
     max_ticks: Tick,
     policy: LeaderPolicy,
+    /// Run the execution attestation hooks with a fake execution function.
+    exec: bool,
 }
 
 impl Scenario {
@@ -39,6 +43,7 @@ impl Scenario {
             gst: 0,
             max_ticks: 6_000,
             policy: LeaderPolicy::RoundRobin,
+            exec: false,
         }
     }
 }
@@ -73,6 +78,11 @@ struct Sim {
     now: Tick,
     global: BTreeMap<Height, Hash>,
     last: BTreeMap<(u64, usize), (Height, Hash)>,
+    /// Per physical node: what it executed (survives epochs, like a database).
+    fx: Vec<Rc<RefCell<FakeExec>>>,
+    /// The true execution digest per height, from the agreed chain.
+    truth: BTreeMap<Height, Hash>,
+    attested: usize,
     out: Outcome,
 }
 
@@ -89,6 +99,11 @@ impl Sim {
             now: 0,
             global: BTreeMap::new(),
             last: BTreeMap::new(),
+            fx: (0..sc.nodes)
+                .map(|_| Rc::new(RefCell::new(FakeExec::new())))
+                .collect(),
+            truth: BTreeMap::from([(0, FakeExec::new().digests[&0])]),
+            attested: 0,
             out: Outcome {
                 ended: BTreeMap::new(),
                 global: BTreeMap::new(),
@@ -157,6 +172,18 @@ impl Sim {
             anchor,
         )
         .unwrap();
+        if self.sc.exec {
+            // A node that joins syncs and executes the finalized chain before it starts.
+            let fx = self.fx[node].clone();
+            let from = fx.borrow().executed() + 1;
+            for h in from..=anchor.map_or(0, |a| a.height) {
+                let prev = fx.borrow().digests[&(h - 1)];
+                let d = fake_digest(&prev, h, &self.global[&h]);
+                fx.borrow_mut().digests.insert(h, d);
+            }
+            let (p, c) = exec_hooks(&fx);
+            r.set_exec_hooks(p, c);
+        }
         let a = r.start();
         self.inst[node].insert(epoch, r);
         self.started.insert((epoch, node));
@@ -194,6 +221,7 @@ impl Sim {
 
     fn apply(&mut self, node: usize, epoch: u64, actions: Vec<Action>) {
         let n = self.sc.members[epoch as usize].len();
+        let mut committed = false;
         for a in actions {
             match a {
                 Action::Send { to, msg } => self.send(node, epoch, to as usize, &msg),
@@ -202,8 +230,18 @@ impl Sim {
                         self.send(node, epoch, j, &m);
                     }
                 }
-                Action::Commit(b) => self.check_commit(node, epoch, &b),
+                Action::Commit(b) => {
+                    self.check_commit(node, epoch, &b);
+                    self.fx[node].borrow_mut().on_commit(&b);
+                    committed = true;
+                }
                 Action::Evidence(_) => panic!("honest nodes must never produce evidence"),
+            }
+        }
+        if committed && self.sc.exec {
+            if let Some(r) = self.inst[node].get_mut(&epoch) {
+                let more = r.resume();
+                self.apply(node, epoch, more);
             }
         }
         let ended = self.inst[node].get(&epoch).is_some_and(|r| r.epoch_ended());
@@ -238,6 +276,27 @@ impl Sim {
             Some(prev) => assert_eq!(*prev, id, "seed {seed}: SAFETY VIOLATION at {}", b.height),
             None => {
                 self.global.insert(b.height, id);
+            }
+        }
+        if self.sc.exec {
+            // The block attests the true execution result of the height its ancestry fixes
+            // (checked against the digest chain of the agreed blocks), also across epochs.
+            let k = u64::from_le_bytes(b.exec[..8].try_into().expect("exec claim"));
+            assert!(
+                k < b.height && k >= epoch * self.sc.epoch_len,
+                "seed {seed}: attested height {k}"
+            );
+            let d = self.truth[&k];
+            assert_eq!(
+                b.exec,
+                fake_claim(k, &d),
+                "seed {seed}: wrong attestation certified"
+            );
+            self.attested += 1;
+            if !self.truth.contains_key(&b.height) {
+                let prev = self.truth[&(b.height - 1)];
+                self.truth
+                    .insert(b.height, fake_digest(&prev, b.height, &id));
             }
         }
         self.last.insert((epoch, node), (b.height, id));
@@ -498,4 +557,34 @@ fn signatures_do_not_cross_epochs() {
     // The root is not part of the signed domain: the chain can rebuild the context without it.
     let c1b = Context::for_epoch(b"x", 1, set(()), None);
     assert_eq!(c1.genesis, c1b.genesis);
+}
+
+#[test]
+fn attestation_chains_across_epochs_joiners_and_laggards() {
+    // Complete turnover, a laggard, stake-weighted leaders and loss: every committed block
+    // (also the first ones of an epoch, which attest the previous epoch's last block) carries
+    // the true execution result, and everyone still finishes every epoch.
+    for seed in 0..6 {
+        let mut sc = Scenario::new(
+            seed,
+            5,
+            8,
+            vec![
+                eq(&[0, 1, 2, 3]),
+                eq(&[2, 3, 4, 5]),
+                eq(&[4, 5, 6, 7]),
+                eq(&[0, 1, 6, 7]),
+            ],
+        );
+        sc.exec = true;
+        sc.policy = LeaderPolicy::StakeWeighted;
+        if seed % 2 == 1 {
+            sc.drop_permille = 100;
+            sc.gst = 150;
+            sc.down = vec![(3, 10, 300)];
+        }
+        sc.max_ticks = 12_000;
+        let o = run(sc);
+        full_chain(&o, 4, 5);
+    }
 }

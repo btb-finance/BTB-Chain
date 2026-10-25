@@ -109,7 +109,7 @@ fn binary_init_then_build_lists_entry_points_and_deploy_hash_is_correct() {
     let elf = std::fs::read(root.join("target/btb/hello.elf")).unwrap();
     let out = run(&["deploy"], &root);
     assert!(
-        out.contains("Phase 4") && out.contains(&sha256_hex(&elf)),
+        out.contains("--rpc") && out.contains(&sha256_hex(&elf)),
         "{out}"
     );
     let bundle = root.join("target/btb/deploy");
