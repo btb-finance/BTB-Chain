@@ -1,44 +1,33 @@
-# Contributing to BTB Orbit Chain
+# Contributing to BTB Chain
 
-We love your input! We want to make contributing to BTB Orbit Chain as easy and transparent as possible, whether it's:
+BTB Chain is in its design phase, and input at this stage shapes everything that follows. Contributions are welcome, whether it's:
 
-- Reporting a bug
-- Discussing the current state of the code
-- Submitting a fix
-- Proposing new features
+- Feedback on the design docs and roadmap
+- Proposing changes to the architecture, language or tokenomics
+- Reporting problems or inconsistencies
+- Code for Phase 1 (language and VM) once development starts
 - Becoming a maintainer
 
-## Development Process
+## Design proposals
 
-We use GitHub to host code, to track issues and feature requests, as well as accept pull requests.
+Larger changes start as a **design proposal** issue: describe the problem, the proposed change, alternatives considered and the impact on security, performance and developer experience. Accepted proposals are merged into the docs under `docs/`.
+
+## Development process
+
+We use GitHub to host code, track issues and feature requests, and accept pull requests.
 
 1. Fork the repo and create your branch from `main`
 2. If you've added code that should be tested, add tests
-3. If you've changed APIs, update the documentation
-4. Ensure the test suite passes
-5. Make sure your code lints
-6. Issue that pull request!
+3. If you've changed behavior or interfaces, update the documentation
+4. Ensure the test suite passes and your code is formatted (`cargo fmt`, `cargo clippy` once Rust code lands)
+5. Open the pull request
 
-## Any contributions you make will be under the MIT Software License
+## Reporting issues
 
-In short, when you submit code changes, your submissions are understood to be under the same [MIT License](http://choosealicense.com/licenses/mit/) that covers the project. Feel free to contact the maintainers if that's a concern.
+Use the [issue tracker](https://github.com/btb-finance/btb-chain/issues). Good reports include a summary, steps to reproduce, what you expected and what actually happened.
 
-## Report bugs using GitHub's [issue tracker](https://github.com/btb-finance/btb-orbit-chain/issues)
-
-We use GitHub issues to track public bugs. Report a bug by [opening a new issue](https://github.com/btb-finance/btb-orbit-chain/issues/new); it's that easy!
-
-## Write bug reports with detail, background, and sample code
-
-**Great Bug Reports** tend to have:
-
-- A quick summary and/or background
-- Steps to reproduce
-  - Be specific!
-  - Give sample code if you can
-- What you expected would happen
-- What actually happens
-- Notes (possibly including why you think this might be happening, or stuff you tried that didn't work)
+Security vulnerabilities must **not** be reported in public issues — see [SECURITY.md](SECURITY.md).
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under its MIT License.
+Contributions are licensed under the MIT License, the same license that covers the project.

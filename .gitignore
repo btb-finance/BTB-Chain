@@ -16,13 +16,13 @@ build/
 coverage/
 *.tsbuildinfo
 
-# Hardhat
-cache/
-artifacts/
-typechain-types/
+# Rust
+target/
+**/*.rs.bk
 
-# Chain deployment info
-chain-deployment-info.json
+# Local chain data
+.btb/
+devnet-data/
 
 # Debug logs
 npm-debug.log*

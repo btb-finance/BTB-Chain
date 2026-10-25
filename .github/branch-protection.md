@@ -14,10 +14,8 @@ Configure the following branch protection rules in GitHub repository settings:
 - [x] Require status checks to pass before merging
   - [x] Require branches to be up to date before merging
   - Required status checks:
-    - CI workflow
-    - Security scan
     - Documentation checks
-    - Dependency review
+    - CI workflow (once Rust code lands in Phase 1)
 
 - [x] Require conversation resolution before merging
 

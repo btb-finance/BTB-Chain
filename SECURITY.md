@@ -4,11 +4,12 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
+| 2.x (BTB Chain L1, design phase) | :white_check_mark: |
+| 1.0.x (Orbit L3, retired) | :x: |
 
 ## Reporting a Vulnerability
 
-We take the security of BTB Orbit Chain seriously. If you believe you have found a security vulnerability, please report it to us as described below.
+We take the security of BTB Chain seriously. If you believe you have found a security vulnerability, please report it to us as described below.
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 

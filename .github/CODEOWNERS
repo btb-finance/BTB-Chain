@@ -1,20 +1,14 @@
 # These owners will be the default owners for everything in the repo.
 * @btb-finance/core-team
 
-# Chain configuration files
-/orbit-config.json @btb-finance/chain-admins
-/node-config.json @btb-finance/chain-admins
-
-# Smart contracts
-/contracts/ @btb-finance/smart-contract-team
-/test/contracts/ @btb-finance/smart-contract-team
-
-# Deployment scripts
-/scripts/ @btb-finance/devops-team
-
-# Documentation
+# Roadmap and design documentation
+/ROADMAP.md @btb-finance/core-team
 /docs/ @btb-finance/docs-team
 *.md @btb-finance/docs-team
+
+# Tokenomics and cross-chain design (security-sensitive)
+/docs/TOKENOMICS.md @btb-finance/core-team @btb-finance/security-team
+/docs/CROSS_CHAIN.md @btb-finance/core-team @btb-finance/security-team
 
 # CI/CD
 /.github/workflows/ @btb-finance/devops-team

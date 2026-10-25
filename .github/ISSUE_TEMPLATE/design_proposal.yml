@@ -1,0 +1,55 @@
+name: Design Proposal
+description: Propose a change to the BTB Chain architecture, language, tokenomics or roadmap
+title: "[Proposal]: "
+labels: ["design-proposal", "needs-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to propose changes to the BTB Chain design.
+        Accepted proposals are merged into the docs under `docs/` or into ROADMAP.md.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the design does this affect?
+      options:
+        - Architecture / state model
+        - Consensus / networking
+        - Contract language / VM
+        - Tokenomics / fees
+        - Cross-chain
+        - Developer tools / SDK
+        - Roadmap
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the change in detail.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact analysis
+      placeholder: |
+        - Security:
+        - Performance:
+        - Developer experience:
+        - Tokenomics:
+    validations:
+      required: true

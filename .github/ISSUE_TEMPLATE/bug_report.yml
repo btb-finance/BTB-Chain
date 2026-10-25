@@ -12,9 +12,9 @@ body:
   - type: input
     id: chain
     attributes:
-      label: Chain Environment
-      description: Which chain environment are you experiencing the issue on?
-      placeholder: "e.g., BTB Orbit Testnet, BTB Orbit Mainnet"
+      label: Environment
+      description: Where are you experiencing the issue?
+      placeholder: "e.g., docs, local devnet, BTB testnet"
     validations:
       required: true
   - type: textarea

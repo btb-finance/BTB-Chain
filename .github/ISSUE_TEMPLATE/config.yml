@@ -7,7 +7,7 @@ contact_links:
     url: https://twitter.com/btb_finance
     about: Follow us on Twitter for announcements and updates
   - name: BTB Finance Security Policy
-    url: https://github.com/btb-finance/btb-orbit-chain/blob/main/SECURITY.md
+    url: https://github.com/btb-finance/btb-chain/blob/main/SECURITY.md
     about: Please review our security policy for reporting sensitive security vulnerabilities
   - name: BTB Finance Documentation
     url: https://docs.btb.finance

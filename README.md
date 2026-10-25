@@ -1,126 +1,103 @@
-# BTB Finance - Arbitrum L3 Chain
+# BTB Chain
 
-BTB Finance is an Arbitrum Layer 3 chain built using AnyTrust and Arbitrum Orbit technology.
+**The Convex of blockchain.** BTB Chain is a decentralized cloud where a developer writes one project — token, backend logic, database and frontend — runs one deploy command, and gets a live app with a URL. No RPC providers, no indexers, no off-chain servers, no separate web hosting.
 
 [![Website](https://img.shields.io/badge/Website-btb.finance-blue)](https://www.btb.finance)
 [![Twitter Follow](https://img.shields.io/twitter/follow/btb_finance?style=social)](https://twitter.com/btb_finance)
 
-## Chain Specifications
+> **Status: design phase.** This repository holds the BTB Chain specification and roadmap. Phase 1 (language + VM) is the next milestone. The earlier Arbitrum Orbit L3 design has been retired; it remains available at the `orbit-legacy` tag.
 
-- **Chain Name**: BTB Orbit
-- **Chain ID**: 91738291
-- **Consensus**: AnyTrust
-- **Parent Chain**: Arbitrum One
-- **Features**:
-  - Custom token bridge
-  - Optimized gas settings
-  - 3-validator AnyTrust setup
-  - High-performance sequencer
+## Why BTB Chain
 
-## Prerequisites
+On most chains, the chain cannot answer basic questions like "who holds this NFT?" or "who created this pool?". Every app needs RPC providers, indexers, cron servers and web hosting bolted on. On BTB Chain, **the chain is the whole backend**:
 
-1. Node.js v16 or higher
-2. Access to Arbitrum One RPC
-3. Three validator addresses
-4. Sequencer address
-5. Sufficient ETH in deployer wallet
+- **Database-native state** — contracts declare tables and indexes; "all NFTs owned by X" is a plain query.
+- **Queries and live subscriptions** — reads are instant and served without consensus; UIs update the moment data changes.
+- **Cron jobs and scheduled functions** — contracts schedule their own work, no off-chain keepers.
+- **On-chain hosting** — frontends are served by the network itself.
+- **Native tokens** — creating a token is one built-in call; every wallet, explorer and DEX sees it automatically.
+- **Cross-chain by signature** — BTB contracts can read and write Ethereum, Bitcoin, Solana and more without deploying contracts there.
 
-## Environment Setup
+## At a glance
 
-1. Clone the repository
-2. Copy `.env.example` to `.env`
-3. Fill in the required environment variables:
+| | |
+| --- | --- |
+| Native token | **BTB**, fixed supply of **1,000,000,000**, no minting after genesis |
+| Fees | Every request pays the node that does the work (hosting node or block executor) |
+| Contract language | BTB's own Rust-like language, compiled to RISC-V |
+| VM | RISC-V recompiler with deterministic gas metering |
+| Node software | Rust |
+| Consensus | Proof-of-stake BFT, ~1 s finality, fast path for owned data |
+| Execution | Parallel (Block-STM style) |
+| Network | Core validators (consensus) + hosting nodes (queries, subscriptions, websites) |
+
+## Developer experience (target)
 
 ```bash
-# Network Configuration
-ARBITRUM_RPC=                  # Arbitrum One RPC URL
-PRIVATE_KEY=                   # Deployer wallet private key
-
-# Validator Setup
-VALIDATOR_1_ADDRESS=           # First validator address
-VALIDATOR_2_ADDRESS=           # Second validator address
-VALIDATOR_3_ADDRESS=           # Third validator address
-
-# Sequencer Configuration
-SEQUENCER_ADDRESS=             # Sequencer address
-
-# Token Bridge (Optional)
-L1_TOKEN_ADDRESS=              # Address of L1 token to bridge
+btb init my-dex
+btb dev        # local chain with hot reload
+btb deploy     # contracts + frontend go live
+# → https://my-dex.btb.app
 ```
 
-## Deployment Steps
+```rust
+contract Dex {
+    table Pool {
+        id: u64 @primary,
+        token_a: TokenId @index,
+        token_b: TokenId @index,
+        reserve_a: u128,
+        reserve_b: u128,
+        creator: Address @index,
+    }
 
-1. Install dependencies:
-```bash
-npm install
+    query fn price(pool: u64) -> Decimal {
+        let p = Pool.get(pool)?;
+        p.reserve_b / p.reserve_a
+    }
+
+    mutation fn swap(pool: u64, amount_in: u128, min_out: u128) {
+        let p = Pool.get(pool)?;
+        let out = amm_out(amount_in, p.reserve_a, p.reserve_b);
+        require(out >= min_out, "slippage too high")?;
+        // move tokens, update reserves
+    }
+
+    @cron(every = 1 hour)
+    mutation fn record_price_history() { /* for charts */ }
+}
 ```
 
-2. Deploy the complete L3 chain:
-```bash
-npx ts-node scripts/deploy-full-chain.ts
+```js
+const price = useQuery(dex.price, { pool: 7 }); // live, no polling
+const swap  = useMutation(dex.swap);
 ```
 
-This script will:
-- Create the L3 chain
-- Configure validators
-- Set up the sequencer
-- Deploy the token bridge
-- Save all deployment information
+## Roadmap
 
-## Chain Components
+| Phase | Focus | Gate to move on |
+| --- | --- | --- |
+| 1 | Language + RISC-V VM (local, no chain) | Sample contracts compile and run with exact, repeatable gas |
+| 2 | State database: tables, indexes, queries, subscriptions | Query by index and watch a UI update live |
+| 3 | Single-node devnet: `btb` CLI, TypeScript SDK, dashboard | An outside developer ships a working app and it feels like Convex |
+| 4 | Multi-validator testnet: consensus, networking, parallel execution | Testnet keeps finalizing when validators fail |
+| 5 | Platform: cron, hosting nodes, payment channels, native tokens, DEX, cross-chain | A full DEX runs end to end on testnet, frontend included |
+| 6 | Mainnet: audits, fixed 1B BTB genesis, operator onboarding | — |
 
-### 1. Node Configuration
-- Located in `node-config.json`
-- Defines chain parameters
-- Configures AnyTrust settings
-- Sets up validator requirements
+Full details: [ROADMAP.md](ROADMAP.md).
 
-### 2. Chain Configuration
-- Located in `orbit-config.json`
-- Defines chain ID and name
-- Configures gas parameters
-- Sets up parent chain connection
+## Documentation
 
-### 3. Token Bridge
-- Enables asset transfers between L2 and L3
-- Supports ERC-20 tokens
-- Configurable gateway
+- [Architecture](docs/ARCHITECTURE.md) — state model, network, consensus, hosting
+- [Language](docs/LANGUAGE.md) — the BTB contract language and RISC-V target
+- [Tokenomics](docs/TOKENOMICS.md) — fixed supply, fees, payment channels
+- [Cross-chain](docs/CROSS_CHAIN.md) — chain signatures and native-asset vaults
+- [Roadmap](ROADMAP.md)
 
-## Post-Deployment
+## Contributing
 
-After deployment, you'll receive:
-1. Chain RPC endpoint
-2. Bridge contract addresses
-3. Validator configuration
-4. Sequencer information
+BTB Chain is at the design stage, so design feedback is the most valuable contribution right now. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-All information is saved in `chain-deployment-info.json`
+## Security
 
-## Security Considerations
-
-1. Secure key management for:
-   - Validators
-   - Sequencer
-   - Bridge admin
-2. Regular monitoring of:
-   - Validator performance
-   - Bridge operations
-   - Network health
-
-## Development and Testing
-
-1. Test contracts:
-```bash
-npx hardhat test
-```
-
-2. Local development:
-```bash
-npx hardhat node
-```
-
-## Resources
-
-- [Arbitrum Orbit Documentation](https://docs.arbitrum.io/launch-orbit-chain/orbit-gentle-introduction)
-- [AnyTrust Protocol](https://docs.arbitrum.io/how-arbitrum-works/anytrust-protocol)
-- [Token Bridge Documentation](https://docs.arbitrum.io/bridge-tokens/token-bridge-basics)
+Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
