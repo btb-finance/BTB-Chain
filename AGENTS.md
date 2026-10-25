@@ -12,7 +12,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 
 | Path | Contents |
 | --- | --- |
-| `IDEA.md` | The problem BTB solves and why, plus tweet drafts |
+| `IDEA.md` | The problem BTB solves and why (the page to share) |
 | `README.md` | Overview and quick summary |
 | `ROADMAP.md` | Six phases, deliverables as checkboxes, gates between phases |
 | `docs/ARCHITECTURE.md` | Network, consensus, state model, tech stack |
