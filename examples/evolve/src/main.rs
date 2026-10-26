@@ -98,7 +98,12 @@ fn todo_v1_to_v2(row: TodoV1) -> Todo {
 // ---------------------------------------------------------------- functions
 #[btb::mutation]
 pub fn add(text: String) -> u64 {
-    #[cfg(not(any(feature = "migrate", feature = "fail", feature = "wrongprev", feature = "bad")))]
+    #[cfg(not(any(
+        feature = "migrate",
+        feature = "fail",
+        feature = "wrongprev",
+        feature = "bad"
+    )))]
     {
         #[cfg(not(feature = "compat"))]
         return Todo {

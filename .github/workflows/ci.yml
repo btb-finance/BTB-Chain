@@ -121,7 +121,7 @@ jobs:
 
       - uses: actions/setup-node@v4.1.0
         with:
-          node-version: "22.12.0"
+          node-version: "22.22.0"
           cache: npm
           cache-dependency-path: sdk-ts/package-lock.json
 
