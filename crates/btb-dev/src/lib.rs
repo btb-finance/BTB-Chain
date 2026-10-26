@@ -21,6 +21,7 @@ mod demo;
 
 pub use admin::parse_fields;
 
+use btb_runtime::schema::{IndexKind, Schema, Ty};
 use btb_runtime::{
     layout, IndexDef, IndexValue, KvStore, Occ, OccError, ReadSet, RuntimeHost, SubId,
     SubscriptionManager, Tables, WriteBatch,
@@ -96,6 +97,31 @@ impl IndexSpec {
     }
 }
 
+/// Register the indexes the contract declares in its ELF, plus the deprecated `--index` /
+/// `Cargo.toml` specs for tables the ELF does not declare. Returns the ELF's schema.
+fn register_tables(
+    tables: &mut Tables,
+    elf: &[u8],
+    legacy: &[IndexSpec],
+) -> Result<Schema, String> {
+    let schema = Schema::from_elf(elf)?;
+    for (t, defs) in schema.index_defs()? {
+        tables
+            .register(CONTRACT, t.as_bytes(), defs)
+            .map_err(|e| e.to_string())?;
+    }
+    let mut by_table: BTreeMap<&str, Vec<IndexDef>> = BTreeMap::new();
+    for i in legacy.iter().filter(|i| schema.table(&i.table).is_none()) {
+        by_table.entry(&i.table).or_default().push(i.def());
+    }
+    for (t, defs) in by_table {
+        tables
+            .register(CONTRACT, t.as_bytes(), defs)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(schema)
+}
+
 struct Client {
     caller: [u8; 32],
     tx: Sender<Vec<u8>>,
@@ -115,13 +141,66 @@ struct Shared<S: KvStore> {
     contract: RwLock<Arc<Contract>>,
     /// Page served at `/`; `None` serves the built-in todo demo.
     page: RwLock<Option<String>>,
-    tables: Tables,
+    tables: RwLock<Tables>,
+    /// What the contract's ELF declares (`#[btb::table]`, function signatures).
+    schema: RwLock<Schema>,
     /// Index declarations (the dashboard needs their value kinds).
     indexes: Vec<IndexSpec>,
     /// Field-type hints per table for the dashboard (`Table` -> `["addr", "bool", ...]`).
     fields: RwLock<BTreeMap<String, Vec<String>>>,
     state: Mutex<State<S>>,
     stop: AtomicBool,
+}
+
+impl<S: KvStore> Shared<S> {
+    /// Dashboard field hints of `table`: from `--fields` / `Cargo.toml` if given, else derived
+    /// from the contract's schema when every field has a dashboard type.
+    fn hint(&self, table: &str) -> Option<Vec<String>> {
+        if let Some(h) = self.fields.read().unwrap().get(table) {
+            return Some(h.clone());
+        }
+        let schema = self.schema.read().unwrap();
+        schema
+            .table(table)?
+            .fields
+            .iter()
+            .map(|(_, ty)| match ty {
+                Ty::Address => Some("addr".to_string()),
+                Ty::Str => Some("string".into()),
+                Ty::Bytes => Some("bytes".into()),
+                Ty::Bool
+                | Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64
+                | Ty::U128
+                | Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::I128 => Some(ty.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Is index `index` of `table` made of 32-byte addresses (`Some(true)`), numbers
+    /// (`Some(false)`), or unknown to the contract and the legacy specs (`None`)?
+    fn index_is_addr(&self, table: &str, index: &str) -> Option<bool> {
+        if let Some(k) = self
+            .schema
+            .read()
+            .unwrap()
+            .table(table)
+            .and_then(|t| t.index_kind(index))
+        {
+            return Some(k == IndexKind::Bytes);
+        }
+        self.indexes
+            .iter()
+            .find(|i| i.table == table && i.index == index)
+            .map(|i| i.addr)
+    }
 }
 
 /// Dashboard field hints: `(table, field types)`.
@@ -148,15 +227,7 @@ impl Server {
     ) -> Result<Server, String> {
         let contract = Contract::from_elf(elf).map_err(|e| format!("bad contract: {e:?}"))?;
         let mut tables = Tables::new();
-        let mut by_table: BTreeMap<&str, Vec<IndexDef>> = BTreeMap::new();
-        for i in &indexes {
-            by_table.entry(&i.table).or_default().push(i.def());
-        }
-        for (t, defs) in by_table {
-            tables
-                .register(CONTRACT, t.as_bytes(), defs)
-                .map_err(|e| e.to_string())?;
-        }
+        let schema = register_tables(&mut tables, elf, &indexes)?;
         let bal = layout::balance_key(&CONTRACT);
         if store.get(&bal).map_err(|e| e.to_string())?.is_none() {
             store
@@ -168,7 +239,8 @@ impl Server {
         let shared = Arc::new(Shared {
             contract: RwLock::new(Arc::new(contract)),
             page: RwLock::new(None),
-            tables,
+            tables: RwLock::new(tables),
+            schema: RwLock::new(schema),
             indexes,
             fields: RwLock::new(BTreeMap::new()),
             state: Mutex::new(State {
@@ -255,6 +327,11 @@ fn reload_contract<S: KvStore + Send + 'static>(
 ) -> Result<Vec<btb_vm::EntryPoint>, String> {
     let contract = Contract::from_elf(elf).map_err(|e| format!("bad contract: {e:?}"))?;
     let entries = contract.entry_points().to_vec();
+    // New or changed tables and indexes apply to new writes; existing rows are not re-indexed.
+    let mut tables = sh.tables.read().unwrap().clone();
+    let schema = register_tables(&mut tables, elf, &sh.indexes)?;
+    *sh.tables.write().unwrap() = tables;
+    *sh.schema.write().unwrap() = schema;
     let mut guard = sh.state.lock().unwrap();
     *sh.contract.write().unwrap() = Arc::new(contract);
     let st = &mut *guard;
@@ -411,7 +488,8 @@ fn run<S: KvStore>(
     caller: [u8; 32],
     height: u64,
 ) -> Result<(Vec<u8>, WriteBatch, ReadSet), (&'static str, String)> {
-    let mut host = RuntimeHost::new(store, &sh.tables, CONTRACT, caller, height);
+    let tables = sh.tables.read().unwrap();
+    let mut host = RuntimeHost::new(store, &tables, CONTRACT, caller, height);
     if kind != FunctionKind::Query {
         // No beacon on a development server: marked functions get numbers from a fixed seed so
         // they can be tried out. Different on every call; not random in any security sense.

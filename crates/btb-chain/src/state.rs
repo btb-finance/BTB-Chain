@@ -23,6 +23,7 @@ use btb_codec::{Decode, DecodeError, Encode, Reader};
 use btb_runtime::kv::{KvError, KvStore, MemKv};
 use btb_runtime::layout;
 use btb_runtime::merkle::{self, MerkleError};
+use btb_runtime::schema::Schema;
 use btb_runtime::tables::{IndexDef, Tables};
 use btb_runtime::IndexValue;
 use btb_vm::Contract;
@@ -413,16 +414,27 @@ pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
         + sum_tag(kv, crate::host::TAG_HOST_UNBOND)?)
 }
 
-/// Register a manifest's indexes into `tables` for `contract`.
+/// Register the indexes of a contract into `tables`: the ones its code declares with
+/// `#[btb::table]` (read from the schema markers in the ELF), and, for tables the code does not
+/// declare, the deprecated `manifest.indexes` specs.
 pub(crate) fn register_manifest(
     tables: &mut Tables,
     contract: Address,
+    code: &[u8],
     manifest: &Manifest,
 ) -> Result<(), String> {
     let specs = manifest.validate()?;
+    let schema = Schema::from_elf(code)?;
+    for (table, defs) in schema.index_defs()? {
+        tables
+            .register(contract, table.as_bytes(), defs)
+            .map_err(|e| e.to_string())?;
+    }
     let mut by_table: BTreeMap<&str, Vec<&IndexSpec>> = BTreeMap::new();
     for s in &specs {
-        by_table.entry(&s.table).or_default().push(s);
+        if schema.table(&s.table).is_none() {
+            by_table.entry(&s.table).or_default().push(s);
+        }
     }
     for (table, specs) in by_table {
         let mut names = BTreeSet::new();
@@ -572,7 +584,8 @@ impl<S: KvStore> ChainState<S> {
                     .try_into()
                     .map_err(|_| StateError("bad contract key".into()))?;
                 let rec = ContractRecord::decode(v)?;
-                register_manifest(&mut tables, addr, &rec.manifest).map_err(StateError)?;
+                register_manifest(&mut tables, addr, &rec.code, &rec.manifest)
+                    .map_err(StateError)?;
             }
             match page.last() {
                 Some((k, _)) if page.len() == 256 => {

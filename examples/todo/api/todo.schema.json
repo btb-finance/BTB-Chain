@@ -1,0 +1,19 @@
+{
+  "contract": "todo",
+  "tables": [
+    {
+      "name": "Todo",
+      "fields": [{"name": "owner", "type": "address"}, {"name": "done", "type": "bool"}, {"name": "created", "type": "u64"}, {"name": "text", "type": "string"}],
+      "indexes": ["owner", "created"],
+      "primary": null
+    }
+  ],
+  "functions": [
+    {"kind": "mutation", "name": "add", "args": [{"name": "text", "type": "string"}], "returns": "u64", "fallible": true},
+    {"kind": "mutation", "name": "toggle", "args": [{"name": "id", "type": "u64"}], "returns": "bool", "fallible": true},
+    {"kind": "query", "name": "list_mine", "args": [], "returns": "vec<(u64,bool,string)>", "fallible": false},
+    {"kind": "query", "name": "open_since", "args": [{"name": "from", "type": "u64"}], "returns": "vec<u64>", "fallible": false},
+    {"kind": "query", "name": "page_mine", "args": [{"name": "limit", "type": "u32"}, {"name": "cursor", "type": "bytes"}, {"name": "newest_first", "type": "bool"}], "returns": "(vec<(u64,bool,string)>,bytes)", "fallible": false},
+    {"kind": "query", "name": "recent", "args": [{"name": "limit", "type": "u32"}], "returns": "vec<Todo>", "fallible": false}
+  ]
+}

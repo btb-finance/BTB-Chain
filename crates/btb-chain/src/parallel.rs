@@ -76,7 +76,7 @@ pub(crate) struct ParOut {
     pub relayers: BTreeMap<Address, u64>,
     pub validator: u64,
     pub any_fee: bool,
-    pub deploys: Vec<(Address, Manifest)>,
+    pub deploys: Vec<(Address, Vec<u8>, Manifest)>,
     pub cache: Cache,
     pub stats: ParStats,
 }
@@ -942,9 +942,9 @@ pub(crate) fn run(
                 *slot = a;
             }
         }
-        if let (TxKind::Deploy { manifest, .. }, Status::Success) = (&tx.body.kind, &r.status) {
+        if let (TxKind::Deploy { code, manifest }, Status::Success) = (&tx.body.kind, &r.status) {
             if let Ok(addr) = Address::try_from(r.output.as_slice()) {
-                deploys.push((addr, manifest.clone()));
+                deploys.push((addr, code.clone(), manifest.clone()));
             }
         }
     }

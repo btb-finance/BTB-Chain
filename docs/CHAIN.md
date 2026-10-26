@@ -239,7 +239,20 @@ hash   = SHA256("btb.block.v1" || height || parent_hash || timestamp || state_ro
 3. The due crons, as system transactions. Always sequential, after all transactions. Then the HTTPS action votes and deliveries, then the DEX clearing, then the price observations, then staking.
 4. The new head, then the supply check, then the Merkle root, then one atomic commit.
 
-Contract code runs in `btb-vm` with the call's gas limit. A reverted call's writes (storage, tables, deposit moves, token moves) are dropped as a whole.
+Contract code runs in `btb-vm` with the call's gas limit. A reverted call's writes (storage, tables, deposit moves, token moves) are dropped as a whole; a failed nested call ([Calling other contracts](#calling-other-contracts)) drops only its own.
+
+## Calling other contracts
+
+A contract can call another with the `call_contract` host call ([LANGUAGE.md](LANGUAGE.md#calling-other-contracts) has the contract-side rules). The chain side:
+
+- **Where the code comes from.** `RuntimeHost` gets a `Resolver` (`exec::ChainResolver`) that reads the callee's `ContractRecord` through the running call's own overlay and parses it through the same per-block code cache as top-level calls. The read lands in the call's read set, so a subscribed query or a speculative transaction depends on it.
+- **One overlay, savepoints.** Every frame (the entry point and each nested call) works on the transaction's single write overlay. A nested call opens an `Overlay::savepoint`; any outcome but success rolls back exactly the writes of that frame (the undo journal is only kept while a savepoint is open). The read set is not rolled back: a reverted callee still depended on what it read, which keeps optimistic validation and subscriptions sound.
+- **Frames.** The callee gets `caller` = the calling contract's address and `contract` = its own; native transfers, token calls, storage and tables act as the callee. `read_only` is inherited and sticky (a query's callees are read-only). The stack of contract addresses refuses re-entry and caps the depth at 8 (`abi::MAX_CALL_DEPTH`).
+- **Deposits** are settled per contract, incrementally. A successful callee frame settles the callee's net metered-byte change since it was last settled (`settle_contract`); the entry-point contract is settled at the end of the transaction. If the callee's balance cannot pay, that call fails (`CALL_DEPOSIT`) and is rolled back, together with the deposit bookkeeping of the frame. The supply invariant is unchanged: deposits move balance into the contract's own `deposit` record.
+- **Failures** inside a nested frame that are not storage backend errors (aborts, traps, table faults, out of gas) become statuses. A storage backend error (`KvError`) is not recoverable and fails the transaction (`Revert::Fault`), as it does without calls.
+- **Gas and fees.** The caller pays the callee's exact VM gas inside its own VM gas, so the transaction's `gas_used` and fee already include everything; there is no separate callee fee. A function marked `randomness` is charged its whole limit as before.
+- **Crons** may call too (a cron is a mutation). Actions' first phase and queries are read-only and so may call queries only; `call_transform` runs with no host at all.
+- **Parallel execution.** A call transaction's footprint was already dynamic (a contract may touch any account), so transactions that call contracts always take the tracked (Block-STM) path; the contract record, storage and balances a callee reads are logged like any other read, and a callee's table schemas are registered lazily per worker like those of a directly called contract. The differential test (`tests/parallel.rs`) includes routers that call the token and each other, with aborts, out-of-gas callees, re-entrancy and deposit failures, and requires byte-identical receipts, roots and stores.
 
 ## Parallel execution
 

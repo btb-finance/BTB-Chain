@@ -1,4 +1,4 @@
-//! `btb init <name> | build | dev | deploy`, see docs/CLI.md.
+//! `btb init <name> | build | codegen | dev | deploy`, see docs/CLI.md.
 use btb_cli::{chain, deploy, init, print_entries, sha256_hex, DevSession, SdkSource};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -7,6 +7,7 @@ use std::time::Duration;
 const USAGE: &str = "usage: btb <command>\n\
   btb init <name> [--sdk-path DIR | --sdk-git URL]   create a contract project in ./<name>\n\
   btb build                                          build target/btb/<name>.elf and list entry points\n\
+  btb codegen --ts DIR                               build and write the typed TypeScript client (api.ts, api.js, api.d.ts) to DIR\n\
   btb dev [--port N] [--data DIR]                    build, serve and hot reload (default port 8787)\n\
   btb deploy [--rpc URL --key FILE [--gas-limit N]]  write a deploy bundle; with --rpc deploy it to a node\n\
   btb call --rpc URL --key FILE [--gas-limit N] [--relayer HOST_URL] <contract> <fn> [args]   send a mutation (--relayer: submit via a hosting node, which earns 20% of the fee)\n\
@@ -62,6 +63,25 @@ fn run() -> Result<(), String> {
             let b = btb_cli::build(&project)?;
             print_entries(&b);
             println!("wrote {}", b.elf_path.display());
+            Ok(())
+        }
+        "codegen" => {
+            let mut out = None;
+            let mut it = rest.into_iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--ts" => out = Some(it.next().ok_or("--ts needs an output directory")?),
+                    _ => return Err(format!("unexpected argument {a}")),
+                }
+            }
+            let out = out.ok_or("usage: btb codegen --ts <out-dir>")?;
+            let (files, warnings) = btb_cli::codegen_ts(&project, &PathBuf::from(out))?;
+            for w in warnings {
+                eprintln!("btb: warning: {w}");
+            }
+            for f in files {
+                println!("wrote {}", f.display());
+            }
             Ok(())
         }
         "deploy" => {

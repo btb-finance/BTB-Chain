@@ -20,6 +20,8 @@ pub type Extractor = Arc<dyn Fn(&[u8]) -> Result<Option<IndexValue>, String> + S
 pub struct IndexDef {
     pub name: String,
     pub extract: Extractor,
+    /// At most one row may have a given value (a `#[primary]` key). Checked on insert and update.
+    pub unique: bool,
 }
 
 impl IndexDef {
@@ -30,7 +32,14 @@ impl IndexDef {
         Self {
             name: name.to_string(),
             extract: Arc::new(extract),
+            unique: false,
         }
+    }
+
+    /// Make the index unique: writing a second row with the same value fails.
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
     }
 }
 
@@ -46,6 +55,10 @@ pub enum TableError {
     IdOverflow,
     /// Bad schema registration.
     Schema(String),
+    /// A write would give a second row the value of a unique (primary) index.
+    Duplicate {
+        index: String,
+    },
 }
 
 impl From<KvError> for TableError {
@@ -63,6 +76,9 @@ impl fmt::Display for TableError {
             }
             TableError::IdOverflow => write!(f, "table id counter overflow"),
             TableError::Schema(m) => write!(f, "bad schema: {m}"),
+            TableError::Duplicate { index } => {
+                write!(f, "duplicate value for unique index {index:?}")
+            }
         }
     }
 }
@@ -106,6 +122,13 @@ impl Tables {
         Ok(())
     }
 
+    /// Add every schema of `other` (replacing same-named ones).
+    pub fn absorb(&mut self, other: &Tables) {
+        for (k, v) in &other.schemas {
+            self.schemas.insert(k.clone(), v.clone());
+        }
+    }
+
     fn defs(&self, contract: &Address, table: &[u8]) -> &[IndexDef] {
         self.schemas
             .get(&(*contract, table.to_vec()))
@@ -129,6 +152,45 @@ impl Tables {
                     })
             })
             .collect()
+    }
+
+    /// Fail if another row than `id` already holds a unique index value in `idx`.
+    fn check_unique(
+        &self,
+        kv: &impl KvStore,
+        contract: &Address,
+        table: &[u8],
+        idx: &Extracted,
+        id: u64,
+        old: Option<&Extracted>,
+    ) -> Result<(), TableError> {
+        for (i, d) in self.defs(contract, table).iter().enumerate() {
+            let Some((_, Some(v))) = idx.get(i) else {
+                continue;
+            };
+            if !d.unique {
+                continue;
+            }
+            if old.is_some_and(|o| o.get(i).map(|x| &x.1) == Some(&Some(v.clone()))) {
+                continue;
+            }
+            let mut prefix = layout::index_prefix(contract, table, &d.name);
+            v.encode_into(&mut prefix);
+            let Some(end) = layout::prefix_successor(&prefix) else {
+                continue;
+            };
+            // Entries are `prefix || id (8 bytes BE)`; the value encoding is prefix-free.
+            let found = kv.scan(&prefix, Some(&end), false, 2)?;
+            if found
+                .iter()
+                .any(|(k, _)| k.len() != prefix.len() + 8 || !k.ends_with(&id.to_be_bytes()))
+            {
+                return Err(TableError::Duplicate {
+                    index: d.name.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn get(
@@ -159,6 +221,7 @@ impl Tables {
             None => 0,
         };
         let next = id.checked_add(1).ok_or(TableError::IdOverflow)?;
+        self.check_unique(kv, contract, table, &idx, id, None)?;
         let mut batch = WriteBatch::new();
         batch.put(counter, next.to_le_bytes().to_vec());
         batch.put(layout::row_key(contract, table, id), row.to_vec());
@@ -189,6 +252,7 @@ impl Tables {
         };
         let old_idx = self.extract(contract, table, &old)?;
         let new_idx = self.extract(contract, table, row)?;
+        self.check_unique(kv, contract, table, &new_idx, id, Some(&old_idx))?;
         let mut batch = WriteBatch::new();
         for ((name, o), (_, n)) in old_idx.into_iter().zip(new_idx) {
             if o == n {

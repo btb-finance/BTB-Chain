@@ -5,6 +5,7 @@
 ```
 btb init <name> [--sdk-path DIR | --sdk-git URL]
 btb build
+btb codegen --ts DIR
 btb dev [--port N] [--data DIR]
 btb deploy [--rpc URL --key FILE [--gas-limit N]]
 btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]
@@ -19,7 +20,7 @@ btb storage-node run --rpc URL --key FILE --dir DIR [--listen ADDR] [--endpoint 
 
 ## `btb init <name>`
 
-Creates `./<name>/` with the same structure as `examples/todo`: `Cargo.toml`, `.cargo/config.toml` (rv64im flags, `build-std`), `link.ld`, `rust-toolchain.toml`, `src/main.rs` (a `Note` table with `add`, `toggle`, `list_mine`) and `web/index.html` (a live page that calls those three functions). The templates are embedded in the binary. The source is `src/main.rs`, not `lib.rs`: a contract is a `no_std`/`no_main` binary, which is what produces the ELF.
+Creates `./<name>/` with the same structure as `examples/todo`: `Cargo.toml`, `.cargo/config.toml` (rv64im flags, `build-std`), `link.ld`, `rust-toolchain.toml`, `src/main.rs` (a `Note` table with an `#[index]` on `owner` and `add`, `toggle`, `list_mine`) and `web/index.html` (a live page that calls those three functions). The templates are embedded in the binary. The source is `src/main.rs`, not `lib.rs`: a contract is a `no_std`/`no_main` binary, which is what produces the ELF.
 
 It also writes `.vscode/settings.json`, `.vscode/extensions.json` and `rust-analyzer.toml` so rust-analyzer uses the RISC-V target and `build-std` and expands the `#[btb::*]` macros; see [LSP.md](LSP.md).
 
@@ -29,11 +30,20 @@ The generated `Cargo.toml` depends on `btb-sdk`. Where it finds it is configurab
 - `--sdk-git URL` writes a git dependency (cargo finds the crate in the repository by name).
 - Default: `$BTB_SDK_PATH`, else the absolute path of `crates/btb-sdk` in the checkout `btb` was built from. Set one of the above when you move the project or install `btb` elsewhere. `btb-sdk` is not published to crates.io yet.
 
-The project's `[package.metadata.btb] indexes = ["Note:owner:addr@0"]` lists the temporary host-side index declarations (see [DEV_SERVER.md](DEV_SERVER.md)); `btb dev` registers them and `btb deploy` records them in the manifest.
+Indexes are declared in the contract (`#[index]` on a `#[btb::table]` field) and read from the ELF by `btb dev`, `btb deploy` and the chain; the project needs no metadata. The old `[package.metadata.btb] indexes = ["Note:owner:addr@0"]` is **deprecated**: it is still honoured for tables the contract does not declare (and recorded in the deploy manifest), with a warning, and ignored for tables it does. `fields = [...]` (dashboard decode hints) remains optional; hints are derived from the schema by default.
 
 ## `btb build`
 
-Runs `cargo build --release` for `riscv64imac-unknown-none-elf` with the environment of the examples' `build.sh` (`RUSTC_BOOTSTRAP=1`; `RUSTFLAGS`, `CARGO_BUILD_TARGET` and `CARGO_TARGET_DIR` are cleared so `.cargo/config.toml` wins), copies the ELF to `target/btb/<name>.elf`, validates it with `btb_vm::Contract::from_elf` and prints the entry points (`query list_mine`, `mutation add`, ...). A rejected ELF is an error.
+Runs `cargo build --release` for `riscv64imac-unknown-none-elf` with the environment of the examples' `build.sh` (`RUSTC_BOOTSTRAP=1`; `RUSTFLAGS`, `CARGO_BUILD_TARGET` and `CARGO_TARGET_DIR` are cleared so `.cargo/config.toml` wins), copies the ELF to `target/btb/<name>.elf`, validates it with `btb_vm::Contract::from_elf` and prints the entry points (`query list_mine`, `mutation add`, ...) and the declared tables (`table Note (indexes: owner)`). A rejected ELF or an invalid schema is an error. It also writes `target/btb/<name>.schema.json`: the contract's tables (fields with their `btb-codec` types, `indexes`, `primary`) and functions (`kind`, `name`, `args`, `returns`, `fallible`), the input of `btb codegen`.
+
+## `btb codegen`
+
+`btb codegen --ts DIR` builds the project and writes the typed client for its frontend to `DIR`:
+
+- `api.ts`: one `interface` and codec per table (`export interface Todo { owner: Uint8Array; done: boolean; created: bigint; text: string }`) and `export const api = { add: mutationRef<[text: string], bigint>(...), list_mine: queryRef<[], ...>(...), ... }`, using `queryRef` / `mutationRef` / `t` from `@btb/client`;
+- `api.js` and `api.d.ts`: the same without a build step, for a page that inlines `@btb/client` (see [TS_SDK.md](TS_SDK.md#typed-clients-from-the-contract-schema)).
+
+Queries and mutations are generated; crons, actions and transforms are not part of the client. A function whose argument or result type the schema cannot describe (a Rust type that is neither a primitive, a tuple, `Vec`, `Option` nor a table struct) is skipped with a warning. The output is a pure function of the schema, so it can be checked in and diffed: `examples/todo/api/` holds the generated files (and `todo.schema.json`), which `crates/btb-cli/tests/cli.rs` compares with fresh output (`BTB_UPDATE_GOLDEN=1` rewrites them).
 
 ## `btb dev`
 
@@ -50,7 +60,7 @@ Same limits as the dev server: one contract, no auth, development only. Never ex
 Builds and writes a **deploy bundle** to `target/btb/deploy/`:
 
 - `<name>.elf`, the contract;
-- `manifest.json`: `name`, `elf`, `size`, `code_hash` (SHA-256 of the ELF, lowercase hex), `hash_algorithm`, `entry_points` (`{kind, name}`), `crons` (`{function, every_blocks}`, from `#[btb::cron(every = "N blocks")]`) and `indexes`.
+- `manifest.json`: `name`, `elf`, `size`, `code_hash` (SHA-256 of the ELF, lowercase hex), `hash_algorithm`, `entry_points` (`{kind, name}`), `crons` (`{function, every_blocks}`, from `#[btb::cron(every = "N blocks")]`) and `indexes` (only the deprecated metadata specs for tables the contract does not declare; declared indexes travel inside the ELF, which the chain reads when it validates the `Deploy`).
 
 Without `--rpc` that is all: it prints the hash and where the bundle is.
 

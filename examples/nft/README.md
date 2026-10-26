@@ -12,11 +12,11 @@ Example BTB contract: NFTs and a marketplace that sells them for a user token (`
 | mutation | `buy(listing)`: pays the seller from the buyer's escrow, moves the NFT, closes the listing |
 | mutation | `deposit(token, amount)`, `withdraw(token, amount)`: the escrow ledger, below |
 | mutation | `create_currency(name, symbol, decimals, supply) -> Token`: demo helper, the contract holds the supply |
-| query | `my_nfts() -> Vec<(id, uri)>` (read through the `owner` index), `nft(id) -> (owner, uri)` |
+| query | `my_nfts() -> Vec<(id, uri)>` (read through the `owner` index), `nft(id) -> (owner, uri)`, `listing_of(nft) -> Option<(listing id, token, price)>` (primary-key lookup) |
 | query | `listings(cursor, limit) -> (Vec<(listing, nft, seller, token, price, uri)>, Option<cursor>)`, ascending listing id, `limit` 1 to 50, start with cursor 0 |
 | query | `escrow_of(token, who)`, `escrowed(token)`, `unclaimed(token)`, `balance_of(token, who)`, `info(token)` |
 
-Tables: `Nft { owner, uri }` (indexed by `owner`, declared in `[package.metadata.btb]` for `btb dev`) and `Listing { nft, seller, token, price }` (deleted on cancel and on sale).
+Tables: `Nft { #[index] owner, uri }` and `Listing { #[primary] nft, seller, token, price }` (deleted on cancel and on sale). The indexes are declared on the fields with `#[btb::table]`; `btb dev` and the chain read them from the contract, and the unique primary key on `nft` is what allows only one open listing per NFT.
 
 ## The escrow model (contract-as-sender)
 

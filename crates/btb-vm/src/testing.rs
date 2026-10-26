@@ -1,9 +1,10 @@
 //! In-memory `Host` for tests and tooling.
 
-use crate::host::{Address, Host, PriceRecord, TwapOutcome};
+use crate::contract::FunctionKind;
+use crate::host::{Address, CallEnd, CallReply, CallRequest, Host, PriceRecord, TwapOutcome};
 use crate::rand::RandomSource;
 use crate::token::{TokenId, TokenInfo, TokenStore};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 /// One table: rows by id, plus the next id to hand out (never decreases, so ids are not reused).
 #[derive(Debug, Clone, Default)]
@@ -34,7 +35,16 @@ pub struct MemHost {
     pub twaps: BTreeMap<(u32, u64), TwapOutcome>,
     /// Reports queued by `report_request`, in order (the id is the index).
     pub reports: Vec<Vec<u8>>,
+    /// Scripted answers to `call_contract`, first in first out; with none left the call is
+    /// `Unsupported`.
+    pub call_replies: VecDeque<CallReply>,
+    /// Every `call_contract` the host received: `(target, kind, function, args, gas, read_only,
+    /// max_output)`.
+    pub calls_seen: Vec<SeenCall>,
 }
+
+/// A `call_contract` request as `MemHost` recorded it.
+pub type SeenCall = (Address, FunctionKind, String, Vec<u8>, u64, bool, usize);
 
 impl TokenStore for MemHost {
     fn contract(&self) -> Address {
@@ -162,6 +172,20 @@ impl Host for MemHost {
     fn report_request(&mut self, data: &[u8]) -> Option<u64> {
         self.reports.push(data.to_vec());
         Some(self.reports.len() as u64 - 1)
+    }
+    fn call_contract(&mut self, req: &CallRequest<'_>) -> CallReply {
+        self.calls_seen.push((
+            req.target,
+            req.kind,
+            req.function.to_string(),
+            req.args.to_vec(),
+            req.gas,
+            req.read_only,
+            req.max_output,
+        ));
+        self.call_replies
+            .pop_front()
+            .unwrap_or_else(|| CallReply::refused(CallEnd::Unsupported))
     }
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
         let Some(t) = self.tables.get(table) else {

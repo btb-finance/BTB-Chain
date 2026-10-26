@@ -1,3 +1,4 @@
+import { type ArgsParam, type MutationRef, type QueryRef, isFnRef } from "./api.js";
 import { type Codec, decode, encode, fromHex, toHex } from "./codec.js";
 import type { ProofBundle } from "./proof.js";
 import { type TxKind, signTransaction } from "./tx.js";
@@ -11,6 +12,28 @@ export class BtbError extends Error {
     super(message);
     this.name = "BtbError";
   }
+}
+
+/**
+ * A contract function aborted the call (`abort("msg")`, or an `Err` returned by a function
+ * declared `-> btb_sdk::Result<T>`). `reason` is the contract's message.
+ */
+export class ContractError extends BtbError {
+  constructor(
+    /** The message the contract aborted with. */
+    readonly reason: string,
+    status: number = 400,
+  ) {
+    super(`aborted: ${reason}`, status);
+    this.name = "ContractError";
+  }
+}
+
+/** Turn a failed HTTP response into a `ContractError` for aborts, else a `BtbError`. */
+function httpError(text: string, status: number): BtbError {
+  const message = errorMessage(text, status);
+  const m = /^aborted: ([\s\S]*)$/.exec(message);
+  return status === 400 && m ? new ContractError(m[1]!, status) : new BtbError(message, status);
 }
 
 export interface BtbClientOptions {
@@ -132,18 +155,26 @@ export class BtbClient {
       throw new BtbError(`network error: ${(e as Error).message}`);
     }
     const text = await res.text();
-    if (!res.ok) throw new BtbError(errorMessage(text, res.status), res.status);
+    if (!res.ok) throw httpError(text, res.status);
     return decode(resultType, fromHex(text.trim()));
   }
 
   /** Run a query once. */
-  query<A extends unknown[], R>(name: string, argsType: Codec<A>, args: A, resultType: Codec<R>): Promise<R> {
-    return this.call("query", name, argsType, args, resultType);
+  query<A extends unknown[], R>(ref: QueryRef<A, R>, ...args: ArgsParam<A>): Promise<R>;
+  query<A extends unknown[], R>(name: string, argsType: Codec<A>, args: A, resultType: Codec<R>): Promise<R>;
+  query(first: unknown, ...rest: unknown[]): Promise<unknown> {
+    if (isFnRef(first)) return this.call("query", first.name, first.args, (rest[0] ?? []) as unknown[], first.result);
+    const [argsType, args, resultType] = rest as [Codec<unknown[]>, unknown[], Codec<unknown>];
+    return this.call("query", first as string, argsType, args, resultType);
   }
 
   /** Run a mutation; resolves with its result once committed. */
-  mutation<A extends unknown[], R>(name: string, argsType: Codec<A>, args: A, resultType: Codec<R>): Promise<R> {
-    return this.call("mutation", name, argsType, args, resultType);
+  mutation<A extends unknown[], R>(ref: MutationRef<A, R>, ...args: ArgsParam<A>): Promise<R>;
+  mutation<A extends unknown[], R>(name: string, argsType: Codec<A>, args: A, resultType: Codec<R>): Promise<R>;
+  mutation(first: unknown, ...rest: unknown[]): Promise<unknown> {
+    if (isFnRef(first)) return this.call("mutation", first.name, first.args, (rest[0] ?? []) as unknown[], first.result);
+    const [argsType, args, resultType] = rest as [Codec<unknown[]>, unknown[], Codec<unknown>];
+    return this.call("mutation", first as string, argsType, args, resultType);
   }
 
   /**
@@ -197,13 +228,42 @@ export class BtbClient {
    * Returns a function that stops the subscription.
    */
   subscribe<A extends unknown[], R>(
+    ref: QueryRef<A, R>,
+    args: A,
+    onResult: (result: R) => void,
+    onError?: (error: BtbError) => void,
+  ): Unsubscribe;
+  subscribe<A extends unknown[], R>(
     name: string,
     argsType: Codec<A>,
     args: A,
     resultType: Codec<R>,
     onResult: (result: R) => void,
     onError?: (error: BtbError) => void,
-  ): Unsubscribe {
+  ): Unsubscribe;
+  subscribe(first: unknown, ...rest: unknown[]): Unsubscribe {
+    let name: string;
+    let argsType: Codec<unknown[]>;
+    let args: unknown[];
+    let resultType: Codec<unknown>;
+    let onResult: (result: unknown) => void;
+    let onError: ((error: BtbError) => void) | undefined;
+    if (isFnRef(first)) {
+      name = first.name;
+      argsType = first.args;
+      resultType = first.result;
+      [args, onResult, onError] = rest as [unknown[], (r: unknown) => void, ((e: BtbError) => void)?];
+    } else {
+      name = first as string;
+      [argsType, args, resultType, onResult, onError] = rest as [
+        Codec<unknown[]>,
+        unknown[],
+        Codec<unknown>,
+        (r: unknown) => void,
+        ((e: BtbError) => void)?,
+      ];
+    }
+    type R = unknown;
     const url = this.target("subscribe", name, encode(argsType, args));
     let closed = false;
     const deliver = (data: string) => {
@@ -244,7 +304,7 @@ export class BtbClient {
             signal: abort.signal,
           });
           if (!res.ok) {
-            fail(new BtbError(errorMessage(await res.text(), res.status), res.status));
+            fail(httpError(await res.text(), res.status));
             if (res.status < 500) return; // a bad request will not get better
           } else if (res.body) {
             await readSse(res.body, deliver);

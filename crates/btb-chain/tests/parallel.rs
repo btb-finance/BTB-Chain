@@ -30,6 +30,8 @@ impl Lcg {
 }
 
 static RELAYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// try_transfer receipts that report a callee abort: a nested call failed and was reverted alone.
+static CALL_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CHANNEL_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const RICH: u64 = 10 * UNITS_PER_BTB;
 
@@ -129,11 +131,13 @@ struct World {
     token: Address,
     dex: Address,
     todo: Address,
+    /// Two `examples/caller` routers that call each other and the token (cross-contract calls).
+    r1: Address,
+    r2: Address,
 }
 
 fn setup(rigs: &mut [Rig], w: &mut [Wallet]) -> World {
-    let mut todo_m = manifest("todo");
-    todo_m.indexes = vec!["Todo:owner:addr@0".into()];
+    let todo_m = manifest("todo");
     let r = step(
         rigs,
         vec![
@@ -141,12 +145,23 @@ fn setup(rigs: &mut [Rig], w: &mut [Wallet]) -> World {
             w[0].deploy(elf("token"), manifest("token")),
             w[0].deploy(elf("dex"), manifest("dex")),
             w[0].deploy(elf("todo"), todo_m),
+            w[0].deploy(elf("caller"), manifest("router1")),
+            w[0].deploy(elf("caller"), manifest("router2")),
         ],
     );
-    let [counter, token, dex, todo] = [0, 1, 2, 3].map(|i| deployed(&r[i]));
-    let mut txs: Vec<Transaction> = [counter, token, dex, todo]
+    let [counter, token, dex, todo, r1, r2] = [0, 1, 2, 3, 4, 5].map(|i| deployed(&r[i]));
+    let mut txs: Vec<Transaction> = [counter, token, dex, todo, r1, r2]
         .iter()
-        .map(|c| w[0].transfer(*c, 2_000_000_000))
+        .map(|c| {
+            w[0].transfer(
+                *c,
+                if [r1, r2].contains(c) {
+                    500_000_000
+                } else {
+                    2_000_000_000
+                },
+            )
+        })
         .collect();
     // two wallets are registered hosting nodes (relayers); the random blocks toggle them
     for h in [12, 13] {
@@ -155,6 +170,7 @@ fn setup(rigs: &mut [Rig], w: &mut [Wallet]) -> World {
         })));
     }
     txs.push(w[0].call(token, "init", &(1_000_000u128,)));
+    txs.push(w[0].call(token, "transfer", &(CodecAddress(r1), 100_000u128)));
     txs.push(w[0].call(dex, "add_liquidity", &(500_000u128, 500_000u128)));
     let r = step(rigs, txs);
     r.iter().for_each(ok);
@@ -163,6 +179,8 @@ fn setup(rigs: &mut [Rig], w: &mut [Wallet]) -> World {
         token,
         dex,
         todo,
+        r1,
+        r2,
     }
 }
 
@@ -198,7 +216,7 @@ fn random_block(
             // transfer-only block: hot recipients and disjoint pairs (fast path candidates)
             rng.below(3)
         } else {
-            rng.below(36)
+            rng.below(42)
         };
         let tx = match k {
             0 => w[i].transfer(to_hot, amt),
@@ -345,6 +363,54 @@ fn random_block(
                 }))
             }
             35 => w[i].transfer(w[12 + rng.below(2)].addr(), amt), // pay a relayer directly
+            36 => {
+                // router moves tokens it holds: the token sees the router as caller
+                let to = CodecAddress(w[j].addr());
+                w[i].call(
+                    c.r1,
+                    "forward_transfer",
+                    &(CodecAddress(c.token), to, (rng.next() % 3_000) as u128),
+                )
+            }
+            37 => {
+                // a callee abort (insufficient balance) must only revert the callee
+                let to = CodecAddress(w[j].addr());
+                let (from, amt) = if rng.below(2) == 0 {
+                    (c.r1, (rng.next() % 3_000) as u128)
+                } else {
+                    (c.r2, 5u128)
+                };
+                w[i].call(from, "try_transfer", &(CodecAddress(c.token), to, amt))
+            }
+            38 => w[i].call(c.r1, "chain", &(vec![CodecAddress(c.r2)],)),
+            // re-entrancy refused in the middle of a chain
+            39 => w[i].call(
+                c.r2,
+                "chain",
+                &(vec![CodecAddress(c.r1), CodecAddress(c.r2)],),
+            ),
+            40 => {
+                let n = (rng.next() % 800) as u32;
+                if rng.below(2) == 0 {
+                    w[i].call(c.r1, "grow_via", &(CodecAddress(c.r2), n))
+                } else {
+                    w[i].call(c.r2, "ident_m_via", &(CodecAddress(c.r1),))
+                }
+            }
+            41 => {
+                // gas forwarded to a callee, sometimes too little for it
+                let gas = if rng.below(2) == 0 { u64::MAX } else { 20_000 };
+                let (from, to) = if rng.below(2) == 0 {
+                    (c.r1, c.r2)
+                } else {
+                    (c.r2, c.r1)
+                };
+                w[i].call(
+                    from,
+                    "call_burn",
+                    &(CodecAddress(to), rng.next() % 3_000, gas),
+                )
+            }
             _ => w[i].call(c.counter, "increment", &(1u64,)),
         };
         txs.push(tx);
@@ -375,6 +441,12 @@ fn run_seed(seed: u64, blocks: usize) -> Vec<Rig> {
             .map(|t| matches!(t.body.kind, TxKind::Channel(_)))
             .collect();
         let rec = step(&mut rigs, txs);
+        CALL_OK.fetch_add(
+            rec.iter()
+                .filter(|r| r.status == Status::Success && r.output == vec![3])
+                .count(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         RELAYED.fetch_add(
             rec.iter().filter(|r| r.relayer.is_some()).count(),
             std::sync::atomic::Ordering::Relaxed,
@@ -418,6 +490,11 @@ fn parallel_equals_sequential_on_random_blocks() {
     assert!(fell_back > 0, "pool-touching blocks must fall back");
     let relayed = RELAYED.load(std::sync::atomic::Ordering::Relaxed);
     assert!(relayed > 20, "relayer-paying txs: {relayed}");
+    let reverted_callees = CALL_OK.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        reverted_callees > 5,
+        "reverted nested calls: {reverted_callees}"
+    );
     let ok = CHANNEL_OK.load(std::sync::atomic::Ordering::Relaxed);
     assert!(ok > 20, "successful channel txs: {ok}");
 }

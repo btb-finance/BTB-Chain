@@ -353,6 +353,18 @@ const t = {
     struct,
 };
 
+function queryRef(name, args, result) {
+    return { kind: "query", name, args, result };
+}
+function mutationRef(name, args, result) {
+    return { kind: "mutation", name, args, result };
+}
+function isFnRef(x) {
+    return typeof x === "object" && x !== null && "kind" in x && "name" in x && "args" in x && "result" in x;
+}
+
+
+
 
 class BtbError extends Error {
     status;
@@ -364,18 +376,83 @@ class BtbError extends Error {
         this.name = "BtbError";
     }
 }
+/**
+ * A contract function aborted the call (`abort("msg")`, or an `Err` returned by a function
+ * declared `-> btb_sdk::Result<T>`). `reason` is the contract's message.
+ */
+class ContractError extends BtbError {
+    reason;
+    constructor(
+    /** The message the contract aborted with. */
+    reason, status = 400) {
+        super(`aborted: ${reason}`, status);
+        this.reason = reason;
+        this.name = "ContractError";
+    }
+}
+/** Turn a failed HTTP response into a `ContractError` for aborts, else a `BtbError`. */
+function httpError(text, status) {
+    const message = errorMessage(text, status);
+    const m = /^aborted: ([\s\S]*)$/.exec(message);
+    return status === 400 && m ? new ContractError(m[1], status) : new BtbError(message, status);
+}
 class BtbClient {
     url;
     caller;
     fetchFn;
     ES;
     reconnectMs;
+    relayBase;
+    relayerHex;
     constructor(opts) {
         this.url = opts.url.replace(/\/+$/, "");
         this.caller = opts.caller;
         this.fetchFn = opts.fetch ?? ((...a) => globalThis.fetch(...a));
         this.ES = opts.EventSource === undefined ? (globalThis.EventSource ?? null) : opts.EventSource;
         this.reconnectMs = opts.reconnectMs ?? 1000;
+        this.relayBase = (opts.relayUrl ?? this.url.replace(/\/c\/[0-9a-fA-F]{64}$/, "")).replace(/\/+$/, "");
+        this.relayerHex = opts.relayer?.toLowerCase();
+    }
+    async relayRequest(path, init) {
+        let res;
+        try {
+            res = await this.fetchFn(`${this.relayBase}${path}`, init);
+        }
+        catch (e) {
+            throw new BtbError(`network error: ${e.message}`);
+        }
+        const text = await res.text();
+        if (!res.ok)
+            throw new BtbError(errorMessage(text, res.status), res.status);
+        return JSON.parse(text);
+    }
+    /** The relayer address (hex) and chain id of the relay host (`GET /relay`). */
+    async relayInfo() {
+        const j = await this.relayRequest("/relay", { method: "GET" });
+        return { relayer: j.relayer, chainId: BigInt(j.chain_id ?? -1) };
+    }
+    /**
+     * Sign a transaction that names the relay host as its relayer and submit it through the host
+     * (`POST /tx`), which forwards it to validators. The relayer is part of the signed body, so the
+     * host cannot change it. `seed` is the account's 32-byte Ed25519 seed.
+     */
+    async submit(args) {
+        if (this.relayerHex === undefined)
+            this.relayerHex = (await this.relayInfo()).relayer.toLowerCase();
+        const wire = await signTransaction({ chainId: args.chainId, nonce: args.nonce, relayer: fromHex(this.relayerHex), kind: args.kind }, args.seed);
+        return this.submitSigned(wire);
+    }
+    /** Submit an already signed transaction. The host accepts it only if it names the host as relayer. */
+    submitSigned(wire) {
+        return this.relayRequest("/tx", {
+            method: "POST",
+            headers: { "content-type": "text/plain" },
+            body: toHex(wire),
+        });
+    }
+    /** The receipt of a transaction, or `null` while the host has not executed its block. */
+    receipt(id) {
+        return this.relayRequest(`/tx/${id}`, { method: "GET" });
     }
     target(kind, name, args) {
         const q = new URLSearchParams();
@@ -398,22 +475,83 @@ class BtbClient {
         }
         const text = await res.text();
         if (!res.ok)
-            throw new BtbError(errorMessage(text, res.status), res.status);
+            throw httpError(text, res.status);
         return decode(resultType, fromHex(text.trim()));
     }
-    /** Run a query once. */
-    query(name, argsType, args, resultType) {
-        return this.call("query", name, argsType, args, resultType);
+    query(first, ...rest) {
+        if (isFnRef(first))
+            return this.call("query", first.name, first.args, (rest[0] ?? []), first.result);
+        const [argsType, args, resultType] = rest;
+        return this.call("query", first, argsType, args, resultType);
     }
-    /** Run a mutation; resolves with its result once committed. */
-    mutation(name, argsType, args, resultType) {
-        return this.call("mutation", name, argsType, args, resultType);
+    mutation(first, ...rest) {
+        if (isFnRef(first))
+            return this.call("mutation", first.name, first.args, (rest[0] ?? []), first.result);
+        const [argsType, args, resultType] = rest;
+        return this.call("mutation", first, argsType, args, resultType);
     }
     /**
-     * Watch a query: `onResult` gets the current result, then a new one each time it changes.
-     * Returns a function that stops the subscription.
+     * Run a query on a hosting node and get the result together with Merkle proofs of the storage
+     * keys it read (`?proof=1`). Check them with `verifyProof`. `incomplete` is true when the query
+     * also scanned key ranges, which a proof cannot cover (docs/HOSTING.md).
      */
-    subscribe(name, argsType, args, resultType, onResult, onError) {
+    async queryWithProof(name, argsType, args, resultType) {
+        const base = this.target("query", name, encode(argsType, args));
+        const url = `${base}${base.includes("?") ? "&" : "?"}proof=1`;
+        let res;
+        try {
+            res = await this.fetchFn(url, { method: "GET" });
+        }
+        catch (e) {
+            throw new BtbError(`network error: ${e.message}`);
+        }
+        const text = await res.text();
+        if (!res.ok)
+            throw new BtbError(errorMessage(text, res.status), res.status);
+        const j = JSON.parse(text);
+        return { result: decode(resultType, fromHex(j.result)), height: j.height, incomplete: j.incomplete, proof: j.proof };
+    }
+    /**
+     * Fetch a proof bundle for storage keys of the contract this client points at (a hosting node
+     * URL ending in `/c/<contract>`). `height` picks the state version; by default the newest one
+     * whose next block is provably committed.
+     */
+    async proof(keys, height) {
+        const m = /^(.*)\/c\/([0-9a-fA-F]{64})$/.exec(this.url);
+        if (!m)
+            throw new BtbError("proof() needs a hosting node url ending in /c/<contract>");
+        const q = new URLSearchParams({ key: keys.map(toHex).join(",") });
+        if (height !== undefined)
+            q.set("height", String(height));
+        let res;
+        try {
+            res = await this.fetchFn(`${m[1]}/proof/${m[2]}?${q}`, { method: "GET" });
+        }
+        catch (e) {
+            throw new BtbError(`network error: ${e.message}`);
+        }
+        const text = await res.text();
+        if (!res.ok)
+            throw new BtbError(errorMessage(text, res.status), res.status);
+        return JSON.parse(text);
+    }
+    subscribe(first, ...rest) {
+        let name;
+        let argsType;
+        let args;
+        let resultType;
+        let onResult;
+        let onError;
+        if (isFnRef(first)) {
+            name = first.name;
+            argsType = first.args;
+            resultType = first.result;
+            [args, onResult, onError] = rest;
+        }
+        else {
+            name = first;
+            [argsType, args, resultType, onResult, onError] = rest;
+        }
         const url = this.target("subscribe", name, encode(argsType, args));
         let closed = false;
         const deliver = (data) => {
@@ -456,7 +594,7 @@ class BtbClient {
                         signal: abort.signal,
                     });
                     if (!res.ok) {
-                        fail(new BtbError(errorMessage(await res.text(), res.status), res.status));
+                        fail(httpError(await res.text(), res.status));
                         if (res.status < 500)
                             return; // a bad request will not get better
                     }
@@ -519,7 +657,7 @@ async function readSse(body, onData) {
     }
 }
 
-return { BtbClient, BtbError, t, encode, decode, toHex, fromHex };
+return { BtbClient, BtbError, ContractError, queryRef, mutationRef, t, encode, decode, toHex, fromHex };
 })();
 </script>
 <!-- btb-client:end -->

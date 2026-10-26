@@ -176,6 +176,9 @@ fn header_call_numbers_match_abi() {
         ("BTB_PRICE", abi::PRICE),
         ("BTB_REPORT_REQUEST", abi::REPORT_REQUEST),
         ("BTB_PRICE_TWAP", abi::PRICE_TWAP),
+        ("BTB_CALL_CONTRACT", abi::CALL_CONTRACT),
+        ("BTB_CALL_QUERY", 0),
+        ("BTB_CALL_MUTATION", 1),
         ("BTB_PRICE_PAUSED", abi::PRICE_PAUSED),
         ("BTB_PRICE_BAD_WINDOW", abi::PRICE_BAD_WINDOW),
         ("BTB_TOKEN_OK", abi::TOKEN_OK),
@@ -215,4 +218,69 @@ fn header_call_numbers_match_abi() {
         "header has defines the test does not cover"
     );
     assert!(h.contains("#define BTB_NOT_FOUND UINT64_MAX") && abi::NOT_FOUND == u64::MAX);
+}
+
+/// The header's `btb_call_request` / `btb_call_contract` build the request the VM parses, and the
+/// status codes decode: scripted host, C caller.
+#[test]
+fn c_contract_can_call_another_contract() {
+    use btb_vm::host::parse_call;
+    use btb_vm::testing::MemHost;
+    use btb_vm::{CallEnd, CallReply};
+    let Some(elf) = elf() else { return };
+    let c = Contract::from_elf(elf).expect("valid contract");
+    let mut input = vec![0x42u8; 32];
+    input.push(1);
+    input.extend_from_slice(b"transfer");
+
+    let mut h = MemHost::default();
+    h.call_replies.push_back(CallReply {
+        end: CallEnd::Ok(vec![5, 6, 7]),
+        gas_used: 100,
+    });
+    let (out, gas) = run(&c, FunctionKind::Mutation, "relay", &input, &mut h);
+    assert_eq!(out, [5, 6, 7]);
+    assert!(gas > 3_000 + 100);
+    let (target, kind, f, args, forwarded, read_only, max) = h.calls_seen[0].clone();
+    assert_eq!(
+        (target, kind, f.as_str()),
+        ([0x42; 32], FunctionKind::Mutation, "transfer")
+    );
+    assert!(args.is_empty() && !read_only && max == 64);
+    // GAS_ALL was capped at what the C caller had left
+    assert!(forwarded > 9_000_000 && forwarded < GAS, "{forwarded}");
+    // the request the header built is the one the VM would parse
+    let mut req = input[..32].to_vec();
+    req.push(1);
+    req.extend_from_slice(&u64::MAX.to_le_bytes());
+    req.extend_from_slice(&8u32.to_le_bytes());
+    req.extend_from_slice(b"transfer");
+    assert_eq!(parse_call(&req).unwrap().3, "transfer");
+
+    // an error status aborts the C contract with the code
+    let mut h = MemHost::default();
+    h.call_replies
+        .push_back(CallReply::refused(CallEnd::Reentrant));
+    let e = c
+        .call(FunctionKind::Mutation, "relay", &input, &mut h, GAS, MEM)
+        .unwrap_err();
+    match e {
+        btb_vm::CallError::Trap {
+            trap: btb_vm::Trap::Abort(m),
+            ..
+        } => assert_eq!(m.as_bytes(), [6], "UINT64_MAX - CALL_REENTRANT"),
+        other => panic!("{other:?}"),
+    }
+    // a host that cannot run other contracts
+    let e = c
+        .call(
+            FunctionKind::Mutation,
+            "relay",
+            &input,
+            &mut MemHost::default(),
+            GAS,
+            MEM,
+        )
+        .unwrap_err();
+    assert!(matches!(e, btb_vm::CallError::Trap { .. }));
 }

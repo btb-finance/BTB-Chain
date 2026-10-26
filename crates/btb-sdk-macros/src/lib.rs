@@ -153,12 +153,53 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
         }
     };
     let call = quote! { #fn_name(#(#idents),*) };
-    let body = match sig.output {
-        ReturnType::Default => quote! { #call; },
-        ReturnType::Type(..) => quote! {
+    // `-> btb_sdk::Result<T>`: `Ok(v)` returns `v`, `Err(e)` aborts with the message.
+    let (ret_ty, fallible) = match &sig.output {
+        ReturnType::Default => (None, false),
+        ReturnType::Type(_, ty) => match result_ok_type(ty) {
+            Some(ok) => (Some(ok), true),
+            None => (Some(&**ty), false),
+        },
+    };
+    let body = match (&sig.output, fallible) {
+        (ReturnType::Default, _) => quote! { #call; },
+        (_, false) => quote! {
             let __result = #call;
             ::btb_sdk::__private::return_value(&__result);
         },
+        (_, true) => quote! {
+            match #call {
+                ::core::result::Result::Ok(__ok) => ::btb_sdk::__private::return_value(&__ok),
+                ::core::result::Result::Err(__err) => ::btb_sdk::__private::fail(__err),
+            }
+        },
+    };
+    // The schema marker: argument names and types, result type.
+    let mut arg_descs = Vec::new();
+    for (i, arg) in sig.inputs.iter().enumerate() {
+        if let FnArg::Typed(t) = arg {
+            let n = match &*t.pat {
+                syn::Pat::Ident(p) => p.ident.to_string().trim_start_matches('_').to_string(),
+                _ => String::new(),
+            };
+            let n = if n.is_empty() { format!("arg{i}") } else { n };
+            arg_descs.push(format!("{n}:{}", type_desc(&t.ty)?));
+        }
+    }
+    let ret_desc = match ret_ty {
+        Some(t) if !matches!(t, syn::Type::Tuple(tt) if tt.elems.is_empty()) => type_desc(t)?,
+        _ => String::new(),
+    };
+    let payload = format!(
+        "a={};r={ret_desc}{}",
+        arg_descs.join("|"),
+        if fallible { ";e=1" } else { "" }
+    );
+    let schema_sym = format_ident!("btb_schema_fn_{}_{}_{}", kind, name, hex(&payload));
+    let schema_marker = quote! {
+        #[doc(hidden)]
+        #[no_mangle]
+        pub extern "C" fn #schema_sym() {}
     };
     let marker = every_blocks.map(|n| {
         let sym = format_ident!("btb_every_{}_{}", n, name);
@@ -189,6 +230,96 @@ fn expand_entry(kind: &str, attr: TokenStream2, func: &ItemFn) -> syn::Result<To
 
         #marker
         #rand_marker
+        #schema_marker
+    })
+}
+
+fn hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `T` of `Result<T>` / `Result<T, E>` (any path ending in `Result`).
+fn result_ok_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(a) = &seg.arguments else {
+        return None;
+    };
+    match a.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// The schema text form of a `btb-codec` type (see `btb_runtime::schema::Ty`). Types the macro
+/// cannot see through become a name, resolved against the contract's tables on the host.
+fn type_desc(ty: &syn::Type) -> syn::Result<String> {
+    use syn::Type;
+    Ok(match ty {
+        Type::Paren(p) => type_desc(&p.elem)?,
+        Type::Group(g) => type_desc(&g.elem)?,
+        Type::Tuple(t) => {
+            let items: syn::Result<Vec<_>> = t.elems.iter().map(type_desc).collect();
+            format!("({})", items?.join(","))
+        }
+        Type::Array(a) => {
+            let n = match &a.len {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(i),
+                    ..
+                }) => i.base10_parse::<u32>()?,
+                other => {
+                    return Err(syn::Error::new(
+                        other.span(),
+                        "array lengths in tables and entry points must be integer literals",
+                    ))
+                }
+            };
+            format!("arr<{},{n}>", type_desc(&a.elem)?)
+        }
+        Type::Path(p) => {
+            let seg = p
+                .path
+                .segments
+                .last()
+                .ok_or_else(|| syn::Error::new(p.span(), "empty type path"))?;
+            let id = seg.ident.to_string();
+            let inner = || -> syn::Result<&syn::Type> {
+                match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(a) if a.args.len() == 1 => {
+                        match a.args.first() {
+                            Some(syn::GenericArgument::Type(t)) => Ok(t),
+                            _ => Err(syn::Error::new(seg.span(), "expected a type argument")),
+                        }
+                    }
+                    _ => Err(syn::Error::new(seg.span(), "expected one type argument")),
+                }
+            };
+            match id.as_str() {
+                "bool" | "u8" | "u16" | "u32" | "u64" | "u128" | "i8" | "i16" | "i32" | "i64"
+                | "i128" => id,
+                "String" => "string".into(),
+                "Address" | "Token" => "address".into(),
+                "Vec" => {
+                    let t = inner()?;
+                    match type_desc(t)?.as_str() {
+                        "u8" => "bytes".into(),
+                        d => format!("vec<{d}>"),
+                    }
+                }
+                "Option" => format!("opt<{}>", type_desc(inner()?)?),
+                _ => id,
+            }
+        }
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "this type cannot be encoded as a contract argument, result or table field",
+            ))
+        }
     })
 }
 
@@ -255,7 +386,13 @@ impl syn::parse::Parse for EntryArgs {
 
 /// Turn a struct into a table row: implements `Encode`/`Decode` (the tuple of its fields, in
 /// order) and `btb_sdk::table::Table` with the struct name as table name, which gives
-/// `insert`, `get`, `update`, `delete` and `scan`.
+/// `insert`, `get`, `update`, `delete`, `scan` and `filter`.
+///
+/// Fields may be marked `#[index]` (a secondary index, ordered by value) or `#[primary]` (an
+/// index whose value is unique; at most one per table). The macro exports the schema in the ELF
+/// (so the host and the chain register the indexes) and generates typed lookups:
+/// `Todo::by_owner(addr)`, `Todo::by_created_range(a..b)` and, for the primary key,
+/// `Todo::get_by_<field>(v)`. Each returns or yields `(id, row)`.
 #[proc_macro_attribute]
 pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
     let st = parse_macro_input!(item as ItemStruct);
@@ -267,19 +404,149 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    expand_table(&st)
-        .unwrap_or_else(|e| {
-            let e = e.to_compile_error();
-            quote!(#st #e)
-        })
+    expand_table(st)
+        .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
 
-fn expand_table(st: &ItemStruct) -> syn::Result<TokenStream2> {
+/// How an indexed field turns into a `Key`.
+struct KeyKind {
+    /// Argument type of `by_<field>(..)`.
+    eq_param: TokenStream2,
+    /// Key from the argument `v`.
+    eq_key: TokenStream2,
+    /// Element type of the range bounds of `by_<field>_range(..)`.
+    elem: TokenStream2,
+    /// Key from `v: &elem`.
+    ref_key: TokenStream2,
+}
+
+fn key_kind(desc: &str, ty: &syn::Type) -> Option<KeyKind> {
+    let k = |eq_param: TokenStream2, eq_key, elem: TokenStream2, ref_key| KeyKind {
+        eq_param,
+        eq_key,
+        elem,
+        ref_key,
+    };
+    Some(match desc {
+        "u8" | "u16" | "u32" | "u64" | "bool" => k(
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::U64(v as u64)),
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::U64(*v as u64)),
+        ),
+        "i8" | "i16" | "i32" | "i64" => k(
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::I64(v as i64)),
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::I64(*v as i64)),
+        ),
+        "u128" => k(
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::U128(v)),
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::U128(*v)),
+        ),
+        "string" => k(
+            quote!(&str),
+            quote!(::btb_sdk::host::Key::Str(v)),
+            quote!(::btb_sdk::__private::String),
+            quote!(::btb_sdk::host::Key::Str(v.as_str())),
+        ),
+        "address" => k(
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::Bytes(&v.0)),
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::Bytes(&v.0)),
+        ),
+        "bytes" => k(
+            quote!(&[u8]),
+            quote!(::btb_sdk::host::Key::Bytes(v)),
+            quote!(::btb_sdk::__private::Vec<u8>),
+            quote!(::btb_sdk::host::Key::Bytes(v.as_slice())),
+        ),
+        d if d.starts_with("arr<u8,") => k(
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::Bytes(&v)),
+            quote!(#ty),
+            quote!(::btb_sdk::host::Key::Bytes(v)),
+        ),
+        _ => return None,
+    })
+}
+
+/// `T` of `Option<T>`, else the type itself.
+fn unwrap_option(ty: &syn::Type) -> &syn::Type {
+    if let syn::Type::Path(p) = ty {
+        if let Some(seg) = p.path.segments.last() {
+            if seg.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(a) = &seg.arguments {
+                    if let Some(syn::GenericArgument::Type(t)) = a.args.first() {
+                        return t;
+                    }
+                }
+            }
+        }
+    }
+    ty
+}
+
+fn expand_table(mut st: ItemStruct) -> syn::Result<TokenStream2> {
     if !st.generics.params.is_empty() {
         return Err(syn::Error::new(
             st.generics.span(),
             "tables cannot be generic",
+        ));
+    }
+    // Field attributes `#[index]` and `#[primary]` are ours: read them, then remove them.
+    let mut indexed: Vec<(usize, bool)> = Vec::new(); // (field position, primary)
+    let mut descs: Vec<(String, String)> = Vec::new();
+    for (pos, f) in st.fields.iter_mut().enumerate() {
+        let (mut idx, mut pri) = (false, false);
+        let mut keep = Vec::new();
+        for a in f.attrs.drain(..) {
+            if a.path().is_ident("index") {
+                a.meta.require_path_only()?;
+                idx = true;
+            } else if a.path().is_ident("primary") {
+                a.meta.require_path_only()?;
+                pri = true;
+            } else {
+                keep.push(a);
+            }
+        }
+        f.attrs = keep;
+        let name = f
+            .ident
+            .as_ref()
+            .map_or_else(|| format!("f{pos}"), |i| i.to_string());
+        if (idx || pri) && f.ident.is_none() {
+            return Err(syn::Error::new(
+                f.span(),
+                "#[index] and #[primary] need a named field",
+            ));
+        }
+        if idx && pri {
+            return Err(syn::Error::new(
+                f.span(),
+                "#[primary] already indexes the field",
+            ));
+        }
+        if idx || pri {
+            indexed.push((pos, pri));
+        }
+        descs.push((name, type_desc(&f.ty)?));
+    }
+    if indexed.iter().filter(|(_, p)| *p).count() > 1 {
+        return Err(syn::Error::new(
+            st.ident.span(),
+            "a table has at most one #[primary] field",
+        ));
+    }
+    if indexed.len() > 8 {
+        return Err(syn::Error::new(
+            st.ident.span(),
+            "a table has at most 8 indexes",
         ));
     }
     let name = &st.ident;
@@ -303,6 +570,91 @@ fn expand_table(st: &ItemStruct) -> syn::Result<TokenStream2> {
         }
         Fields::Unit => (quote! {}, quote! { Ok(#name) }),
     };
+
+    // Schema marker.
+    let fields_txt = descs
+        .iter()
+        .map(|(n, d)| format!("{n}:{d}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let idx_txt = indexed
+        .iter()
+        .filter(|(_, p)| !*p)
+        .map(|(pos, _)| descs[*pos].0.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    let pri_txt = indexed
+        .iter()
+        .find(|(_, p)| *p)
+        .map(|(pos, _)| descs[*pos].0.clone())
+        .unwrap_or_default();
+    let payload = format!("f={fields_txt};i={idx_txt};p={pri_txt}");
+    let schema_sym = format_ident!("btb_schema_table_{}_{}", table_name, hex(&payload));
+
+    // Typed lookups.
+    let mut lookups = Vec::new();
+    for (pos, primary) in &indexed {
+        let field = st.fields.iter().nth(*pos).expect("position is valid");
+        let fid = field.ident.as_ref().expect("named");
+        let fname = fid.to_string();
+        let inner_ty = unwrap_option(&field.ty);
+        let desc = type_desc(inner_ty)?;
+        let Some(kk) = key_kind(&desc, inner_ty) else {
+            return Err(syn::Error::new(
+                field.ty.span(),
+                "this field type cannot be indexed (use integers up to u64/i64, u128, bool, String, Address, [u8; N] or Vec<u8>)",
+            ));
+        };
+        let (eq_param, eq_key, elem, ref_key) = (kk.eq_param, kk.eq_key, kk.elem, kk.ref_key);
+        let by = format_ident!("by_{}", fid);
+        let by_range = format_ident!("by_{}_range", fid);
+        let doc_by = format!("Rows whose `{fname}` equals `v`, ordered by id.");
+        let doc_range =
+            format!("Rows whose `{fname}` is in `range`, ordered by `{fname}` then id.");
+        lookups.push(quote! {
+            #[doc = #doc_by]
+            pub fn #by(v: #eq_param) -> ::btb_sdk::table::Lookup<Self> {
+                ::btb_sdk::table::Lookup::eq(#fname, #eq_key)
+            }
+
+            #[doc = #doc_range]
+            pub fn #by_range<R: ::core::ops::RangeBounds<#elem>>(
+                range: R,
+            ) -> ::btb_sdk::table::Lookup<Self> {
+                use ::core::ops::Bound as B;
+                let conv = |b: B<&#elem>| match b {
+                    B::Unbounded => ::btb_sdk::table::OwnedBound::Unbounded,
+                    B::Included(v) => ::btb_sdk::table::OwnedBound::Included(
+                        ::btb_sdk::table::OwnedKey::of(#ref_key),
+                    ),
+                    B::Excluded(v) => ::btb_sdk::table::OwnedBound::Excluded(
+                        ::btb_sdk::table::OwnedKey::of(#ref_key),
+                    ),
+                };
+                ::btb_sdk::table::Lookup::range(
+                    #fname,
+                    conv(range.start_bound()),
+                    conv(range.end_bound()),
+                )
+            }
+        });
+        if *primary {
+            let get = format_ident!("get_by_{}", fid);
+            let doc = format!("The row whose primary key `{fname}` is `v`, with its id.");
+            lookups.push(quote! {
+                #[doc = #doc]
+                pub fn #get(v: #eq_param) -> ::core::option::Option<(u64, Self)> {
+                    Self::#by(v).limit(1).next()
+                }
+            });
+        }
+    }
+    let lookups_impl = if lookups.is_empty() {
+        quote! {}
+    } else {
+        quote! { impl #name { #(#lookups)* } }
+    };
+
     Ok(quote! {
         #st
 
@@ -325,5 +677,11 @@ fn expand_table(st: &ItemStruct) -> syn::Result<TokenStream2> {
         impl ::btb_sdk::table::Table for #name {
             const NAME: &'static str = #table_name;
         }
+
+        #lookups_impl
+
+        #[doc(hidden)]
+        #[no_mangle]
+        pub extern "C" fn #schema_sym() {}
     })
 }

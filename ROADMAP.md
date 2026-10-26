@@ -60,6 +60,9 @@ The full developer experience on one node, so developers can build real apps.
 - [x] Example apps: token launcher, simple DEX, NFT market
   - [examples/launcher](examples/launcher), [examples/dex](examples/dex), [examples/nft](examples/nft) (escrow-based market), each with a live web page served by `btb dev` and a Playwright smoke script, see [examples/README-web.md](examples/README-web.md)
 
+- [x] Convex-style DX: declared indexes, typed lookups, generated TS API
+  - `#[btb::table]` fields carry `#[index]` / `#[primary]` (unique); the schema (tables, indexes, function signatures) is exported in the ELF and read by `btb dev`, `btb deploy` and the chain, so `Cargo.toml` metadata is deprecated; generated lookups `Todo::by_owner(addr).order(..).limit(..).after(..)`, `by_<field>_range`, `get_by_<primary>`, `filter`; `-> btb_sdk::Result<T>` with `ensure!` aborts with a message that `@btb/client` raises as `ContractError`; `btb build` writes `target/btb/<name>.schema.json` and `btb codegen --ts` generates the typed `api` used as `client.query(api.list_mine)` / `useQuery(api.list_mine)`. See [docs/LANGUAGE.md](docs/LANGUAGE.md#tables-indexes-and-lookups), [docs/CLI.md](docs/CLI.md#btb-codegen), [docs/TS_SDK.md](docs/TS_SDK.md#typed-clients-from-the-contract-schema); [examples/todo](examples/todo) and [examples/nft](examples/nft) use them
+
 **Gate:** an outside developer ships a working app and it feels like Convex.
 
 ## Phase 4 — Multi-validator testnet

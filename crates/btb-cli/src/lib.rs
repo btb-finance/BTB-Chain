@@ -3,9 +3,11 @@
 //! Everything is a plain function here so tests can drive it; `main.rs` only parses arguments.
 
 pub mod chain;
+pub mod codegen;
 pub mod storage;
 
 use btb_dev::{IndexSpec, Server};
+use btb_runtime::schema::Schema;
 use btb_vm::{Contract, EntryPoint};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -194,6 +196,8 @@ pub struct Built {
     pub entry_points: Vec<EntryPoint>,
     /// `(function, every_blocks)` from the `#[btb::cron(every = "N blocks")]` marker symbols.
     pub crons: Vec<(String, u64)>,
+    /// Tables, indexes and function signatures the contract declares (its ELF markers).
+    pub schema: Schema,
 }
 
 /// Cron schedules from the `btb_every_<N>_<name>` marker symbols, sorted by function.
@@ -271,13 +275,58 @@ pub fn build(project: &Path) -> Result<Built, String> {
     fs::write(&elf_path, &elf).map_err(io)?;
     let entry_points = contract.entry_points().to_vec();
     let crons = cron_schedules(&elf, &entry_points)?;
+    let schema = Schema::from_elf(&elf)?;
+    fs::write(
+        out_dir.join(format!("{name}.schema.json")),
+        codegen::schema_json(&name, &schema),
+    )
+    .map_err(io)?;
     Ok(Built {
         name,
         elf_path,
         elf,
         entry_points,
         crons,
+        schema,
     })
+}
+
+/// The deprecated `[package.metadata.btb] indexes` specs that still apply: those for tables the
+/// contract does not declare itself with `#[btb::table]`. Warns when the section is present.
+pub fn legacy_indexes(project: &Path, schema: &Schema) -> Result<Vec<IndexSpec>, String> {
+    let all = project_indexes(project)?;
+    if all.is_empty() {
+        return Ok(all);
+    }
+    eprintln!(
+        "btb: warning: [package.metadata.btb] indexes is deprecated; declare indexes with #[index] \
+         or #[primary] on the fields of a #[btb::table] struct"
+    );
+    let (declared, keep): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|i| schema.table(&i.table).is_some());
+    for i in declared {
+        eprintln!(
+            "btb: warning: ignoring metadata index {}:{}: the contract declares table {}",
+            i.table, i.index, i.table
+        );
+    }
+    Ok(keep)
+}
+
+/// Build the project and write the typed client modules (`api.ts`, `api.js`, `api.d.ts`) to
+/// `out_dir`. Returns the files written and any functions that were skipped.
+pub fn codegen_ts(project: &Path, out_dir: &Path) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let b = build(project)?;
+    let g = codegen::typescript(&b.name, &b.schema);
+    fs::create_dir_all(out_dir).map_err(io)?;
+    let mut written = Vec::new();
+    for (file, text) in [("api.ts", &g.ts), ("api.js", &g.js), ("api.d.ts", &g.dts)] {
+        let p = out_dir.join(file);
+        fs::write(&p, text).map_err(|e| format!("write {}: {e}", p.display()))?;
+        written.push(p);
+    }
+    Ok((written, g.warnings))
 }
 
 /// `kind name` per entry point, e.g. `query list_mine`.
@@ -364,7 +413,7 @@ pub fn manifest_json(b: &Built, indexes: &[IndexSpec]) -> String {
 /// `target/btb/deploy/`. There is no chain to deploy to yet (Phase 4).
 pub fn deploy(project: &Path) -> Result<(Built, PathBuf), String> {
     let b = build(project)?;
-    let indexes = project_indexes(project)?;
+    let indexes = legacy_indexes(project, &b.schema)?;
     let dir = project.join("target/btb/deploy");
     fs::create_dir_all(&dir).map_err(io)?;
     fs::write(dir.join(format!("{}.elf", b.name)), &b.elf).map_err(io)?;
@@ -420,14 +469,12 @@ impl DevSession {
         data: Option<&str>,
     ) -> Result<DevSession, String> {
         let project = project.to_path_buf();
-        let mut indexes = project_indexes(&project)?;
-        if indexes.is_empty() {
-            eprintln!(
-                "btb: no [package.metadata.btb] indexes in Cargo.toml; no index is registered"
-            );
-        }
         let before = fingerprint(&project);
         let b = build(&project)?;
+        let mut indexes = legacy_indexes(&project, &b.schema)?;
+        if indexes.is_empty() && b.schema.tables.is_empty() {
+            eprintln!("btb: the contract declares no #[btb::table], so no index is registered");
+        }
         print_entries(&b);
         let server = match data {
             None => Server::start(
@@ -521,5 +568,24 @@ pub fn print_entries(b: &Built) {
     println!("{} ({} bytes), entry points:", b.name, b.elf.len());
     for l in describe(&b.entry_points) {
         println!("  {l}");
+    }
+    for t in &b.schema.tables {
+        let idx = if t.indexes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (indexes: {})",
+                t.indexes
+                    .iter()
+                    .map(|i| if t.primary.as_ref() == Some(i) {
+                        format!("{i} primary")
+                    } else {
+                        i.clone()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        println!("  table {}{idx}", t.name);
     }
 }

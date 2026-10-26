@@ -7,9 +7,9 @@ use std::process::ExitCode;
 const USAGE: &str =
     "usage: btb-dev <contract.elf> [--port N] [--index Table:index:addr@offset]... [--fields Table:addr,bool,...]... [--data DIR]\n\
   --port N     listen on 127.0.0.1:N (default 8787; 0 = pick a free port)\n\
-  --index SPEC temporary schema registration, e.g. Todo:owner:addr@0 (see docs/DEV_SERVER.md);\n\
-               without any --index, Todo:owner:addr@0 is registered for the todo demo\n\
-  --fields SPEC dashboard decode hint, e.g. Todo:addr,bool,string (default for the demo)\n\
+  --index SPEC DEPRECATED, e.g. Todo:owner:addr@0: contracts declare indexes with #[index] on\n\
+               a #[btb::table] field; this only applies to tables the ELF does not declare\n\
+  --fields SPEC dashboard decode hint, e.g. Todo:addr,bool,string (derived from the schema)\n\
   --data DIR   keep state in RocksDB at DIR (needs --features rocksdb); default is memory";
 
 fn main() -> ExitCode {
@@ -47,10 +47,15 @@ fn run() -> Result<(), String> {
     }
     let elf = elf.ok_or("missing contract.elf")?;
     let bytes = std::fs::read(&elf).map_err(|e| format!("read {elf}: {e}"))?;
-    if indexes.is_empty() {
+    // Contracts declare their tables and indexes (`#[btb::table]`); the old todo defaults only
+    // apply to a contract that declares nothing.
+    let declared = !btb_runtime::schema::Schema::from_elf(&bytes)?
+        .tables
+        .is_empty();
+    if indexes.is_empty() && !declared {
         indexes.push(IndexSpec::parse("Todo:owner:addr@0")?);
     }
-    if fields.is_empty() {
+    if fields.is_empty() && !declared {
         fields.push(parse_fields("Todo:addr,bool,string")?);
     }
     let handle = match data {

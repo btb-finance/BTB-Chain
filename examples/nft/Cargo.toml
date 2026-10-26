@@ -21,7 +21,3 @@ debug = false
 
 [profile.dev]
 panic = "abort"
-
-# Temporary host-side index declarations (see docs/DEV_SERVER.md): `btb dev` registers them.
-[package.metadata.btb]
-indexes = ["Nft:owner:addr@0"]

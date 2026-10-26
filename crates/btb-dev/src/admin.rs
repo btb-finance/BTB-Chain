@@ -225,16 +225,17 @@ fn overview<S: KvStore>(sh: &Shared<S>) -> Reply {
     let st = sh.state.lock().unwrap();
     let store = st.occ.store();
     let tables = discover(store)?;
-    let fields = sh.fields.read().unwrap();
     let mut t = Vec::new();
     for (name, n) in &tables {
         let idx: Vec<String> = sh
             .tables
+            .read()
+            .unwrap()
             .index_names(&CONTRACT, name.as_bytes())
             .iter()
             .map(|i| js(i))
             .collect();
-        let f = fields.get(name).map_or("null".to_string(), |f| {
+        let f = sh.hint(name).map_or("null".to_string(), |f| {
             format!(
                 "[{}]",
                 f.iter().map(|x| js(x)).collect::<Vec<_>>().join(",")
@@ -270,11 +271,11 @@ fn table_rows<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str) -> Reply {
         return Err(("404 Not Found", format!("no such table {table:?}")));
     };
     let page = scan_table(store, &CONTRACT, table.as_bytes(), &opts(req)?).map_err(fault)?;
-    let fields = sh.fields.read().unwrap();
+    let hint = sh.hint(table);
     let rows: Vec<String> = page
         .rows
         .iter()
-        .map(|r| row_json(fields.get(table), r.id, &r.data))
+        .map(|r| row_json(hint.as_ref(), r.id, &r.data))
         .collect();
     Ok(format!(
         "{{\"table\":{},\"total\":{total},\"rows\":[{}],\"next_cursor\":{}}}",
@@ -284,16 +285,7 @@ fn table_rows<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str) -> Reply {
     ))
 }
 
-fn index_value(
-    specs: &[IndexSpec],
-    table: &str,
-    index: &str,
-    v: &str,
-) -> Result<IndexValue, String> {
-    let addr = specs
-        .iter()
-        .find(|i| i.table == table && i.index == index)
-        .map(|i| i.addr);
+fn index_value(addr: Option<bool>, v: &str) -> Result<IndexValue, String> {
     match (addr, v.len() == 64, v.parse::<u64>()) {
         (Some(true), _, _) | (None, true, _) => demo::unhex(v)
             .filter(|b| b.len() == 32)
@@ -309,6 +301,8 @@ fn index_browse<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str, index: &
     let store = st.occ.store();
     if !sh
         .tables
+        .read()
+        .unwrap()
         .index_names(&CONTRACT, table.as_bytes())
         .iter()
         .any(|i| i == index)
@@ -316,15 +310,15 @@ fn index_browse<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str, index: &
         return Err(("404 Not Found", "no such index".into()));
     }
     let o = opts(req)?;
-    let fields = sh.fields.read().unwrap();
+    let hint = sh.hint(table);
     if let Some(v) = req.query.get("value").filter(|v| !v.is_empty()) {
-        let value = index_value(&sh.indexes, table, index, v).map_err(bad)?;
+        let value = index_value(sh.index_is_addr(table, index), v).map_err(bad)?;
         let page =
             by_index_eq(store, &CONTRACT, table.as_bytes(), index, &value, &o).map_err(fault)?;
         let rows: Vec<String> = page
             .rows
             .iter()
-            .map(|r| row_json(fields.get(table), r.id, &r.data))
+            .map(|r| row_json(hint.as_ref(), r.id, &r.data))
             .collect();
         return Ok(format!(
             "{{\"table\":{},\"index\":{},\"value\":{},\"rows\":[{}],\"next_cursor\":{}}}",
@@ -457,11 +451,7 @@ fn one_row<S: KvStore>(sh: &Shared<S>, table: &str, id: &str) -> Reply {
     let Some(r) = row else {
         return Err(("404 Not Found", "no such row".into()));
     };
-    Ok(row_json(
-        sh.fields.read().unwrap().get(table),
-        r.id,
-        &r.data,
-    ))
+    Ok(row_json(sh.hint(table).as_ref(), r.id, &r.data))
 }
 
 /// Serve `GET /admin/...` (everything except the SSE stream).

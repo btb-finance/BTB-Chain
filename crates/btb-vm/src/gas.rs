@@ -137,3 +137,14 @@ pub const HOST_TWAP_MUTATION: u64 = HOST_TWAP_QUERY + TWAP_READ_FEE;
 /// of gossip, so it is priced well above a storage write.
 pub const HOST_REPORT_REQUEST: u64 = 5_000;
 pub const REPORT_BYTE: u64 = 10;
+
+// ---- Cross-contract calls -------------------------------------------------------------------
+
+/// `call_contract(req_ptr, req_len, out_ptr, out_cap)`: base plus `CALL_BYTE` per request byte,
+/// charged first. It covers loading the callee's code and a fresh VM memory image. On top of it
+/// the caller pays, exactly, the gas the callee used (at most the forwarded gas), then
+/// `CALL_RETURN_BYTE` per output byte copied back, charged before the copy. Gas the callee did
+/// not use stays with the caller. A refused call (trap) costs the base only.
+pub const HOST_CALL_CONTRACT: u64 = 3_000;
+pub const CALL_BYTE: u64 = 2;
+pub const CALL_RETURN_BYTE: u64 = 1;

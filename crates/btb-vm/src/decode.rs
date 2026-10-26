@@ -20,6 +20,9 @@ pub enum Trap {
     RandomnessForbidden,
     /// `random_bytes` where the chain has no randomness beacon for this execution.
     RandomnessUnavailable,
+    /// `call_contract` named a target the callee rules refuse (a randomness-marked function, an
+    /// HTTPS action callback, a kind that cannot be called). Carries the reason.
+    CallForbidden(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

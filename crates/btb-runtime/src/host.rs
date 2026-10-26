@@ -12,9 +12,31 @@ use crate::layout::{self, IndexValue};
 use crate::query::{self, Cursor, Order, QueryOptions};
 use crate::readset::ReadSet;
 use crate::tables::{TableError, Tables};
-use btb_vm::host::{Address, Host, IndexBound, IndexKey, IndexScan, IndexScanPage};
+use btb_vm::decode::Trap;
+use btb_vm::host::{
+    abi, Address, CallEnd, CallReply, CallRequest, Host, IndexBound, IndexKey, IndexScan,
+    IndexScanPage,
+};
 use btb_vm::token::{TokenId, TokenInfo, TokenStore};
+use btb_vm::{CallError, Contract, FunctionKind};
+use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::Arc;
+
+/// A contract loaded for a nested call.
+pub struct Callee {
+    pub contract: Arc<Contract>,
+    /// The callee's table schemas, when the host's registry does not already hold them (the
+    /// parallel executor registers lazily); merged into the running host's registry.
+    pub tables: Option<Tables>,
+}
+
+/// Finds the code of a contract for `call_contract`. It reads through `kv` (the running call's
+/// overlay) so that the read is tracked and sees this block's earlier writes. `Ok(None)`: no
+/// contract at `addr`.
+pub trait Resolver {
+    fn resolve(&self, kv: &dyn KvStore, addr: &Address) -> Result<Option<Callee>, KvError>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
@@ -64,6 +86,15 @@ pub struct RuntimeHost<'a, S: KvStore> {
     random: Option<btb_vm::rand::RandomSource>,
     /// Reports queued by this call (capped at `layout::MAX_REPORTS_PER_CALL`).
     reports: u32,
+    /// Cross-contract calls: where to find code, the memory of a callee's VM, the contracts
+    /// below the running frame (outermost first) and the tables of callees merged in.
+    resolver: Option<&'a dyn Resolver>,
+    vm_memory: usize,
+    ancestors: Vec<Address>,
+    extra_tables: Option<Tables>,
+    /// Net metered bytes of each contract already settled into its deposit (see
+    /// `settle_contract`).
+    settled: BTreeMap<Address, i128>,
 }
 
 impl<'a, S: KvStore> RuntimeHost<'a, S> {
@@ -85,7 +116,20 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             rand_tx: None,
             random: None,
             reports: 0,
+            resolver: None,
+            vm_memory: 1 << 20,
+            ancestors: Vec::new(),
+            extra_tables: None,
+            settled: BTreeMap::new(),
         }
+    }
+
+    /// Let the running contract call others (`call_contract`): `resolver` finds their code and
+    /// each callee gets a fresh VM with `vm_memory` bytes. Without this the call returns
+    /// `abi::CALL_UNSUPPORTED`.
+    pub fn enable_calls(&mut self, resolver: &'a dyn Resolver, vm_memory: usize) {
+        self.resolver = Some(resolver);
+        self.vm_memory = vm_memory;
     }
 
     /// Development hosts (`btb dev`) have no beacon: derive from a fixed, public `seed`
@@ -115,39 +159,42 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             return Err(f);
         }
         if !self.read_only {
-            self.settle_deposit()?;
+            self.settle_contract(self.contract)?;
         }
         Ok(self.kv.into_parts())
     }
 
-    /// Storage deposit: compare the contract's metered bytes before and after the call. Growth
-    /// locks `delta * DEPOSIT_PER_BYTE` from the contract's balance into its deposit record;
-    /// shrinkage returns that amount to the balance. Fails (no state change, the batch is
-    /// never produced) if the balance is too low.
-    fn settle_deposit(&mut self) -> Result<(), Fault> {
-        let c = self.contract;
-        let (mut grown, mut freed) = (0u64, 0u64);
+    /// Storage deposit of `c`: compare its metered bytes in the pending writes with the base.
+    /// Growth since the last settlement of `c` locks `delta * DEPOSIT_PER_BYTE` from its balance
+    /// into its deposit record; shrinkage returns the proportional share to the balance. Fails
+    /// (the caller discards the writes) if the balance is too low. Incremental, so a contract
+    /// that is called several times in one transaction (or settles at the end of a nested call
+    /// and again at the end of the transaction) is charged each byte once.
+    fn settle_contract(&mut self, c: Address) -> Result<(), Fault> {
         let mut changes = Vec::new();
         for (k, v) in self.kv.pending() {
             if layout::is_metered(k) && layout::key_contract(k) == Some(&c[..]) {
                 changes.push((k.clone(), v.as_ref().map_or(0, |v| k.len() + v.len())));
             }
         }
+        let mut net: i128 = 0;
         for (k, new) in changes {
             let old = match self.kv.base_get(&k) {
                 Ok(v) => v.map_or(0, |v| k.len() + v.len()),
                 Err(e) => return Err(Fault::Kv(e)),
             };
-            let (new, old) = (new as u64, old as u64);
-            if new >= old {
-                grown = grown.checked_add(new - old).ok_or(Fault::DepositOverflow)?;
-            } else {
-                freed = freed.checked_add(old - new).ok_or(Fault::DepositOverflow)?;
-            }
+            net += new as i128 - old as i128;
         }
-        if grown == freed {
+        let delta = net - self.settled.get(&c).copied().unwrap_or(0);
+        if delta == 0 {
             return Ok(());
         }
+        let magnitude = u64::try_from(delta.unsigned_abs()).map_err(|_| Fault::DepositOverflow)?;
+        let (grown, freed) = if delta > 0 {
+            (magnitude, 0)
+        } else {
+            (0, magnitude)
+        };
         let read = |h: &mut Self, key: Vec<u8>| -> Result<u64, Fault> {
             let r = h.kv.get(&key).map_err(Fault::Kv)?;
             Ok(r.and_then(|b| <[u8; 8]>::try_from(b).ok())
@@ -190,6 +237,7 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
         ] {
             self.kv.put(&k, &v.to_le_bytes()).map_err(Fault::Kv)?;
         }
+        self.settled.insert(c, net);
         Ok(())
     }
 
@@ -381,6 +429,125 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         }
     }
 
+    fn call_contract(&mut self, req: &CallRequest<'_>) -> CallReply {
+        let refused = CallReply::refused;
+        let Some(resolver) = self.resolver else {
+            return refused(CallEnd::Unsupported);
+        };
+        let read_only = self.read_only || req.read_only;
+        if read_only && req.kind == FunctionKind::Mutation {
+            return refused(CallEnd::Forbidden(Trap::WriteInQuery));
+        }
+        // Re-entering a contract that is already on the stack (the caller included) is
+        // refused; so is nesting past the depth limit (the entry point is frame 1).
+        if req.target == self.contract || self.ancestors.contains(&req.target) {
+            return refused(CallEnd::Reentrant);
+        }
+        if self.ancestors.len() + 2 > abi::MAX_CALL_DEPTH {
+            return refused(CallEnd::Depth);
+        }
+        let callee = match resolver.resolve(&self.kv, &req.target) {
+            Ok(Some(c)) => c,
+            Ok(None) => return refused(CallEnd::NoContract),
+            Err(e) => {
+                self.note(Fault::Kv(e));
+                return refused(CallEnd::Trapped);
+            }
+        };
+        let code = callee.contract;
+        if !code.has_entry(req.kind, req.function) {
+            return refused(CallEnd::NoFunction);
+        }
+        if req.kind == FunctionKind::Mutation && code.is_action_callback(req.function) {
+            return refused(CallEnd::Forbidden(Trap::CallForbidden(
+                "an HTTPS action callback cannot be called by a contract",
+            )));
+        }
+        if code.is_randomness(req.kind, req.function) {
+            return refused(CallEnd::Forbidden(Trap::RandomnessForbidden));
+        }
+        if let Some(t) = &callee.tables {
+            let base = self.tables;
+            self.extra_tables
+                .get_or_insert_with(|| base.clone())
+                .absorb(t);
+        }
+
+        // The frame: its own writes can be undone, and its caller's state comes back after.
+        let sp = self.kv.savepoint();
+        let settled = self.settled.clone();
+        let outer_fault = self.fault.take();
+        let (outer_contract, outer_caller, outer_read_only) =
+            (self.contract, self.caller, self.read_only);
+        self.ancestors.push(outer_contract);
+        self.caller = outer_contract;
+        self.contract = req.target;
+        self.read_only = read_only || req.kind == FunctionKind::Query;
+        let ran = code.call(
+            req.kind,
+            req.function,
+            req.args,
+            self,
+            req.gas,
+            self.vm_memory,
+        );
+        self.ancestors.pop();
+        self.contract = outer_contract;
+        self.caller = outer_caller;
+        self.read_only = outer_read_only;
+        let frame_fault = self.fault.take();
+        self.fault = outer_fault;
+
+        let (mut end, used) = match ran {
+            Ok(o) => (CallEnd::Ok(o.output), o.gas_used),
+            Err(CallError::Trap { trap, gas_used }) => match trap {
+                Trap::OutOfGas => (CallEnd::OutOfGas, req.gas),
+                Trap::Abort(_) => (CallEnd::Aborted, gas_used),
+                _ => (CallEnd::Trapped, gas_used),
+            },
+            Err(CallError::NoSuchEntry { .. }) => (CallEnd::NoFunction, 0),
+            Err(_) => (CallEnd::Trapped, 0),
+        };
+        if let CallEnd::Ok(out) = &end {
+            if out.len() > req.max_output {
+                end = CallEnd::OutputTooLarge;
+            }
+        }
+        if let Some(f) = frame_fault {
+            if matches!(end, CallEnd::Ok(_)) {
+                end = CallEnd::Trapped;
+            }
+            // A storage backend failure cannot be reverted around: it fails the transaction.
+            if matches!(f, Fault::Kv(_)) {
+                self.note(f);
+            }
+        }
+        if matches!(end, CallEnd::Ok(_)) && !(read_only || req.kind == FunctionKind::Query) {
+            // The callee pays for the bytes it grew; a balance that cannot cover them fails
+            // the call, not the caller.
+            match self.settle_contract(req.target) {
+                Ok(()) => {}
+                Err(Fault::InsufficientDeposit { .. }) => end = CallEnd::Deposit,
+                Err(f) => {
+                    if matches!(f, Fault::Kv(_)) {
+                        self.note(f);
+                    }
+                    end = CallEnd::Trapped;
+                }
+            }
+        }
+        if matches!(end, CallEnd::Ok(_)) {
+            self.kv.release(sp);
+        } else {
+            self.kv.rollback(sp);
+            self.settled = settled;
+        }
+        CallReply {
+            end,
+            gas_used: used.min(req.gas),
+        }
+    }
+
     fn tokens(&mut self) -> Option<&mut dyn TokenStore> {
         Some(self)
     }
@@ -435,7 +602,8 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         true
     }
     fn table_insert(&mut self, table: &[u8], row: &[u8]) -> u64 {
-        let (t, c) = (self.tables, self.contract);
+        let t = self.extra_tables.as_ref().unwrap_or(self.tables);
+        let c = self.contract;
         let r = t.insert(&mut self.kv, &c, table, row);
         self.tbl(r)
     }
@@ -444,12 +612,14 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         self.tbl(r)
     }
     fn table_update(&mut self, table: &[u8], id: u64, row: &[u8]) -> bool {
-        let (t, c) = (self.tables, self.contract);
+        let t = self.extra_tables.as_ref().unwrap_or(self.tables);
+        let c = self.contract;
         let r = t.update(&mut self.kv, &c, table, id, row);
         self.tbl(r)
     }
     fn table_delete(&mut self, table: &[u8], id: u64) -> bool {
-        let (t, c) = (self.tables, self.contract);
+        let t = self.extra_tables.as_ref().unwrap_or(self.tables);
+        let c = self.contract;
         let r = t.delete(&mut self.kv, &c, table, id);
         self.tbl(r)
     }

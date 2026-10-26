@@ -2,7 +2,9 @@
 
 `launcher`, `dex`, `nft` and `todo` each have `web/index.html`, which `btb dev` serves at `/` (it serves no other files). The three newer pages talk to the contract with [`@btb/client`](../sdk-ts) (hex-encoded canonical arguments, `subscribe` for live data), so the client is **inlined** into each page between `<!-- btb-client:begin -->` and `<!-- btb-client:end -->` as a classic script that defines the global `btb`. There is no build step when you run an example.
 
-Refresh the inlined copy after changing `sdk-ts/src`:
+`examples/todo` also has a `<!-- btb-api:begin -->` block: the typed client `btb codegen --ts` generated into `examples/todo/api/api.js`, inlined by the same script as `const api` (`client.subscribe(api.list_mine, [], render)`).
+
+Refresh the inlined copy after changing `sdk-ts/src` or a generated `api/api.js`:
 
 ```
 (cd sdk-ts && npm ci && npm run build) && node examples/sync-sdk.mjs     # --check only reports stale pages

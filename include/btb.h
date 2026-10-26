@@ -40,6 +40,8 @@
 #define BTB_PRICE 41
 #define BTB_REPORT_REQUEST 42
 #define BTB_PRICE_TWAP 43
+/* Cross-contract calls (range 50..59): see docs/LANGUAGE.md, "Calling other contracts". */
+#define BTB_CALL_CONTRACT 50
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
@@ -57,6 +59,23 @@
 #define BTB_TOKEN_UNAUTHORIZED 4
 #define BTB_TOKEN_OVERFLOW 5
 #define BTB_TOKEN_UNSUPPORTED 6
+
+/* call_contract results: the output length on success, else one of these (>= BTB_CALL_ERR_MIN).
+ * Every error reverts the callee's writes only. */
+#define BTB_CALL_ERR_MIN (UINT64_MAX - 15)
+#define BTB_CALL_NO_CONTRACT UINT64_MAX
+#define BTB_CALL_NO_FUNCTION (UINT64_MAX - 1)
+#define BTB_CALL_ABORTED (UINT64_MAX - 2)
+#define BTB_CALL_TRAPPED (UINT64_MAX - 3)
+#define BTB_CALL_OUT_OF_GAS (UINT64_MAX - 4)
+#define BTB_CALL_DEPTH (UINT64_MAX - 5)       /* more than 8 frames */
+#define BTB_CALL_REENTRANT (UINT64_MAX - 6)   /* target already on the call stack */
+#define BTB_CALL_OUTPUT_TOO_LARGE (UINT64_MAX - 7)
+#define BTB_CALL_DEPOSIT (UINT64_MAX - 8)
+#define BTB_CALL_UNSUPPORTED (UINT64_MAX - 9)
+#define BTB_CALL_QUERY 0
+#define BTB_CALL_MUTATION 1
+#define BTB_GAS_ALL UINT64_MAX
 
 /* Entry points: btb_<kind>_<name>(input, input_len). Name is [a-z0-9_], 1..64 bytes. */
 #define BTB_ENTRY(kind, name)                                                  \
@@ -237,6 +256,34 @@ static inline uint64_t btb_token_mint(const uint8_t id[32], const uint8_t to[32]
 /* Mutations only. Burns from this contract's balance; it must be the mint authority. */
 static inline uint64_t btb_token_burn(const uint8_t id[32], const uint8_t amount[16]) {
   return btb_ecall5(BTB_TOKEN_BURN, BTB_P(id), BTB_P(amount), 0, 0, 0);
+}
+
+/* ---- Calling other contracts. ---- */
+
+/* Builds the call_contract request in buf (capacity cap) and returns its length, or 0 if it does
+ * not fit. Layout: target[32], kind u8, gas u64 LE, fn_len u32 LE, fn, args. */
+static inline uint64_t btb_call_request(uint8_t *buf, uint64_t cap, const uint8_t target[32],
+                                        uint8_t kind, uint64_t gas, const char *fn,
+                                        uint32_t fn_len, const uint8_t *args,
+                                        uint64_t args_len) {
+  uint64_t n = 32 + 1 + 8 + 4 + (uint64_t)fn_len + args_len;
+  if (n < args_len || n > cap) return 0;
+  uint64_t o = 0;
+  for (int i = 0; i < 32; i++) buf[o++] = target[i];
+  buf[o++] = kind;
+  for (int i = 0; i < 8; i++) buf[o++] = (uint8_t)(gas >> (8 * i));
+  for (int i = 0; i < 4; i++) buf[o++] = (uint8_t)(fn_len >> (8 * i));
+  for (uint32_t i = 0; i < fn_len; i++) buf[o++] = (uint8_t)fn[i];
+  for (uint64_t i = 0; i < args_len; i++) buf[o++] = args[i];
+  return o;
+}
+/* Runs a query (kind BTB_CALL_QUERY) or mutation (BTB_CALL_MUTATION; not from a query) of another
+ * contract. Returns the output length (copied to out; at most out_cap) or a BTB_CALL_* error
+ * >= BTB_CALL_ERR_MIN, which leaves this contract running. The callee sees btb_caller() = this
+ * contract. Naming a randomness-marked function or an action callback traps. */
+static inline uint64_t btb_call_contract(const uint8_t *req, uint64_t req_len, uint8_t *out,
+                                         uint64_t out_cap) {
+  return btb_ecall5(BTB_CALL_CONTRACT, BTB_P(req), req_len, BTB_P(out), out_cap, 0);
 }
 
 #endif /* BTB_H */

@@ -255,8 +255,8 @@ fn put_bound(out: &mut Vec<u8>, b: Bound<'_>) {
 }
 
 /// Scan the secondary index `index` of `table` between `lo` and `hi`, at most `limit` ids
-/// (the VM caps it at 256). Declared indexes are registered on the host side for now (see
-/// docs/DEV_SERVER.md). Allowed in queries.
+/// (the VM caps it at 256). The index must be declared on a `#[btb::table]` field (`#[index]` /
+/// `#[primary]`); prefer the generated `Todo::by_owner(..)` lookups. Allowed in queries.
 pub fn table_index_scan(
     table: &[u8],
     index: &str,

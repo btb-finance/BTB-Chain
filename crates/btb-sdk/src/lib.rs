@@ -18,6 +18,8 @@ extern crate alloc;
 
 extern crate self as btb_sdk;
 
+pub mod call;
+pub mod error;
 pub mod host;
 pub mod oracle;
 #[cfg(all(feature = "runtime", target_os = "none"))]
@@ -29,12 +31,22 @@ pub use btb_codec as codec;
 pub use btb_codec::{Address, Decode, DecodeError, Encode};
 /// The attribute macros, used as `#[btb::query]` after `use btb_sdk::btb;`.
 pub use btb_sdk_macros as btb;
+pub use call::{call, query, CallError, Remote};
+pub use error::{Error, Result};
 
 /// Items the generated code refers to. Not part of the public API.
 #[doc(hidden)]
 pub mod __private {
+    pub use alloc::format;
+    pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use core::slice::from_raw_parts;
+
+    /// Abort the call with the message of an `Err` returned by a `Result` entry point.
+    pub fn fail<E: Into<crate::Error>>(e: E) -> ! {
+        let e: crate::Error = e.into();
+        crate::host::abort(e.message())
+    }
 
     /// Decode the call input as `T`, aborting the call on malformed input.
     ///
@@ -66,6 +78,7 @@ pub mod prelude {
     pub use crate::oracle::{price, price_checked, price_twap, random, Price, PriceError, Twap};
     pub use crate::table::Table;
     pub use crate::token::Token;
+    pub use crate::{bail, ensure};
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use btb_codec::Address;

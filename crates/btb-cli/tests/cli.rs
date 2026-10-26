@@ -103,7 +103,12 @@ fn binary_init_then_build_lists_entry_points_and_deploy_hash_is_correct() {
     run(&["init", "hello", "--sdk-path", sdk_dir], &dir);
     let root = dir.join("hello");
     let out = run(&["build"], &root);
-    for e in ["mutation add", "mutation toggle", "query list_mine"] {
+    for e in [
+        "mutation add",
+        "mutation toggle",
+        "query list_mine",
+        "table Note (indexes: owner)",
+    ] {
         assert!(out.contains(e), "{out}");
     }
     let elf = std::fs::read(root.join("target/btb/hello.elf")).unwrap();
@@ -117,7 +122,11 @@ fn binary_init_then_build_lists_entry_points_and_deploy_hash_is_correct() {
     let manifest = std::fs::read_to_string(bundle.join("manifest.json")).unwrap();
     assert!(manifest.contains(&format!("\"code_hash\": \"{}\"", sha256_hex(&elf))));
     assert!(manifest.contains("{\"kind\": \"query\", \"name\": \"list_mine\"}"));
-    assert!(manifest.contains("Note:owner:addr@0"));
+    // Indexes come from the ELF now, not from Cargo.toml metadata.
+    assert!(manifest.contains("\"indexes\": []"), "{manifest}");
+    let schema = std::fs::read_to_string(root.join("target/btb/hello.schema.json")).unwrap();
+    assert!(schema.contains("\"name\": \"Note\"") && schema.contains("\"indexes\": [\"owner\"]"));
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -218,12 +227,12 @@ fn dev_reload_reruns_subscriptions_and_pushes_changes() {
     assert!(next_event().contains("hello"));
     let src = root.join("src/main.rs");
     let text = std::fs::read_to_string(&src).unwrap();
-    assert!(text.contains("out.push((id, t.done, t.text));"));
+    assert!(text.contains(".map(|(id, t)| (id, t.done, t.text))"));
     std::fs::write(
         &src,
         text.replace(
-            "out.push((id, t.done, t.text));",
-            "out.push((id, t.done, t.text.to_uppercase()));",
+            ".map(|(id, t)| (id, t.done, t.text))",
+            ".map(|(id, t)| (id, t.done, t.text.to_uppercase()))",
         ),
     )
     .unwrap();
@@ -292,5 +301,96 @@ fn cron_every_flows_from_macro_into_deploy_manifest() {
     );
     // The unscheduled cron is still an entry point, just without a schedule.
     assert!(manifest.contains("{\"kind\": \"cron\", \"name\": \"manual\"}"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---- schema.json and the typed TypeScript client ----
+
+fn example(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name)
+}
+
+/// Compare with a checked-in file; `BTB_UPDATE_GOLDEN=1` rewrites it.
+fn golden(path: &Path, actual: &str) {
+    if std::env::var("BTB_UPDATE_GOLDEN").is_ok() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, actual).unwrap();
+    }
+    let want = std::fs::read_to_string(path).unwrap_or_default();
+    assert!(
+        want == actual,
+        "{} is stale; run with BTB_UPDATE_GOLDEN=1 to regenerate\n--- want\n{want}\n--- got\n{actual}",
+        path.display()
+    );
+}
+
+#[test]
+fn build_writes_schema_json_matching_the_golden_file() {
+    let b = build(&example("todo")).unwrap();
+    let json =
+        std::fs::read_to_string(example("todo").join("target/btb/todo.schema.json")).unwrap();
+    assert_eq!(json, btb_cli::codegen::schema_json("todo", &b.schema));
+    golden(&example("todo").join("api/todo.schema.json"), &json);
+    // It is valid JSON with the declared indexes.
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["tables"][0]["indexes"],
+        serde_json::json!(["owner", "created"])
+    );
+    assert_eq!(v["functions"][0]["fallible"], true);
+
+    let b = build(&example("nft")).unwrap();
+    let json = btb_cli::codegen::schema_json("nft", &b.schema);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let listing = v["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "Listing")
+        .unwrap();
+    assert_eq!(listing["primary"], "nft");
+}
+
+#[test]
+fn codegen_ts_matches_golden_files() {
+    let out = temp("codegen");
+    let (files, warnings) = btb_cli::codegen_ts(&example("todo"), &out).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(files.len(), 3);
+    for f in ["api.ts", "api.js", "api.d.ts"] {
+        golden(
+            &example("todo").join("api").join(f),
+            &std::fs::read_to_string(out.join(f)).unwrap(),
+        );
+    }
+    let ts = std::fs::read_to_string(out.join("api.ts")).unwrap();
+    assert!(ts.contains("export interface Todo {") && ts.contains("created: bigint;"));
+    assert!(ts.contains("list_mine: queryRef<[], [bigint, boolean, string][]>"));
+    assert!(ts.contains("add: mutationRef<[text: string], bigint>"));
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn metadata_indexes_still_work_with_a_warning_for_undeclared_tables_only() {
+    // A project whose Cargo.toml still has the deprecated section: the specs for tables the
+    // contract declares are ignored, the rest are kept.
+    let (dir, root) = new_project("legacy");
+    let toml = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "{toml}\n[package.metadata.btb]\nindexes = [\"Note:owner:addr@0\", \"Other:who:addr@0\"]\n"
+        ),
+    )
+    .unwrap();
+    let b = build(&root).unwrap();
+    let kept = btb_cli::legacy_indexes(&root, &b.schema).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].table, "Other");
+    let (_, bundle) = deploy(&root).unwrap();
+    let manifest = std::fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    assert!(manifest.contains("Other:who:addr@0") && !manifest.contains("Note:owner"));
     let _ = std::fs::remove_dir_all(dir);
 }

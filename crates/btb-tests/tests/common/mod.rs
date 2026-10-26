@@ -89,3 +89,16 @@ pub fn assert_only_rv64im(b: &[u8]) {
     }
     assert!(words > 100, "suspiciously little code: {words} words");
 }
+
+/// Tables with the indexes the contract declares in its ELF (`#[btb::table]`), registered for
+/// `contract` exactly as `btb dev` and the chain do.
+pub fn declared_tables(contract: [u8; 32], elf: &[u8]) -> btb_runtime::Tables {
+    let schema = btb_runtime::schema::Schema::from_elf(elf).expect("valid schema");
+    let mut tables = btb_runtime::Tables::new();
+    for (name, defs) in schema.index_defs().expect("index definitions") {
+        tables
+            .register(contract, name.as_bytes(), defs)
+            .expect("register");
+    }
+    tables
+}

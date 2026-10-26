@@ -38,6 +38,33 @@ const stop = client.subscribe("list_mine", t.unit, [], Todos, (rows) => console.
 
 `subscribe` uses `EventSource` when the runtime has one and a `fetch` stream reader otherwise (Node), reconnecting after 1 s on dropped streams. Errors are `BtbError` with the HTTP `status` and the server's message.
 
+## Typed clients from the contract schema
+
+`btb codegen --ts DIR` ([CLI.md](CLI.md#btb-codegen)) turns the schema in the contract's ELF into a module whose `api` object holds one typed reference per query and mutation, and whose table names are TypeScript interfaces with codecs. Nothing is repeated by hand:
+
+```ts
+import { BtbClient, ContractError } from "@btb/client";
+import { api, Todo } from "./btb/api";
+
+const client = new BtbClient({ url: "http://127.0.0.1:8787", caller: "alice" });
+
+const id   = await client.mutation(api.add, ["buy milk"]);   // bigint
+const mine = await client.query(api.list_mine);              // [bigint, boolean, string][], no args
+const rows: Todo[] = await client.query(api.recent, [10]);   // table rows, typed
+const stop = client.subscribe(api.list_mine, [], (rows) => render(rows));
+```
+
+A reference is `queryRef(name, argsCodec, resultCodec)` / `mutationRef(...)` (`QueryRef<A, R>`, `MutationRef<A, R>`, `FnRef`); `client.query`, `client.mutation`, `client.subscribe`, `useQuery` and `useMutation` accept it in place of the name-and-codecs form, which keeps working. Arguments are the tuple of the Rust parameters (`[text: string]`) and may be left out when the function takes none; passing a mutation to `query` (or the reverse), a wrong argument type or an unknown function is a compile error. Type mapping: `u8`/`u16`/`u32`/`i8`/`i16`/`i32` to `number`, `u64`/`u128`/`i64`/`i128` to `bigint`, `String` to `string`, `Address` and `Vec<u8>` to `Uint8Array`, `Option<T>` to `T | null`, `Vec<T>`/`[T; N]` to `T[]`, tuples to tuples, table structs to interfaces. `sdk-ts/test/codegen.test.ts` typechecks the generated `examples/todo/api/api.ts` with `strict` and `test/fixtures/usage.ts` pins the compile errors.
+
+**Errors.** A contract that aborts, or returns `Err` from a `-> btb_sdk::Result<T>` function ([LANGUAGE.md](LANGUAGE.md#what-works-today-phase-1)), makes the call fail with HTTP 400 `aborted: <message>`. The client raises `ContractError` (a subclass of `BtbError`) with `reason` set to the contract's message:
+
+```ts
+try { await client.mutation(api.add, [""]); }
+catch (e) { if (e instanceof ContractError) show(e.reason); }   // "text must be 1..=280 bytes"
+```
+
+Other failures (404 unknown function, malformed arguments, network errors) stay plain `BtbError`s.
+
 ## Hosting nodes and proofs
 
 The same client talks to a hosting node ([HOSTING.md](HOSTING.md)); the contract is part of the URL: `new BtbClient({ url: "http://host:8788/c/<contract hex>" })`. `query` and `subscribe` are unchanged; `mutation` fails with status 501 (send a signed transaction to a validator).
@@ -49,7 +76,7 @@ The same client talks to a hosting node ([HOSTING.md](HOSTING.md)); the contract
 
 ## In a plain page (no bundler)
 
-`btb dev` serves only `web/index.html`, so the example pages inline the built client (`sdk-ts/dist`) in a `<script>` that defines a global `btb`; `node examples/sync-sdk.mjs` refreshes it ([examples/README-web.md](../examples/README-web.md)). Pages use `new btb.BtbClient({ url: location.origin, caller })` and `btb.t`.
+`btb dev` serves only `web/index.html`, so the example pages inline the built client (`sdk-ts/dist`) in a `<script>` that defines a global `btb`; `node examples/sync-sdk.mjs` refreshes it ([examples/README-web.md](../examples/README-web.md)). Pages use `new btb.BtbClient({ url: location.origin, caller })` and `btb.t`. A page that also has a `<!-- btb-api:begin --><!-- btb-api:end -->` block gets the generated `examples/<app>/api/api.js` inlined as `const api` by the same script, so `examples/todo/web/index.html` calls `client.subscribe(api.list_mine, [], render)` and `client.mutation(api.add, [text])` with no build step; regenerate with `btb codegen --ts examples/todo/api` and then `node examples/sync-sdk.mjs`.
 
 ## React
 
@@ -65,7 +92,7 @@ function Todos() {
 }
 ```
 
-`useQuery` is live (a subscription) and resubscribes when the name or encoded arguments change. `mutate` resolves with the result and rejects with `BtbError`.
+`useQuery` is live (a subscription) and resubscribes when the name or encoded arguments change. `mutate` resolves with the result and rejects with `BtbError` (`ContractError` for a contract abort). With a generated reference: `useQuery(api.list_mine)`, `useQuery(api.recent, [10])`, `const [add] = useMutation(api.add)`, fully typed.
 
 ## Tests
 

@@ -22,8 +22,9 @@
 //! it cannot be bypassed by the manifest or by the caller. A marker on a query or action, or one
 //! without a matching entry point, makes the contract invalid at deploy time. At run time a
 //! `random_bytes` call anywhere else traps with `Trap::RandomnessForbidden`. There are no
-//! cross-contract calls, so a marked function can never be reached from another contract's
-//! code; if they are added, the callee must run with the flag off.
+//! `call_contract` (host call 50) runs the callee through `Contract::call` too, and a marked
+//! callee is refused by the host (`CallForbidden`/`RandomnessForbidden`), so the flag is off in
+//! every nested frame and a marked function can never be reached from another contract's code.
 
 use crate::decode::Trap;
 use crate::elf::{self, ElfError};
@@ -469,6 +470,10 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     }
     fn report_request(&mut self, data: &[u8]) -> Option<u64> {
         self.0.report_request(data)
+    }
+    fn call_contract(&mut self, req: &crate::host::CallRequest<'_>) -> crate::host::CallReply {
+        // The dispatcher already put this frame's read-only state into `req.read_only`.
+        self.0.call_contract(req)
     }
 }
 

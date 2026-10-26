@@ -4,7 +4,7 @@
 //! Server-Sent Events stream on `list_mine` (what the demo page does with `EventSource`),
 //! posts mutations over HTTP and asserts the stream pushes the new state.
 
-use btb_dev::{IndexSpec, Server};
+use btb_dev::Server;
 use btb_runtime::MemKv;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -17,7 +17,7 @@ fn start() -> Server {
         &common::build_example("todo"),
         ("127.0.0.1", 0),
         MemKv::new(),
-        vec![IndexSpec::parse("Todo:owner:addr@0").unwrap()],
+        vec![],
     )
     .unwrap()
 }

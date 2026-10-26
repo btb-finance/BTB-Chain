@@ -39,3 +39,21 @@ BTB_MUTATION(increment) {
   btb_storage_write(KEY, sizeof KEY, out, 8);
   btb_return_data(out, 8);
 }
+
+/* Cross-contract call from C. Argument: target[32] || kind u8 (0 query, 1 mutation) || function
+ * name (rest). Calls the function with no arguments, forwarding all gas, and returns its output
+ * (at most 64 bytes). A failed call aborts with the status's low byte as the message. */
+BTB_MUTATION(relay) {
+  if (len < 34) btb_abort("invalid arguments", 17);
+  uint8_t req[160];
+  uint8_t out[64];
+  uint64_t n = btb_call_request(req, sizeof req, ptr, ptr[32], BTB_GAS_ALL,
+                                (const char *)ptr + 33, (uint32_t)(len - 33), 0, 0);
+  if (n == 0) btb_abort("request too large", 17);
+  uint64_t r = btb_call_contract(req, n, out, sizeof out);
+  if (r >= BTB_CALL_ERR_MIN) {
+    uint8_t code = (uint8_t)(UINT64_MAX - r);
+    btb_abort((const char *)&code, 1);
+  }
+  btb_return_data(out, r);
+}

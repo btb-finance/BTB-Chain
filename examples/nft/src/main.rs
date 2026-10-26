@@ -29,16 +29,20 @@ use btb_sdk::{Decode, Encode};
 const MAX_URI: usize = 256;
 const MAX_PAGE: u32 = 50;
 
-/// One row per NFT. The host indexes it by `owner` (the first 32 bytes of the row).
+/// One row per NFT. `owner` is an indexed field: `Nft::by_owner(addr)` reads only that owner's
+/// rows (the host and the chain register the index from the schema in the ELF).
 #[btb::table]
 pub struct Nft {
+    #[index]
     pub owner: Address,
     pub uri: String,
 }
 
-/// One row per open listing; deleted on cancel and on sale.
+/// One row per open listing; deleted on cancel and on sale. `nft` is the primary key: the
+/// runtime refuses a second listing for the same NFT, and `Listing::get_by_nft(id)` finds it.
 #[btb::table]
 pub struct Listing {
+    #[primary]
     pub nft: u64,
     pub seller: Address,
     pub token: Token,
@@ -62,14 +66,6 @@ fn total_key(t: &Token) -> [u8; 34] {
     let mut k = [0u8; 34];
     k[..2].copy_from_slice(b"t:");
     k[2..].copy_from_slice(&t.0);
-    k
-}
-
-/// `l:<nft id, big endian>` -> listing id: at most one open listing per NFT.
-fn listed_key(nft: u64) -> [u8; 10] {
-    let mut k = [0u8; 10];
-    k[..2].copy_from_slice(b"l:");
-    k[2..].copy_from_slice(&nft.to_be_bytes());
     k
 }
 
@@ -157,7 +153,7 @@ pub fn transfer(id: u64, to: Address) {
     if n.owner != caller() {
         abort("not the owner");
     }
-    if host::storage_get(&listed_key(id)).is_some() {
+    if Listing::get_by_nft(id).is_some() {
         abort("nft is listed");
     }
     n.owner = to;
@@ -174,21 +170,19 @@ fn list_impl(id: u64, token: Token, price: u128) -> u64 {
     if price == 0 {
         abort("price must be positive");
     }
-    if host::storage_get(&listed_key(id)).is_some() {
+    if Listing::get_by_nft(id).is_some() {
         abort("already listed");
     }
     if token.info().is_none() {
         abort("unknown token");
     }
-    let lid = Listing {
+    Listing {
         nft: id,
         seller: n.owner,
         token,
         price,
     }
-    .insert();
-    host::storage_set(&listed_key(id), &lid.encode());
-    lid
+    .insert()
 }
 
 /// Owner only: offer the NFT for `price` of `token`. Returns the listing id.
@@ -213,7 +207,6 @@ pub fn cancel(listing: u64) {
         abort("not the seller");
     }
     Listing::delete(listing);
-    host::storage_remove(&listed_key(l.nft));
 }
 
 /// Buy a listing: debit the buyer's escrow, pay the seller `price` with a token transfer from
@@ -234,7 +227,6 @@ pub fn buy(listing: u64) {
     n.owner = buyer;
     n.update(l.nft);
     Listing::delete(listing);
-    host::storage_remove(&listed_key(l.nft));
 }
 
 // ---- Escrow ----
@@ -274,21 +266,13 @@ pub fn create_currency(name: String, symbol: String, decimals: u8, supply: u128)
 /// The caller's NFTs as `(id, uri)`, oldest first, read through the owner index.
 #[btb::query]
 pub fn my_nfts() -> Vec<(u64, String)> {
-    let me = caller();
-    let mut out = Vec::new();
-    let mut cursor = Vec::new();
-    loop {
-        let page = Nft::index_eq("owner", host::Key::Bytes(&me.0), 64, &cursor);
-        for id in page.ids {
-            if let Some(n) = Nft::get(id) {
-                out.push((id, n.uri));
-            }
-        }
-        match page.next_cursor {
-            Some(c) => cursor = c,
-            None => return out,
-        }
-    }
+    Nft::by_owner(caller()).map(|(id, n)| (id, n.uri)).collect()
+}
+
+/// The open listing of an NFT as `(listing id, token, price)`, found through its primary key.
+#[btb::query]
+pub fn listing_of(nft: u64) -> Option<(u64, Token, u128)> {
+    Listing::get_by_nft(nft).map(|(id, l)| (id, l.token, l.price))
 }
 
 /// `(owner, uri)` of an NFT.

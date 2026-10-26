@@ -13,11 +13,12 @@ pub mod query;
 pub mod readset;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
+pub mod schema;
 pub mod subscribe;
 pub mod tables;
 pub mod twap;
 
-pub use host::{Fault, RuntimeHost};
+pub use host::{Callee, Fault, Resolver, RuntimeHost};
 pub use kv::{KvError, KvStore, MemKv, Overlay, WriteBatch};
 pub use layout::IndexValue;
 pub use occ::{execute_with_retry, Committed, Occ, OccError, Txn};

@@ -9,7 +9,11 @@
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@btb/client": ["./src/index.ts"],
+      "@btb/client/react": ["./src/react.ts"]
+    }
   },
   "include": ["src", "test"]
 }

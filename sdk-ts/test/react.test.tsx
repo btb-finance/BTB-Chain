@@ -3,7 +3,7 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 import { createElement as h, useState } from "react";
 import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
-import { BtbClient, BtbError, t, type Codec } from "../src/index.js";
+import { BtbClient, BtbError, mutationRef, queryRef, t, type Codec } from "../src/index.js";
 import { BtbProvider, useMutation, useQuery } from "../src/react.js";
 
 afterEach(cleanup);
@@ -15,14 +15,14 @@ class Fake extends BtbClient {
   constructor() {
     super({ url: "http://x" });
   }
-  override subscribe(name: string, _a: Codec<any>, args: any, _r: Codec<any>, on: any, err?: any) {
+  override subscribe(name: any, _a?: any, args?: any, _r?: any, on?: any, err?: any): any {
     const s = { name, args, on, err, closed: false };
     this.subs.push(s);
     return () => {
       s.closed = true;
     };
   }
-  override async mutation(name: string, _a: Codec<any>, args: any, _r: Codec<any>): Promise<any> {
+  override async mutation(name: any, _a?: any, args?: any, _r?: any): Promise<any> {
     this.calls.push({ name, args });
     return this.next!();
   }
@@ -102,5 +102,36 @@ describe("hooks", () => {
     const c = new Fake();
     expect(renderToString(h(BtbProvider, { client: c }, h(List)))).toContain("loading");
     expect(() => renderToString(h(List))).toThrow(/BtbProvider/);
+  });
+});
+
+describe("hooks with function references", () => {
+  const list = queryRef("list", t.tuple(t.u64), t.vec(t.string));
+  const bump = mutationRef("bump", t.tuple(t.u64), t.u64);
+
+  it("useQuery(ref, args) subscribes by the reference's name and codecs", () => {
+    const c = new Fake();
+    function L() {
+      const q = useQuery(list, [1n]);
+      return h("div", { "data-testid": "r" }, q.loading ? "loading" : q.data!.join(","));
+    }
+    render(h(BtbProvider, { client: c }, h(L)));
+    expect(c.subs[0]!.name).toBe("list");
+    expect(c.subs[0]!.args).toEqual([1n]);
+    act(() => c.subs[0]!.on(["x", "y"]));
+    expect(screen.getByTestId("r").textContent).toBe("x,y");
+  });
+
+  it("useMutation(ref) calls the mutation and tracks its state", async () => {
+    const c = new Fake();
+    c.next = () => 5n;
+    let mutate!: (n: bigint) => Promise<bigint>;
+    function M() {
+      [mutate] = useMutation(bump);
+      return null;
+    }
+    render(h(BtbProvider, { client: c }, h(M)));
+    expect(await act(() => mutate(4n))).toBe(5n);
+    expect(c.calls).toEqual([{ name: "bump", args: [4n] }]);
   });
 });

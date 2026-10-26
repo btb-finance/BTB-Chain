@@ -7,6 +7,7 @@
 //! effect. Guest pointers and lengths are bounds-checked and trap, never panic. Addresses are 32
 //! bytes; integers are little-endian u64 in registers.
 
+use crate::contract::FunctionKind;
 use crate::decode::Trap;
 use crate::gas;
 use crate::token::{self, CreateParams, TokenError, TokenId, TokenStore};
@@ -116,6 +117,55 @@ pub mod abi {
     /// `PRICE_BAD_WINDOW`: window is 0, above the maximum, or longer than the feed's history.
     /// Gas: `HOST_TWAP_QUERY` in queries, `HOST_TWAP_MUTATION` (read plus per-read fee) otherwise.
     pub const PRICE_TWAP: u64 = 43;
+    /// Cross-contract calls use their own number range (50..=59), like the oracle calls.
+    ///
+    /// `call_contract(req_ptr, req_len, out_ptr, out_cap) -> output_len | CALL_* error`. Runs
+    /// a `query` or `mutation` of another contract synchronously, in a fresh VM with its own
+    /// memory, on the same transaction state (see `docs/LANGUAGE.md`, "Calling other
+    /// contracts"). Request: `target[32], u8 kind (0 query, 1 mutation), u64 LE gas,
+    /// u32 LE fn_len, fn (UTF-8), args (the rest, the callee's normal encoded input)`. (The
+    /// register file has only five argument registers in this ABI, so the eight logical
+    /// parameters travel in one request block.)
+    ///
+    /// * `gas` is forwarded to the callee, capped at the caller's remaining gas; the callee's
+    ///   exact usage is charged to the caller and the rest is never taken. See `gas.rs`.
+    /// * The callee sees `caller()` = the calling contract and `contract_address()` = itself.
+    ///   Its storage, tables, token balances and transfers are its own.
+    /// * From a query only queries may be called; a mutation from a read-only frame traps with
+    ///   `WriteInQuery`. Crons and actions cannot be named. A randomness-marked function or
+    ///   the callback of an HTTPS action traps (`RandomnessForbidden` / `CallForbidden`), and
+    ///   `random_bytes` in any callee frame traps.
+    /// * On success the callee's output (at most `out_cap` bytes; a longer one fails the call
+    ///   with `CALL_OUTPUT_TOO_LARGE` and reverts the callee) is copied to `out_ptr` and its
+    ///   length returned. Every other outcome is an error status at or above `CALL_ERR_MIN`
+    ///   that reverts the callee's writes only; the caller decides whether to continue. A
+    ///   malformed request traps.
+    pub const CALL_CONTRACT: u64 = 50;
+    /// Deepest nesting of contract frames, the entry point included.
+    pub const MAX_CALL_DEPTH: usize = 8;
+    /// Statuses of `call_contract` (anything `>= CALL_ERR_MIN` is an error, never a length).
+    pub const CALL_ERR_MIN: u64 = u64::MAX - 15;
+    /// No contract at the target address.
+    pub const CALL_NO_CONTRACT: u64 = u64::MAX;
+    /// The target has no such function of that kind.
+    pub const CALL_NO_FUNCTION: u64 = u64::MAX - 1;
+    /// The callee called `abort`.
+    pub const CALL_ABORTED: u64 = u64::MAX - 2;
+    /// The callee trapped (memory fault, illegal instruction, forbidden call, storage fault).
+    pub const CALL_TRAPPED: u64 = u64::MAX - 3;
+    /// The callee used all the gas forwarded to it.
+    pub const CALL_OUT_OF_GAS: u64 = u64::MAX - 4;
+    /// The call would nest deeper than `MAX_CALL_DEPTH`.
+    pub const CALL_DEPTH: u64 = u64::MAX - 5;
+    /// The target is already on the call stack (the caller included): re-entering is refused.
+    pub const CALL_REENTRANT: u64 = u64::MAX - 6;
+    /// The callee's output did not fit `out_cap`; the callee was reverted.
+    pub const CALL_OUTPUT_TOO_LARGE: u64 = u64::MAX - 7;
+    /// The callee's storage growth could not be paid from its balance (deposit).
+    pub const CALL_DEPOSIT: u64 = u64::MAX - 8;
+    /// The host cannot run other contracts.
+    pub const CALL_UNSUPPORTED: u64 = u64::MAX - 9;
+
     /// Largest `window` accepted by `price_twap`.
     pub const MAX_TWAP_WINDOW: u64 = 10_000;
     /// `price` / `price_twap` status: the feed is paused by its circuit breaker; handle it.
@@ -301,6 +351,68 @@ pub enum TwapOutcome {
     BadWindow,
 }
 
+/// A decoded `call_contract` request, as the host gets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRequest<'a> {
+    pub target: Address,
+    /// `Query` or `Mutation`.
+    pub kind: FunctionKind,
+    pub function: &'a str,
+    pub args: &'a [u8],
+    /// Gas the callee may use: the requested amount already capped at the caller's remaining gas.
+    pub gas: u64,
+    /// The calling frame is read-only (a query, or anything below one).
+    pub read_only: bool,
+    /// The caller's `out_cap`: a longer output must fail the call.
+    pub max_output: usize,
+}
+
+/// How a nested call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallEnd {
+    Ok(Vec<u8>),
+    NoContract,
+    NoFunction,
+    Aborted,
+    Trapped,
+    OutOfGas,
+    Depth,
+    Reentrant,
+    OutputTooLarge,
+    Deposit,
+    Unsupported,
+    /// The call is refused outright: the caller traps with this.
+    Forbidden(Trap),
+}
+
+/// A nested call's end and the gas the callee used (at most `CallRequest::gas`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallReply {
+    pub end: CallEnd,
+    pub gas_used: u64,
+}
+
+impl CallReply {
+    pub fn refused(end: CallEnd) -> Self {
+        Self { end, gas_used: 0 }
+    }
+}
+
+/// Decode a `call_contract` request body into `(target, kind, gas, function, args)`; `None` if
+/// malformed (short, unknown kind, function not UTF-8).
+pub fn parse_call(req: &[u8]) -> Option<(Address, FunctionKind, u64, &str, &[u8])> {
+    let mut r = Rd(req);
+    let target: Address = r.take(32)?.try_into().ok()?;
+    let kind = match r.u8()? {
+        0 => FunctionKind::Query,
+        1 => FunctionKind::Mutation,
+        _ => return None,
+    };
+    let gas = u64::from_le_bytes(r.take(8)?.try_into().ok()?);
+    let function = std::str::from_utf8(r.bytes()?).ok()?;
+    Some((target, kind, gas, function, r.0))
+}
+
 /// What the embedder (node runtime) provides to a running contract.
 pub trait Host {
     /// True for queries: state-changing calls then trap with `Trap::WriteInQuery`.
@@ -352,6 +464,15 @@ pub trait Host {
     /// Time-weighted average price of `pair` over the last `window` blocks.
     fn price_twap(&mut self, _pair: u32, _window: u64) -> TwapOutcome {
         TwapOutcome::NotFound
+    }
+    /// Run another contract's function for `call_contract` (see `abi::CALL_CONTRACT`). The VM
+    /// has already charged the base cost, refused a mutation from a read-only frame and capped
+    /// `gas`. The host loads the callee, enforces depth, re-entrancy and the callee rules
+    /// (randomness-marked functions and action callbacks are `Forbidden`), runs it in a fresh
+    /// VM on the same transaction state with a savepoint, and reverts that savepoint on any
+    /// outcome but `Ok`. The default cannot run other contracts.
+    fn call_contract(&mut self, _req: &CallRequest<'_>) -> CallReply {
+        CallReply::refused(CallEnd::Unsupported)
     }
     /// Queue `data` to be threshold-signed as a report for other chains; returns its id. `None`:
     /// the host has no report queue.
@@ -749,6 +870,49 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                 }
                 let data = buf(vm, a0, a1)?;
                 host.report_request(&data).unwrap_or(abi::NOT_FOUND)
+            }
+            abi::CALL_CONTRACT => {
+                vm.charge_gas(cost(gas::HOST_CALL_CONTRACT, gas::CALL_BYTE, a1))?;
+                let req = buf(vm, a0, a1)?;
+                // Validate the output window before doing anything.
+                buf(vm, a2, a3)?;
+                let Some((target, kind, want, function, args)) = parse_call(&req) else {
+                    return Err(Trap::Abort("malformed call_contract request".into()));
+                };
+                let read_only = host.read_only();
+                if read_only && kind == FunctionKind::Mutation {
+                    return Err(Trap::WriteInQuery);
+                }
+                let forwarded = want.min(vm.gas_limit() - vm.gas_used());
+                let reply = host.call_contract(&CallRequest {
+                    target,
+                    kind,
+                    function,
+                    args,
+                    gas: forwarded,
+                    read_only,
+                    max_output: usize::try_from(a3).unwrap_or(usize::MAX),
+                });
+                // The callee's exact usage, never more than it was given.
+                vm.charge_gas(reply.gas_used.min(forwarded))?;
+                match reply.end {
+                    CallEnd::Forbidden(t) => return Err(t),
+                    CallEnd::Ok(out) => {
+                        vm.charge_gas((out.len() as u64).saturating_mul(gas::CALL_RETURN_BYTE))?;
+                        vm.write_mem(a2, &out)?;
+                        out.len() as u64
+                    }
+                    CallEnd::NoContract => abi::CALL_NO_CONTRACT,
+                    CallEnd::NoFunction => abi::CALL_NO_FUNCTION,
+                    CallEnd::Aborted => abi::CALL_ABORTED,
+                    CallEnd::Trapped => abi::CALL_TRAPPED,
+                    CallEnd::OutOfGas => abi::CALL_OUT_OF_GAS,
+                    CallEnd::Depth => abi::CALL_DEPTH,
+                    CallEnd::Reentrant => abi::CALL_REENTRANT,
+                    CallEnd::OutputTooLarge => abi::CALL_OUTPUT_TOO_LARGE,
+                    CallEnd::Deposit => abi::CALL_DEPOSIT,
+                    CallEnd::Unsupported => abi::CALL_UNSUPPORTED,
+                }
             }
             abi::RETURN_DATA => {
                 vm.charge_gas(cost(gas::HOST_RETURN_DATA, gas::RETURN_BYTE, a1))?;

@@ -56,7 +56,7 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 
 **TWAP (time-weighted average price).** The average of a feed's price over the last N blocks, read with the `price_twap` host call. Computed in integer math from cumulative checkpoints written at each publication. See [Oracles](ORACLES.md#update-rule-circuit-breaker-and-twap-built).
 
-**Table.** A contract-declared database table with a primary key and optional indexes, which is how BTB state is modeled. See [Architecture](ARCHITECTURE.md#state-model).
+**Table.** A contract-declared database table (`#[btb::table]`) with an optional unique `#[primary]` key and `#[index]` fields, declared in the contract's schema, which is how BTB state is modeled. See [Architecture](ARCHITECTURE.md#state-model).
 
 **Threshold beacon.** The per-block random value made by validators jointly producing a threshold BLS signature on `(chain, epoch, height)`; each releases its partial only after the block is committed. No single party can predict or choose it. It is available only to mutations and crons marked `randomness`. See [Oracles](ORACLES.md#1-verifiable-randomness).
 

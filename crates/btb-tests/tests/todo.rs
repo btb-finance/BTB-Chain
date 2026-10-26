@@ -1,8 +1,9 @@
 //! `examples/todo` through the real state database: the owner index is read by the contract
-//! with host call 15 (`table_index_scan`).
+//! with host call 15 (`table_index_scan`). The index is declared by the contract itself
+//! (`#[index]` on a `#[btb::table]` field), not registered by the test.
 
-use btb_codec::{Decode, Encode};
-use btb_runtime::{layout, IndexDef, IndexValue, KvStore, MemKv, RuntimeHost, Tables};
+use btb_codec::{Address, Decode, Encode};
+use btb_runtime::{layout, IndexValue, KvStore, MemKv, RuntimeHost, Tables};
 use btb_vm::{Contract, FunctionKind};
 
 mod common;
@@ -12,19 +13,6 @@ const ALICE: [u8; 32] = [1; 32];
 const BOB: [u8; 32] = [2; 32];
 
 type Item = (u64, bool, String);
-
-fn tables() -> Tables {
-    let mut t = Tables::new();
-    t.register(
-        C,
-        b"Todo",
-        vec![IndexDef::new("owner", |row| {
-            Ok(Some(IndexValue::Bytes(row[..32].to_vec())))
-        })],
-    )
-    .unwrap();
-    t
-}
 
 struct Env {
     c: Contract,
@@ -37,9 +25,10 @@ impl Env {
         let mut kv = MemKv::new();
         kv.put(&layout::balance_key(&C), &1_000_000u64.to_le_bytes())
             .unwrap();
+        let elf = common::build_example("todo");
         Env {
-            c: Contract::from_elf(&common::build_example("todo")).unwrap(),
-            t: tables(),
+            c: Contract::from_elf(&elf).unwrap(),
+            t: common::declared_tables(C, &elf),
             kv,
         }
     }
@@ -164,4 +153,113 @@ fn list_mine_read_set_covers_only_the_callers_index_range() {
     };
     assert!(reads.contains_key(&key(ALICE, 77)));
     assert!(!reads.contains_key(&key(BOB, 77)));
+}
+
+type Page = (Vec<Item>, Vec<u8>);
+
+impl Env {
+    fn page(&mut self, who: [u8; 32], limit: u32, cursor: &[u8], newest_first: bool) -> Page {
+        let (o, _) = self
+            .run(
+                FunctionKind::Query,
+                "page_mine",
+                who,
+                &(limit, cursor.to_vec(), newest_first),
+            )
+            .unwrap();
+        Page::decode(&o).unwrap()
+    }
+
+    fn at(&mut self, height: u64, who: [u8; 32], text: &str) -> u64 {
+        let mut h = RuntimeHost::new(&self.kv, &self.t, C, who, height);
+        let out = self
+            .c
+            .call(
+                FunctionKind::Mutation,
+                "add",
+                &(text.to_string(),).encode(),
+                &mut h,
+                common::GAS,
+                common::MEM,
+            )
+            .unwrap();
+        let b = h.finish().unwrap();
+        self.kv.commit(b).unwrap();
+        u64::decode(&out.output).unwrap()
+    }
+}
+
+#[test]
+fn typed_lookup_pages_in_both_directions_with_cursors() {
+    let mut e = Env::new();
+    for i in 0..7 {
+        e.add(ALICE, &format!("a{i}")); // ids 0, 2, 4, ... interleaved with Bob's
+        e.add(BOB, &format!("b{i}"));
+    }
+    let ids = |rows: &[Item]| rows.iter().map(|r| r.0).collect::<Vec<_>>();
+
+    // Ascending: 3 + 3 + 1 rows, then an empty cursor.
+    let (r1, c1) = e.page(ALICE, 3, &[], false);
+    assert_eq!(ids(&r1), vec![0, 2, 4]);
+    assert!(!c1.is_empty());
+    let (r2, c2) = e.page(ALICE, 3, &c1, false);
+    assert_eq!(ids(&r2), vec![6, 8, 10]);
+    let (r3, c3) = e.page(ALICE, 3, &c2, false);
+    assert_eq!(ids(&r3), vec![12]);
+    assert!(c3.is_empty());
+
+    // Descending visits the same rows backwards.
+    let (d1, dc1) = e.page(ALICE, 4, &[], true);
+    assert_eq!(ids(&d1), vec![12, 10, 8, 6]);
+    let (d2, dc2) = e.page(ALICE, 4, &dc1, true);
+    assert_eq!(ids(&d2), vec![4, 2, 0]);
+    assert!(dc2.is_empty());
+
+    // The page is exactly the limit when more rows exist, and `recent` is newest first.
+    let (o, _) = e.run(FunctionKind::Query, "recent", BOB, &(2u32,)).unwrap();
+    let recent = Vec::<(Address, bool, u64, String)>::decode(&o).unwrap();
+    assert_eq!(
+        recent.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(),
+        vec!["b6", "b5"]
+    );
+}
+
+#[test]
+fn range_lookup_with_filter_uses_the_created_index() {
+    let mut e = Env::new();
+    e.at(5, ALICE, "early");
+    e.at(10, BOB, "bob");
+    let late = e.at(10, ALICE, "late");
+    let done = e.at(12, ALICE, "done");
+    e.at(20, ALICE, "latest");
+    e.run(FunctionKind::Mutation, "toggle", ALICE, &(done,))
+        .unwrap();
+    let (o, _) = e
+        .run(FunctionKind::Query, "open_since", ALICE, &(10u64,))
+        .unwrap();
+    // Not "early" (before 10), not Bob's, not the finished one; ordered by `created`, then id.
+    assert_eq!(Vec::<u64>::decode(&o).unwrap(), vec![late, 4]);
+}
+
+#[test]
+fn result_errors_abort_with_the_message_and_change_nothing() {
+    let mut e = Env::new();
+    e.add(ALICE, "milk");
+    let before: Vec<_> =
+        e.kv.entries()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+    let err = e
+        .run(FunctionKind::Mutation, "add", ALICE, &("x".repeat(281),))
+        .unwrap_err();
+    assert_eq!(common::abort_msg(err), "text must be 1..=280 bytes");
+    let err = e
+        .run(FunctionKind::Mutation, "toggle", ALICE, &(41u64,))
+        .unwrap_err();
+    assert_eq!(common::abort_msg(err), "no such todo");
+    let after: Vec<_> =
+        e.kv.entries()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+    assert_eq!(before, after);
 }

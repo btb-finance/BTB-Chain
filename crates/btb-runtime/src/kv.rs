@@ -175,7 +175,17 @@ pub struct Overlay<'a, S: KvStore> {
     base: &'a S,
     pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     reads: RefCell<ReadSet>,
+    /// Previous pending value of every key written while a savepoint is open (see `savepoint`).
+    undo: Vec<UndoEntry>,
+    open: usize,
 }
+
+/// A key and its pending value before a write (`None`: it had no pending entry).
+type UndoEntry = (Vec<u8>, Option<Option<Vec<u8>>>);
+
+/// A point in an overlay's write history that [`Overlay::rollback`] can return to.
+#[derive(Debug)]
+pub struct Savepoint(usize);
 
 impl<'a, S: KvStore> Overlay<'a, S> {
     pub fn new(base: &'a S) -> Self {
@@ -183,6 +193,47 @@ impl<'a, S: KvStore> Overlay<'a, S> {
             base,
             pending: BTreeMap::new(),
             reads: RefCell::new(ReadSet::new()),
+            undo: Vec::new(),
+            open: 0,
+        }
+    }
+
+    /// Open a savepoint: writes from now on can be undone with `rollback`, or kept with
+    /// `release`. Savepoints nest and must be closed in reverse order. The read set is never
+    /// rolled back (a rolled-back call still depended on what it read).
+    pub fn savepoint(&mut self) -> Savepoint {
+        self.open += 1;
+        Savepoint(self.undo.len())
+    }
+
+    /// Keep the writes since `sp`.
+    pub fn release(&mut self, sp: Savepoint) {
+        debug_assert!(self.open > 0 && sp.0 <= self.undo.len());
+        self.open = self.open.saturating_sub(1);
+        if self.open == 0 {
+            self.undo.clear();
+        }
+    }
+
+    /// Discard every write since `sp`.
+    pub fn rollback(&mut self, sp: Savepoint) {
+        debug_assert!(self.open > 0 && sp.0 <= self.undo.len());
+        while self.undo.len() > sp.0 {
+            let Some((k, old)) = self.undo.pop() else {
+                break;
+            };
+            match old {
+                None => {
+                    self.pending.remove(&k);
+                }
+                Some(v) => {
+                    self.pending.insert(k, v);
+                }
+            }
+        }
+        self.open = self.open.saturating_sub(1);
+        if self.open == 0 {
+            self.undo.clear();
         }
     }
 
@@ -256,10 +307,14 @@ impl<S: KvStore> KvStore for Overlay<'_, S> {
 
     fn commit(&mut self, batch: WriteBatch) -> Result<(), KvError> {
         for op in batch.ops {
-            match op {
-                BatchOp::Put(k, v) => self.pending.insert(k, Some(v)),
-                BatchOp::Delete(k) => self.pending.insert(k, None),
+            let (k, v) = match op {
+                BatchOp::Put(k, v) => (k, Some(v)),
+                BatchOp::Delete(k) => (k, None),
             };
+            if self.open > 0 {
+                self.undo.push((k.clone(), self.pending.get(&k).cloned()));
+            }
+            self.pending.insert(k, v);
         }
         Ok(())
     }

@@ -11,11 +11,6 @@ publish = false
 [dependencies]
 {{sdk}}
 
-# Host-side index declarations read by `btb dev` (Table:index:kind@offset, see docs/DEV_SERVER.md).
-[package.metadata.btb]
-indexes = ["Note:owner:addr@0"]
-fields = ["Note:addr,bool,string"]
-
 [profile.release]
 opt-level = "s"
 panic = "abort"

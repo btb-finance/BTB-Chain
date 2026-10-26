@@ -37,6 +37,7 @@ jobs:
             examples/todo
             examples/launcher
             examples/nft
+            examples/caller
 
       - name: Format
         run: cargo fmt --all --check

@@ -37,7 +37,16 @@ An insert, update or delete is one `WriteBatch` holding the row, the counter and
 
 Host call 15, `table_index_scan`, exposes `query::by_index_range` to contracts (see [LANGUAGE.md](LANGUAGE.md)). `RuntimeHost` runs it on its overlay, so rows written earlier in the same call are visible and the scan is tracked: the index key range it covered (cut at the last returned entry when the limit stops it) and a point read for each row it loaded land in the read set. A subscribed query that uses an index therefore re-runs when an entry is added to, removed from or moved within the range, and not for other owners' rows. Gas: 400 + 1 per request byte + 40 per id returned + 1 per cursor byte. An unknown table or index yields an empty page.
 
-Index declarations are **temporary and host-side**: `Tables::register(contract, table, indexes)` with an extractor over the raw row bytes. A contract-side declaration is future work, together with rebuilding entries when a schema changes.
+## Declared tables and indexes
+
+Contracts declare tables with `#[btb::table]` and indexes with `#[index]` / `#[primary]` on fields ([LANGUAGE.md](LANGUAGE.md#tables-indexes-and-lookups)). The macro exports the schema as marker symbols in the ELF and `btb_runtime::schema::Schema::from_elf` reads it, so every node derives the same indexes from the same code: `btb dev`, `btb deploy` and the chain's `Deploy` (which also validates the schema and fails the deploy if it is inconsistent) all go through `Schema::index_defs()`.
+
+- **Types.** Field types use the text form of the [`btb-codec`](ENCODING.md) types: `u8`..`u128`, `i8`..`i128`, `bool`, `string`, `address`, `bytes`, `vec<T>`, `opt<T>`, `arr<T,N>`, tuples and table names (`Todo`).
+- **Extraction.** The extractor for field `k` walks the encoded row from byte 0, skipping fields `0..k` by their encoding (fixed sizes, `u32` length prefixes, option tags) and then reads field `k`. It is bounded by the row length: zero-size vector elements and recursive types are rejected when the schema is validated, nested types are limited to depth 8, and a row that does not parse (truncated, bad tag, a count larger than the row, invalid UTF-8 in a string key) is an `Extract` fault that aborts the write.
+- **Value families.** `u8`..`u64` and `bool` index as `U64`; `i8`..`i64` as `I64`; `u128` as `U128`; `string` as `Str`; `address`, `bytes` and `[u8; N]` as `Bytes`; `Option<T>` as `T`, with `None` left out of the index. The contract's `Key` for a lookup must be of the same family (the generated lookups guarantee it).
+- **Unique indexes.** `IndexDef::unique()` (what `#[primary]` sets) makes `Tables::insert` and `update` check, before building the batch, that no other row has the value; a clash is `TableError::Duplicate`, which is a `Fault` for the running call, so the whole call commits nothing. The check is a one-entry range read of the index, which is tracked in the read set like any scan.
+- **Host-side fallback.** `Tables::register(contract, table, indexes)` with a hand-written extractor still exists, and `Manifest.indexes` specs (`Table:index:addr@offset`) still register tables the ELF does not declare. A table in the ELF always wins over a spec.
+- Adding or changing an index does not rebuild entries of rows already stored; schema migration is future work.
 
 ## Storage deposits
 

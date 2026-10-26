@@ -3,7 +3,7 @@
 #![cfg(feature = "rocksdb")]
 
 use btb_codec::{Decode, Encode};
-use btb_dev::{IndexSpec, Server};
+use btb_dev::Server;
 use btb_runtime::rocks::RocksKv;
 use btb_runtime::{layout, KvStore, MemKv, RuntimeHost, Tables};
 use btb_vm::{Contract, FunctionKind};
@@ -107,13 +107,7 @@ fn start(elf: &[u8], dir: &std::path::Path) -> Server {
     // The previous server's threads may still hold the database lock for a moment.
     for _ in 0..50 {
         if let Ok(kv) = RocksKv::open(dir) {
-            return Server::start(
-                elf,
-                ("127.0.0.1", 0),
-                kv,
-                vec![IndexSpec::parse("Todo:owner:addr@0").unwrap()],
-            )
-            .unwrap();
+            return Server::start(elf, ("127.0.0.1", 0), kv, vec![]).unwrap();
         }
         std::thread::sleep(Duration::from_millis(100));
     }

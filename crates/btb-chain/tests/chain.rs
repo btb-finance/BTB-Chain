@@ -517,11 +517,12 @@ fn token_contract_end_to_end() {
 }
 
 #[test]
-fn todo_contract_with_manifest_indexes() {
+fn todo_contract_declares_its_indexes() {
+    // No `manifest.indexes`: the chain reads the indexes from the schema in the ELF.
     let (mut a, mut b) = (Wallet::new(1), Wallet::new(2));
     let mut n = net(&[&a, &b], RICH);
-    let mut m = manifest("todo");
-    m.indexes = vec!["Todo:owner:addr@0".into()];
+    let m = manifest("todo");
+    assert!(m.indexes.is_empty());
     let t = deployed(&n.run(vec![a.deploy(elf("todo"), m)])[0]);
     n.run(vec![a.transfer(t, 1_000_000_000)]);
     let r = n.run(vec![

@@ -35,7 +35,7 @@ pub(crate) fn relay_share(fee: u64, paid: bool) -> u64 {
 }
 use btb_codec::{Decode, Encode};
 use btb_runtime::kv::{BatchOp, KvStore, Overlay, WriteBatch};
-use btb_runtime::{layout, merkle, RuntimeHost};
+use btb_runtime::{layout, merkle, Callee, Resolver, RuntimeHost};
 use btb_vm::decode::Trap;
 use btb_vm::{CallError, Contract, FunctionKind};
 use std::collections::BTreeMap;
@@ -356,6 +356,41 @@ fn load_contract(
     Ok(c)
 }
 
+/// Finds the code of the contracts a running contract calls (`call_contract`). Reads through the
+/// call's own overlay, so the contract record read lands in the read set (parallel validation,
+/// subscriptions) and sees the block's earlier writes.
+pub(crate) struct ChainResolver<'c> {
+    pub(crate) cache: std::cell::RefCell<&'c mut BTreeMap<Hash, Arc<Contract>>>,
+    /// Parallel mode: the worker's table registry only holds what it registered itself, so
+    /// hand the callee's schemas to the running host.
+    pub(crate) lazy_tables: bool,
+}
+
+impl Resolver for ChainResolver<'_> {
+    fn resolve(
+        &self,
+        kv: &dyn KvStore,
+        addr: &Address,
+    ) -> Result<Option<Callee>, btb_runtime::KvError> {
+        let bad = |m: String| btb_runtime::KvError(m);
+        let Some(b) = kv.get(&contract_key(addr))? else {
+            return Ok(None);
+        };
+        let rec = ContractRecord::decode(&b).map_err(|e| bad(format!("stored contract: {e:?}")))?;
+        let contract =
+            load_contract(&mut self.cache.borrow_mut(), &rec.code).map_err(|e| bad(e.0))?;
+        let tables = if self.lazy_tables {
+            let mut t = btb_runtime::Tables::new();
+            register_manifest(&mut t, *addr, &rec.code, &rec.manifest)
+                .map_err(|m| bad(format!("stored manifest invalid: {m}")))?;
+            Some(t)
+        } else {
+            None
+        };
+        Ok(Some(Callee { contract, tables }))
+    }
+}
+
 /// The VM outcome of one call: gas used by the VM and either (output, writes) or a revert.
 type RunResult = (u64, Result<(Vec<u8>, WriteBatch), Revert>);
 
@@ -463,7 +498,12 @@ impl<S: KvStore> Ctx<'_, S> {
         {
             return Ok((0, Err(Revert::Action(ActionError::CallbackIsSystemOnly))));
         }
+        let resolver = ChainResolver {
+            cache: std::cell::RefCell::new(&mut *self.cache),
+            lazy_tables: self.lazy_tables,
+        };
         let mut host = RuntimeHost::new(&self.overlay, &self.tables, contract, caller, self.height);
+        host.enable_calls(&resolver, self.cfg.vm_memory as usize);
         // Randomness: only a marked mutation or cron may ask (the VM enforces that); its
         // bytes derive from the block beacon, this id (tx id, or the cron receipt id) and the
         // call index. Such a function is always charged its full gas limit, so a caller
@@ -582,7 +622,7 @@ impl<S: KvStore> Ctx<'_, S> {
             return fail(Revert::AddressTaken);
         }
         let mut tables = self.tables.clone();
-        if let Err(m) = register_manifest(&mut tables, addr, manifest) {
+        if let Err(m) = register_manifest(&mut tables, addr, code, manifest) {
             return fail(Revert::BadManifest(m));
         }
         // Nothing below can fail the transaction.
@@ -627,7 +667,8 @@ impl<S: KvStore> Ctx<'_, S> {
             });
         };
         if self.lazy_tables && self.registered.insert(*contract) {
-            if let Err(m) = register_manifest(&mut self.tables, *contract, &rec.manifest) {
+            if let Err(m) = register_manifest(&mut self.tables, *contract, &rec.code, &rec.manifest)
+            {
                 return Err(StateError(format!("stored manifest invalid: {m}")));
             }
         }
@@ -698,7 +739,9 @@ impl<S: KvStore> Ctx<'_, S> {
                     return Ok(refuse(intrinsic, ActionError::NoSuchContract));
                 };
                 if self.lazy_tables && self.registered.insert(*contract) {
-                    if let Err(m) = register_manifest(&mut self.tables, *contract, &rec.manifest) {
+                    if let Err(m) =
+                        register_manifest(&mut self.tables, *contract, &rec.code, &rec.manifest)
+                    {
                         return Err(StateError(format!("stored manifest invalid: {m}")));
                     }
                 }
@@ -1453,8 +1496,8 @@ impl Executor {
                         }
                         ctx.credit(&validator_pool(), out.validator)?;
                     }
-                    for (addr, manifest) in &out.deploys {
-                        register_manifest(&mut ctx.tables, *addr, manifest)
+                    for (addr, code, manifest) in &out.deploys {
+                        register_manifest(&mut ctx.tables, *addr, code, manifest)
                             .map_err(|m| StateError(format!("redeploy registration: {m}")))?;
                     }
                     ctx.cache.extend(out.cache);
@@ -1551,7 +1594,12 @@ impl Executor {
             .map_err(fault)?
             .ok_or(Revert::NoSuchContract)?;
         let c = load_contract(&mut state.code_cache, &rec.code).map_err(fault)?;
+        let resolver = ChainResolver {
+            cache: std::cell::RefCell::new(&mut state.code_cache),
+            lazy_tables: false,
+        };
         let mut host = RuntimeHost::new(&state.kv, &state.tables, *contract, *caller, height);
+        host.enable_calls(&resolver, state.config.vm_memory as usize);
         host.read_only = true;
         match c.call(
             FunctionKind::Query,

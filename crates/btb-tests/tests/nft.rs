@@ -3,7 +3,7 @@
 //! leave the store byte-for-byte unchanged.
 
 use btb_codec::{Address, Decode, Encode};
-use btb_runtime::{layout, IndexDef, IndexValue, KvStore, MemKv, RuntimeHost, Tables};
+use btb_runtime::{layout, KvStore, MemKv, RuntimeHost, Tables};
 use btb_sdk::token::Token;
 use btb_vm::{CallError, Contract, FunctionKind};
 use std::collections::BTreeMap;
@@ -37,20 +37,10 @@ impl Chain {
         let mut kv = MemKv::new();
         kv.put(&layout::balance_key(&CONTRACT), &1_000_000u64.to_le_bytes())
             .unwrap();
-        let mut tables = Tables::new();
-        tables
-            .register(
-                CONTRACT,
-                b"Nft",
-                vec![IndexDef::new("owner", |row| {
-                    Ok(Some(IndexValue::Bytes(row[..32].to_vec())))
-                })],
-            )
-            .unwrap();
         Chain {
             c: Contract::from_elf(elf()).expect("valid contract"),
             kv,
-            tables,
+            tables: common::declared_tables(CONTRACT, elf()),
         }
     }
 
@@ -396,4 +386,33 @@ fn listings_are_paged() {
     assert_eq!(pages, 2);
     // limit 0 is treated as 1.
     assert_eq!(ch.listings(0, 0).0.len(), 1);
+}
+
+/// `#[primary]` on `Listing::nft` is enforced by the runtime from the ELF's schema: a second row
+/// for the same NFT fails the call and commits nothing.
+#[test]
+fn declared_primary_key_rejects_a_second_listing_for_the_same_nft() {
+    use btb_runtime::{Fault, TableError};
+    use btb_vm::host::Host;
+    let ch = Chain::new();
+    let row = |nft: u64| {
+        let mut r = nft.encode();
+        r.extend_from_slice(&[1; 32]); // seller
+        r.extend_from_slice(&[2; 32]); // token
+        r.extend_from_slice(&5u128.encode());
+        r
+    };
+    let mut h = RuntimeHost::new(&ch.kv, &ch.tables, CONTRACT, [1; 32], 1);
+    h.table_insert(b"Listing", &row(7));
+    h.table_insert(b"Listing", &row(8));
+    h.table_insert(b"Listing", &row(7));
+    assert!(matches!(
+        h.finish(),
+        Err(Fault::Table(TableError::Duplicate { .. }))
+    ));
+    // Without the duplicate the same writes commit.
+    let mut h = RuntimeHost::new(&ch.kv, &ch.tables, CONTRACT, [1; 32], 1);
+    h.table_insert(b"Listing", &row(7));
+    h.table_insert(b"Listing", &row(8));
+    assert!(h.finish().is_ok());
 }

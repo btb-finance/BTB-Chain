@@ -2,7 +2,9 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { BtbClient, BtbError, t } from "../src/index.js";
+import { BtbClient, BtbError, ContractError, t } from "../src/index.js";
+// The client `btb codegen --ts` generated for examples/todo (golden-tested in crates/btb-cli).
+import { api } from "../../examples/todo/api/api";
 
 const root = resolve(import.meta.dirname, "../..");
 let proc: ChildProcess;
@@ -81,5 +83,46 @@ describe("BtbClient against btb-dev", () => {
     expect(e.message).toContain("no such todo");
     const e2 = await c.query("nope", t.unit, [], t.u64).catch((x) => x);
     expect(e2.status).toBe(404);
+  });
+
+  it("calls the contract through the generated typed api", async () => {
+    const dave = new BtbClient({ url, caller: "dave" });
+    const events = nextResult<[bigint, boolean, string][]>();
+    const stop = dave.subscribe(api.list_mine, [], events.push);
+    expect(await events.next()).toEqual([]);
+
+    const id = await dave.mutation(api.add, ["write docs"]);
+    expect(typeof id).toBe("bigint");
+    expect(await events.next()).toEqual([[id, false, "write docs"]]);
+    expect(await dave.mutation(api.toggle, [id])).toBe(true);
+    expect(await dave.query(api.list_mine)).toEqual([[id, true, "write docs"]]);
+
+    // A table row type: the Todo codec decodes the row struct the contract returns.
+    const rows = await dave.query(api.recent, [10]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ done: true, text: "write docs" });
+    expect(rows[0]!.owner).toHaveLength(32);
+
+    // Cursor pagination through the declared owner index, newest first.
+    const more = await dave.mutation(api.add, ["ship it"]);
+    const first = await dave.query(api.page_mine, [1, new Uint8Array(), true]);
+    expect(first[0].map((r) => r[0])).toEqual([more]);
+    expect(first[1].length).toBeGreaterThan(0);
+    const second = await dave.query(api.page_mine, [1, first[1], true]);
+    expect(second[0].map((r) => r[0])).toEqual([id]);
+    expect(second[1]).toHaveLength(0);
+    stop();
+  });
+
+  it("surfaces a Result error as a ContractError with the contract's message", async () => {
+    const erin = new BtbClient({ url, caller: "erin" });
+    const e = await erin.mutation(api.add, [""]).catch((x) => x);
+    expect(e).toBeInstanceOf(ContractError);
+    expect(e.reason).toBe("text must be 1..=280 bytes");
+    const e2 = await erin.mutation(api.toggle, [12345n]).catch((x) => x);
+    expect(e2).toBeInstanceOf(ContractError);
+    expect(e2.reason).toBe("no such todo");
+    // Nothing was written.
+    expect(await erin.query(api.list_mine)).toEqual([]);
   });
 });

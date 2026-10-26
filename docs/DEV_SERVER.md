@@ -8,7 +8,7 @@ cargo run -p btb-dev -- examples/todo/todo.elf --port 8787
 # open http://127.0.0.1:8787/ in two tabs
 ```
 
-Flags: `--port N` (default 8787, 0 = any free port), `--index Table:index:addr@offset` (repeatable, see below), `--data DIR` (RocksDB; needs `cargo run -p btb-dev --features rocksdb`, default is memory and state is lost on exit).
+Flags: `--port N` (default 8787, 0 = any free port), `--index Table:index:addr@offset` (deprecated, repeatable, see below), `--data DIR` (RocksDB; needs `cargo run -p btb-dev --features rocksdb`, default is memory and state is lost on exit).
 
 ## HTTP API
 
@@ -28,9 +28,11 @@ Failures return JSON `{"error": "..."}`: 400 (abort or bad arguments), 404 (no s
 
 **Caller identity (dev only).** There is no signature check. The caller is the `X-BTB-Caller` header, or `?caller=` because `EventSource` cannot set headers. 64 hex characters are used as the 32-byte address; any other text (`alice`) is hashed with SHA-256. No value means `anonymous`. A subscription keeps the caller it was opened with and re-runs as that caller.
 
-## Temporary: index declarations
+## Index declarations
 
-Contracts cannot declare indexes yet. The dev server registers them on the host side with `--index Table:index:kind@offset`: the index value is the `addr` (32 bytes, an `Address`) or `u64` (8 bytes LE) at byte `offset` of the encoded row. With no `--index` flag it registers `Todo:owner:addr@0` for the demo. This is a stand-in for contract-side declarations (and a deploy manifest), which will replace the flag; rows written before an index was registered are not indexed.
+Contracts declare their own indexes: `#[index]` / `#[primary]` on the fields of a `#[btb::table]` struct ([LANGUAGE.md](LANGUAGE.md#tables-indexes-and-lookups)). The macro exports the schema in the ELF and the dev server registers the indexes from it when it starts and on every hot reload (`btb_runtime::schema`), so there is nothing to configure: the todo demo's `list_mine` reads through the `owner` index of the contract it is given. A `#[primary]` field is unique: a second row with the same key aborts the call. Rows written before an index was registered are not indexed (a reload that adds an index does not re-index existing rows; restart for a clean state).
+
+The old host-side flag `--index Table:index:kind@offset` (the value is the `addr` or `u64` at byte `offset` of the row) and `[package.metadata.btb] indexes` in `btb dev` projects are **deprecated**. They still register an index for a table the ELF does not declare, and `btb dev` / `btb deploy` print a warning when the metadata is present; for a table the ELF declares they are ignored. Only a contract that declares no table at all gets the old `Todo:owner:addr@0` default.
 
 ## State and limits
 
@@ -38,7 +40,7 @@ One contract at a time, at the fixed address `[0xDE; 32]`, funded with 10^12 bas
 
 ## Library API (used by `btb dev`)
 
-`Server::start(elf, bind, store, indexes)` starts a server. `server.reload(elf)` validates a new build and swaps it in while keeping all state (the `KvStore`, block height and subscriptions); on an invalid ELF the old contract keeps running. After a swap every open subscription re-runs against the new code and pushes its result if it changed (a stream whose query no longer exists ends). `server.set_page(Some(html))` serves a project's own page at `/` instead of the todo demo.
+`Server::start(elf, bind, store, indexes)` starts a server. `server.reload(elf)` validates a new build and swaps it in while keeping all state (the `KvStore`, block height and subscriptions); on an invalid ELF the old contract keeps running. After a swap every open subscription re-runs against the new code and pushes its result if it changed (a stream whose query no longer exists ends). `server.set_page(Some(html))` serves a project's own page at `/` instead of the todo demo. `indexes` is the deprecated list of host-side specs (pass `vec![]`: the ELF's schema registers the rest).
 
 ## Dashboard and admin endpoints
 
@@ -50,15 +52,14 @@ One contract at a time, at the fixed address `[0xDE; 32]`, funded with 10^12 bas
 - **Storage keys** (`0x01`) with hex and text, and **tokens** created by the contract with their top holders.
 - **Live**: the page opens `GET /admin/events`; when a commit touches the selected table the rows reload, and the list, counts and info refresh on every commit.
 
-**Field hints** tell the dashboard how to decode rows with the [ENCODING.md](ENCODING.md) rules. The row is a tuple of the listed types: `addr bool string bytes u8 u16 u32 u64 u128 i8 i16 i32 i64 i128`. Set them with `--fields Table:addr,bool,string` (repeatable; with none, the todo demo gets `Todo:addr,bool,string`), or in a `btb dev` project:
+**Field hints** tell the dashboard how to decode rows with the [ENCODING.md](ENCODING.md) rules. The row is a tuple of the listed types: `addr bool string bytes u8 u16 u32 u64 u128 i8 i16 i32 i64 i128`. Without hints they are **derived from the contract's schema** whenever every field has one of those types (a table with a `Vec<_>` field has no automatic hint). Override them with `--fields Table:addr,bool,string` (repeatable), or in a `btb dev` project:
 
 ```toml
 [package.metadata.btb]
-indexes = ["Note:owner:addr@0"]
 fields = ["Note:addr,bool,string"]
 ```
 
-A row that does not match its hint (wrong type or trailing bytes) shows `decode_error` next to its hex. Without a hint only hex is shown. Library: `Server::set_fields(...)`, `parse_fields(...)`.
+A row that does not match its hint (wrong type or trailing bytes) shows `decode_error` next to its hex. Without a hint (explicit or derived) only hex is shown. Library: `Server::set_fields(...)`, `parse_fields(...)`.
 
 ### `/admin` JSON API (read-only, development only)
 

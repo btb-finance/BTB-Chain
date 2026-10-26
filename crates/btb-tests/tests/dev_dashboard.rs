@@ -1,7 +1,7 @@
 //! The dev dashboard: `/dashboard` page and read-only `/admin/...` JSON endpoints, checked
 //! against the real `examples/todo` contract.
 
-use btb_dev::{parse_fields, IndexSpec, Server};
+use btb_dev::{parse_fields, Server};
 use btb_runtime::MemKv;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -10,15 +10,14 @@ use std::time::Duration;
 mod common;
 
 fn start() -> Server {
-    let s = Server::start(
+    // No index specs and no field hints: both come from the schema in the ELF.
+    Server::start(
         &common::build_example("todo"),
         ("127.0.0.1", 0),
         MemKv::new(),
-        vec![IndexSpec::parse("Todo:owner:addr@0").unwrap()],
+        vec![],
     )
-    .unwrap();
-    s.set_fields(vec![parse_fields("Todo:addr,bool,string").unwrap()]);
-    s
+    .unwrap()
 }
 
 fn http(addr: SocketAddr, method: &str, target: &str, body: &str) -> (String, String) {
@@ -74,7 +73,7 @@ fn dashboard_page_and_overview_list_tables_with_counts() {
     let o = get(a, "/admin/overview");
     assert!(
         o.contains(
-            r#"{"name":"Todo","rows":4,"indexes":["owner"],"fields":["addr","bool","string"]}"#
+            r#"{"name":"Todo","rows":4,"indexes":["owner","created"],"fields":["addr","bool","u64","string"]}"#
         ),
         "{o}"
     );
@@ -95,10 +94,8 @@ fn table_rows_are_paged_and_decoded() {
     }
     let p1 = get(a, "/admin/table/Todo?limit=2");
     assert!(p1.contains("\"total\":5"));
-    assert!(p1.contains(&format!(
-        "\"decoded\":[\"{}\",false,\"item 0\"]",
-        alice_hex()
-    )));
+    assert!(p1.contains(&format!("\"decoded\":[\"{}\",false,", alice_hex())));
+    assert!(p1.contains(",\"item 0\"]"));
     assert!(p1.contains("\"id\":0") && p1.contains("\"id\":1") && !p1.contains("\"id\":2"));
     let cur = p1
         .split("\"next_cursor\":\"")
@@ -131,9 +128,9 @@ fn raw_hex_without_hint_and_decode_error_on_mismatch() {
     let server = start();
     let a = server.addr();
     add(a, &alice_hex(), "hi");
-    server.set_fields(vec![]);
+    // Without explicit hints the dashboard decodes from the contract's schema.
     let r = get(a, "/admin/table/Todo");
-    assert!(r.contains("\"hex\":\"") && !r.contains("decoded"));
+    assert!(r.contains("\"hex\":\"") && r.contains("\"decoded\":["));
     server.set_fields(vec![parse_fields("Todo:u64").unwrap()]);
     assert!(get(a, "/admin/table/Todo").contains("decode_error"));
     assert!(parse_fields("Todo:float").is_err());
