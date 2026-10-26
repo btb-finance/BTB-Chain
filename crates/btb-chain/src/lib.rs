@@ -19,11 +19,13 @@ pub mod mempool;
 pub mod oracle;
 pub(crate) mod parallel;
 pub mod reports;
+pub mod session;
 pub mod site;
 pub mod staking;
 pub mod state;
 pub mod storage;
 pub mod tx;
+pub mod upgrade;
 pub mod vault;
 pub mod vault_plan;
 pub mod xdkg;
@@ -41,6 +43,7 @@ pub use host::{HostError, HostOp};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
 pub use oracle::{OracleGenesis, OracleInput, PairConfig, PriceRules};
 pub use parallel::ParStats;
+pub use session::{Grant, Scope, SessionError, SessionOp};
 pub use staking::{
     ActiveValidator, EpochRecord, GenesisValidator, SlashOutcome, StakeError, StakingConfig,
     ValidatorInfo,
@@ -51,6 +54,9 @@ pub use tx::{
     account_address, contract_address, Address, Hash, Manifest, SigningKey, Transaction, TxBody,
     TxError, TxKind,
 };
+
+pub use tx::UpgradePolicy;
+pub use upgrade::{upgrade_pool, UpgradeError, UpgradeStatus};
 
 use sha2::{Digest, Sha256};
 

@@ -32,6 +32,7 @@ pub mod num {
     pub const TOKEN_MINT: u64 = 21;
     pub const TOKEN_BURN: u64 = 22;
     pub const CONTRACT_ADDRESS: u64 = 23;
+    pub const CALLER_VIA_SESSION: u64 = 60;
     pub const NOT_FOUND: u64 = u64::MAX;
 }
 
@@ -109,6 +110,11 @@ pub fn caller() -> Address {
     let mut a = [0u8; 32];
     ecall(num::CALLER, a.as_mut_ptr() as u64, 0, 0, 0, 0);
     Address(a)
+}
+
+/// Whether the call came from a session key of `caller()` (`auth::via_session`).
+pub fn caller_via_session() -> bool {
+    ecall(num::CALLER_VIA_SESSION, 0, 0, 0, 0, 0) != 0
 }
 
 /// Address of this contract (its token balances live here; match it against a mint authority).

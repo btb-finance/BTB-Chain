@@ -38,6 +38,39 @@ pub fn build_example(name: &str) -> Vec<u8> {
     .expect("read contract ELF")
 }
 
+/// Like `build_example`, with Cargo `features` (comma separated; empty for none). Builds are
+/// serialised so that tests running in parallel cannot read each other's ELF.
+pub fn build_example_with(name: &str, features: &str) -> Vec<u8> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name);
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.args(["build", "--release", "--quiet"]);
+    if !features.is_empty() {
+        cmd.args(["--features", features]);
+    }
+    let status = cmd
+        .current_dir(&dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_TARGET_DIR")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .status()
+        .expect("run cargo");
+    assert!(
+        status.success(),
+        "building examples/{name} [{features}] failed"
+    );
+    std::fs::read(
+        dir.join("target/riscv64imac-unknown-none-elf/release")
+            .join(name),
+    )
+    .expect("read contract ELF")
+}
+
 /// Call a function with encoded `input`; returns `(output, gas_used)`.
 pub fn call(
     c: &Contract,

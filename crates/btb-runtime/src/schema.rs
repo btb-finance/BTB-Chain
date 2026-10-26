@@ -6,7 +6,13 @@
 //! ```text
 //! btb_schema_table_<Name>_<hex>            hex of  f=owner:address|done:bool;i=owner;p=id
 //! btb_schema_fn_<kind>_<name>_<hex>        hex of  a=text:string|n:u64;r=u64;e=1
+//! btb_schema_prev_<Name>_<ver>_<hex>       an earlier shape of table <Name> (same payload as a table)
+//! btb_schema_migrate_<Name>_<from>_<hex>   a migration from version <from> of <Name> (payload `m=1`)
 //! ```
+//!
+//! A table payload may end in `;v=<version>` (default 1). A migration is run by the chain as the
+//! pure entry `btb_transform_migrate_<name lowercased>_<from>`: old row bytes in, new row bytes
+//! out (see [`migration_entry`] and `evolve`).
 //!
 //! Types are written in a small text grammar over the `btb-codec` types (see [`Ty`]). The host
 //! and the chain derive index extractors from it, so a contract no longer needs `Cargo.toml`
@@ -23,8 +29,19 @@ use std::sync::Arc;
 pub const TABLE_PREFIX: &str = "btb_schema_table_";
 /// Prefix of the function markers.
 pub const FN_PREFIX: &str = "btb_schema_fn_";
+/// Prefix of the markers of earlier shapes of a table (`#[btb::table(version = N, of = "T")]`).
+pub const PREV_PREFIX: &str = "btb_schema_prev_";
+/// Prefix of the migration markers (`#[btb::migration(from = N)]`).
+pub const MIGRATE_PREFIX: &str = "btb_schema_migrate_";
+
+/// Name of the pure entry point (`btb_transform_<this>`) that migrates rows of `table` from
+/// `from`. The table name is lowercased because entry names are `[a-z0-9_]`.
+pub fn migration_entry(table: &str, from: u32) -> String {
+    format!("migrate_{}_{from}", table.to_ascii_lowercase())
+}
 
 const MAX_TABLES: usize = 64;
+const MAX_PREVIOUS: usize = 64;
 const MAX_FUNCTIONS: usize = 256;
 const MAX_FIELDS: usize = 64;
 const MAX_PAYLOAD: usize = 16 * 1024;
@@ -349,6 +366,11 @@ impl Ty {
         }
     }
 
+    /// Is this `Option<_>`? A row may end before its trailing options (they read as `None`).
+    pub fn is_opt(&self) -> bool {
+        matches!(self, Ty::Opt(_))
+    }
+
     /// What kind of index value this type makes, if it can be indexed.
     pub fn index_kind(&self) -> Option<IndexKind> {
         match self {
@@ -453,6 +475,9 @@ pub struct TableSchema {
     pub indexes: Vec<String>,
     /// The `#[primary]` field: indexed and unique.
     pub primary: Option<String>,
+    /// Schema version of the table (`#[btb::table(version = N)]`, default 1). Raise it when the
+    /// row layout changes incompatibly and provide a `#[btb::migration(from = old)]`.
+    pub version: u32,
 }
 
 /// One contract function.
@@ -473,6 +498,11 @@ pub struct FnSchema {
 pub struct Schema {
     pub tables: Vec<TableSchema>,
     pub functions: Vec<FnSchema>,
+    /// Earlier shapes of tables, declared so that migrations can name the old row type. Sorted by
+    /// (table, version).
+    pub previous: Vec<TableSchema>,
+    /// Declared migrations `(table, from version)`, sorted.
+    pub migrations: Vec<(String, u32)>,
 }
 
 impl TableSchema {
@@ -521,6 +551,20 @@ impl Schema {
                     .rsplit_once('_')
                     .ok_or_else(|| format!("bad schema symbol {sym:?}"))?;
                 s.tables.push(parse_table(name, &unhex(hex)?)?);
+            } else if let Some(rest) = sym.strip_prefix(PREV_PREFIX) {
+                let bad = || format!("bad schema symbol {sym:?}");
+                let (head, hex) = rest.rsplit_once('_').ok_or_else(bad)?;
+                let (name, ver) = head.rsplit_once('_').ok_or_else(bad)?;
+                let mut t = parse_table(name, &unhex(hex)?)?;
+                t.version = ver.parse().map_err(|_| bad())?;
+                s.previous.push(t);
+            } else if let Some(rest) = sym.strip_prefix(MIGRATE_PREFIX) {
+                let bad = || format!("bad schema symbol {sym:?}");
+                let (head, hex) = rest.rsplit_once('_').ok_or_else(bad)?;
+                unhex(hex)?;
+                let (name, from) = head.rsplit_once('_').ok_or_else(bad)?;
+                s.migrations
+                    .push((name.to_string(), from.parse().map_err(|_| bad())?));
             } else if let Some(rest) = sym.strip_prefix(FN_PREFIX) {
                 let (head, hex) = rest
                     .rsplit_once('_')
@@ -530,10 +574,17 @@ impl Schema {
                     .ok_or_else(|| format!("bad schema symbol {sym:?}"))?;
                 s.functions.push(parse_fn(kind, name, &unhex(hex)?)?);
             }
-            if s.tables.len() > MAX_TABLES || s.functions.len() > MAX_FUNCTIONS {
+            if s.tables.len() > MAX_TABLES
+                || s.functions.len() > MAX_FUNCTIONS
+                || s.previous.len() > MAX_PREVIOUS
+                || s.migrations.len() > MAX_PREVIOUS
+            {
                 return Err("too many schema entries".into());
             }
         }
+        s.previous
+            .sort_by(|a, b| (&a.name, a.version).cmp(&(&b.name, b.version)));
+        s.migrations.sort();
         s.tables.sort_by(|a, b| a.name.cmp(&b.name));
         s.functions
             .sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
@@ -589,6 +640,84 @@ impl Schema {
                 return Err(format!("function {} {} declared twice", f.kind, f.name));
             }
         }
+        for (i, p) in self.previous.iter().enumerate() {
+            if self.previous[..i]
+                .iter()
+                .any(|o| o.name == p.name && o.version == p.version)
+            {
+                return Err(format!(
+                    "table {} version {} declared twice",
+                    p.name, p.version
+                ));
+            }
+            if p.fields.len() > MAX_FIELDS {
+                return Err(format!("table {} v{}: too many fields", p.name, p.version));
+            }
+            for (f, ty) in &p.fields {
+                ty.validate(&st, 0)
+                    .map_err(|e| format!("table {} v{}.{f}: {e}", p.name, p.version))?;
+            }
+            match self.table(&p.name) {
+                None => {
+                    return Err(format!(
+                        "old shape v{} of unknown table {}",
+                        p.version, p.name
+                    ))
+                }
+                Some(t) if t.version <= p.version => {
+                    return Err(format!(
+                        "table {}: old shape v{} must have a lower version than the table (v{})",
+                        p.name, p.version, t.version
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        for (i, (t, from)) in self.migrations.iter().enumerate() {
+            if self.migrations[..i].contains(&(t.clone(), *from)) {
+                return Err(format!("migration of {t} from v{from} declared twice"));
+            }
+            if self.table(t).is_none() {
+                return Err(format!("migration of unknown table {t}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The declared old shape `version` of `table`.
+    pub fn previous_shape(&self, table: &str, version: u32) -> Option<&TableSchema> {
+        self.previous
+            .iter()
+            .find(|p| p.name == table && p.version == version)
+    }
+
+    /// Is there a migration of `table` from `version`?
+    pub fn has_migration(&self, table: &str, from: u32) -> bool {
+        self.migrations.contains(&(table.to_string(), from))
+    }
+
+    /// Check `row` is exactly one well-formed encoding of table `table`'s fields (what a
+    /// migration must produce): every field parses and no byte is left over. A row that ends
+    /// early where only trailing `Option` fields remain is accepted (they read as `None`).
+    pub fn validate_row(&self, table: &str, row: &[u8]) -> Result<(), String> {
+        let t = self
+            .table(table)
+            .ok_or_else(|| format!("unknown table {table}"))?;
+        let st = self.structs();
+        let mut pos = 0;
+        for (name, ty) in &t.fields {
+            if pos == row.len() && ty.is_opt() {
+                continue;
+            }
+            ty.skip(row, &mut pos, &st, 0)
+                .map_err(|e| format!("field {name}: {e}"))?;
+        }
+        if pos != row.len() {
+            return Err(format!(
+                "{} trailing bytes after the last field",
+                row.len() - pos
+            ));
+        }
         Ok(())
     }
 
@@ -613,7 +742,15 @@ impl Schema {
                         let def = IndexDef::new(ix, move |row| {
                             let mut pos = 0;
                             for ty in &tys[..k] {
+                                // A row stored before trailing `Option` fields were appended
+                                // ends early; the missing fields read as `None`.
+                                if pos == row.len() && ty.is_opt() {
+                                    continue;
+                                }
                                 ty.skip(row, &mut pos, &st, 0)?;
+                            }
+                            if pos == row.len() && tys[k].is_opt() {
+                                return Ok(None);
                             }
                             tys[k].read_key(row, &mut pos)
                         });
@@ -681,11 +818,20 @@ fn parse_table(name: &str, payload: &[u8]) -> Result<TableSchema, String> {
         .filter(|n| ix.contains(n) || primary.as_ref() == Some(n))
         .cloned()
         .collect();
+    let version = match m.get("v") {
+        None => 1,
+        Some(v) => v
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v >= 1)
+            .ok_or_else(|| format!("bad table version {v:?}"))?,
+    };
     Ok(TableSchema {
         name: name.to_string(),
         fields,
         indexes,
         primary,
+        version,
     })
 }
 

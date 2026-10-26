@@ -426,6 +426,9 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     fn caller(&self) -> Address {
         self.0.caller()
     }
+    fn caller_via_session(&self) -> bool {
+        self.0.caller_via_session()
+    }
     fn contract_address(&self) -> Address {
         self.0.contract_address()
     }
@@ -470,6 +473,12 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     }
     fn report_request(&mut self, data: &[u8]) -> Option<u64> {
         self.0.report_request(data)
+    }
+    fn file_info(&mut self, root: &[u8; 32]) -> Option<crate::host::FileRecord> {
+        self.0.file_info(root)
+    }
+    fn file_pin(&mut self, pin: &crate::host::FilePin) -> u64 {
+        self.0.file_pin(pin)
     }
     fn call_contract(&mut self, req: &crate::host::CallRequest<'_>) -> crate::host::CallReply {
         // The dispatcher already put this frame's read-only state into `req.read_only`.

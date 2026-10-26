@@ -1,6 +1,7 @@
 import { type ArgsParam, type MutationRef, type QueryRef, isFnRef } from "./api.js";
 import { type Codec, decode, encode, fromHex, toHex } from "./codec.js";
 import type { ProofBundle } from "./proof.js";
+import type { BtbAuth } from "./auth.js";
 import { type TxKind, signTransaction } from "./tx.js";
 
 export class BtbError extends Error {
@@ -54,6 +55,12 @@ export interface BtbClientOptions {
   relayUrl?: string;
   /** Hex address of that node's relayer account. Default: asked from `GET /relay` on first use. */
   relayer?: string;
+  /**
+   * Session-key auth (`BtbAuth`). When someone is logged in, queries use the account as caller
+   * and mutations are sent as session-signed transactions (`X-BTB-Tx`, for `btb-dev --auth
+   * signed`).
+   */
+  auth?: BtbAuth;
 }
 
 /** A transaction submitted through a relay. */
@@ -68,7 +75,8 @@ export type Unsubscribe = () => void;
 
 export class BtbClient {
   readonly url: string;
-  readonly caller: string | undefined;
+  private readonly callerOpt: string | undefined;
+  readonly auth: BtbAuth | undefined;
   private readonly fetchFn: typeof fetch;
   private readonly ES: typeof EventSource | null;
   private readonly reconnectMs: number;
@@ -77,12 +85,31 @@ export class BtbClient {
 
   constructor(opts: BtbClientOptions) {
     this.url = opts.url.replace(/\/+$/, "");
-    this.caller = opts.caller;
+    this.callerOpt = opts.caller;
+    this.auth = opts.auth;
     this.fetchFn = opts.fetch ?? ((...a) => globalThis.fetch(...a));
     this.ES = opts.EventSource === undefined ? (globalThis.EventSource ?? null) : opts.EventSource;
     this.reconnectMs = opts.reconnectMs ?? 1000;
     this.relayBase = (opts.relayUrl ?? this.url.replace(/\/c\/[0-9a-fA-F]{64}$/, "")).replace(/\/+$/, "");
     this.relayerHex = opts.relayer?.toLowerCase();
+  }
+
+  /**
+   * Where the file endpoints live (`/upload`, `/file/<root>`): the node `url` without a
+   * `/c/<contract>` suffix.
+   */
+  get filesBase(): string {
+    return this.url.replace(/\/c\/[^/]+$/, "");
+  }
+
+  /** `fetch` through the client's own fetch (used by the file helpers). */
+  fetchRaw(input: string, init?: RequestInit): Promise<Response> {
+    return this.fetchFn(input, init);
+  }
+
+  /** The caller identity sent with queries: the logged-in account, else the `caller` option. */
+  get caller(): string | undefined {
+    return this.auth?.identity?.account ?? this.callerOpt;
   }
 
   private async relayRequest<T>(path: string, init: RequestInit): Promise<T> {
@@ -131,6 +158,17 @@ export class BtbClient {
     return this.relayRequest(`/tx/${id}`, { method: "GET" });
   }
 
+  /** Poll `receipt(id)` until the host has executed the transaction; rejects on timeout. */
+  async waitForReceipt(id: string, timeoutMs = 60_000, pollMs = 200): Promise<Record<string, unknown>> {
+    const end = Date.now() + timeoutMs;
+    for (;;) {
+      const r = await this.receipt(id);
+      if (r) return r;
+      if (Date.now() > end) throw new BtbError(`no receipt for ${id} after ${timeoutMs} ms`);
+      await new Promise((res) => setTimeout(res, pollMs));
+    }
+  }
+
   private target(kind: "query" | "mutation" | "subscribe", name: string, args: Uint8Array): string {
     const q = new URLSearchParams();
     if (args.length > 0) q.set("args", toHex(args));
@@ -148,14 +186,22 @@ export class BtbClient {
   ): Promise<R> {
     let res: Response;
     try {
-      res = await this.fetchFn(this.target(kind, name, encode(argsType, args)), {
+      const bytes = encode(argsType, args);
+      const headers: Record<string, string> = {};
+      if (kind === "mutation" && this.auth?.identity) headers["x-btb-tx"] = toHex(await this.auth.signCall(name, bytes));
+      res = await this.fetchFn(this.target(kind, name, bytes), {
         method: kind === "query" ? "GET" : "POST",
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
       });
     } catch (e) {
       throw new BtbError(`network error: ${(e as Error).message}`);
     }
     const text = await res.text();
-    if (!res.ok) throw httpError(text, res.status);
+    if (!res.ok) {
+      // A refused signed transaction did not use its nonce: count from the chain again.
+      if (kind === "mutation") this.auth?.resetNonce();
+      throw httpError(text, res.status);
+    }
     return decode(resultType, fromHex(text.trim()));
   }
 

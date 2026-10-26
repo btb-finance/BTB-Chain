@@ -1,0 +1,36 @@
+[package]
+name = "evolve"
+description = "Test contract for upgrades and schema migrations (one source, several versions chosen by feature)"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone workspace: this crate only builds for riscv64imac-unknown-none-elf (see .cargo/config.toml).
+[workspace]
+
+[features]
+# v1 (no feature): Todo { owner (index), done, text }.
+# compat: appended `note: Option<String>`, new index on `done`, new table `Tag` (compatible).
+compat = []
+# bad: `done` becomes a u8 without a migration (rejected).
+bad = []
+# migrate: version 2, `done: bool` becomes `status: u8` (indexed), with a migration.
+migrate = []
+# fail: like migrate, but the migration aborts on the text "bad".
+fail = []
+# wrongprev: like migrate, but the declared old row type does not match the stored one.
+wrongprev = []
+
+[dependencies]
+btb-sdk = { path = "../../crates/btb-sdk", features = ["runtime"] }
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"

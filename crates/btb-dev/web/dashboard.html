@@ -18,8 +18,9 @@ main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:16px}
 section{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:10px 12px;margin-bottom:12px}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 8px}
 ul{list-style:none;margin:0;padding:0}
+#contracts li{padding:5px 8px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between}
 #tables li{padding:5px 8px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between}
-#tables li.sel{background:var(--acc);color:#fff}
+#tables li.sel,#contracts li.sel{background:var(--acc);color:#fff}
 #tables li.flash{outline:2px solid var(--ok)}
 dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 10px}dt{color:var(--mut)}dd{margin:0;word-break:break-all}
 table{border-collapse:collapse;width:100%}
@@ -40,6 +41,7 @@ button{cursor:pointer}button:disabled{opacity:.4;cursor:default}
 </header>
 <main>
   <div>
+    <section id="contractsec" hidden><h2>Contracts</h2><ul id="contracts"></ul></section>
     <section><h2>Contract</h2><dl id="info"></dl></section>
     <section><h2>Tables</h2><ul id="tables"></ul></section>
     <section><h2>Tokens</h2><div id="tokens" class="mono">none</div></section>
@@ -58,16 +60,20 @@ button{cursor:pointer}button:disabled{opacity:.4;cursor:default}
       <div class="wrap"><table id="rows"><thead></thead><tbody></tbody></table></div>
       <div id="msg" class="err"></div>
     </section>
+    <section id="filesec" hidden><h2>Files</h2><div class="wrap"><table id="files"><thead><tr><th>root</th><th>bytes</th><th>status</th><th>expiry</th></tr></thead><tbody></tbody></table></div></section>
     <section><h2>Storage keys</h2><div class="wrap"><table id="storage"><thead><tr><th>key</th><th>text</th><th>value (hex)</th></tr></thead><tbody></tbody></table></div></section>
   </div>
 </main>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const state = {table: null, stack: [], cursor: null, next: null, idx: null, val: ''};
+const state = {contract: null, table: null, stack: [], cursor: null, next: null, idx: null, val: ''};
 let info = null;
 
 async function api(path) {
+  if (state.contract && path.startsWith('/admin/') && !path.startsWith('/admin/contracts') && !path.startsWith('/admin/files')) {
+    path += (path.includes('?') ? '&' : '?') + 'contract=' + encodeURIComponent(state.contract);
+  }
   const r = await fetch(path);
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || r.statusText);
@@ -81,6 +87,27 @@ function el(tag, text, cls) {
 }
 function short(h) { return h.length > 20 ? h.slice(0, 10) + '...' + h.slice(-6) : h; }
 function show(v) { return typeof v === 'string' ? v : JSON.stringify(v); }
+
+async function loadContracts() {
+  const j = await api('/admin/contracts');
+  $('contractsec').hidden = j.contracts.length < 2;
+  if (!state.contract) state.contract = j.contracts[0].name;
+  const ul = $('contracts'); ul.textContent = '';
+  for (const c of j.contracts) {
+    const li = el('li'); li.dataset.name = c.name;
+    li.append(el('span', c.name), el('span', short(c.address), 'warn'));
+    if (c.name === state.contract) li.className = 'sel';
+    li.onclick = () => { state.contract = c.name; state.table = null; refreshAll(null).catch(e => $('msg').textContent = e.message); };
+    ul.append(li);
+  }
+}
+
+async function loadFiles() {
+  const j = await api('/admin/files');
+  $('filesec').hidden = !j.files.length;
+  const b = $('files').tBodies[0]; b.textContent = '';
+  for (const f of j.files) { const r = b.insertRow(); r.append(el('td', f.root, 'hex'), el('td', String(f.bytes)), el('td', f.status), el('td', String(f.expiry))); }
+}
 
 async function loadOverview() {
   info = await api('/admin/overview');
@@ -182,8 +209,10 @@ $('prev').onclick = () => { state.cursor = state.stack.pop() || null; loadRows()
 $('order').onchange = $('limit').onchange = () => { state.stack = []; state.cursor = null; loadRows(); };
 
 async function refreshAll(ev) {
+  await loadContracts();
   await loadOverview();
-  if (ev && ev.tables.includes(state.table)) {
+  await loadFiles();
+  if (ev && ev.tables.includes(state.table) && (!ev.contracts || !ev.contracts.length || ev.contracts.includes(state.contract))) {
     const li = [...$('tables').children].find(l => l.dataset.name === state.table);
     if (li) { li.classList.add('flash'); setTimeout(() => li.classList.remove('flash'), 600); }
     await loadRows();

@@ -393,20 +393,178 @@ impl syn::parse::Parse for EntryArgs {
 /// (so the host and the chain register the indexes) and generates typed lookups:
 /// `Todo::by_owner(addr)`, `Todo::by_created_range(a..b)` and, for the primary key,
 /// `Todo::get_by_<field>(v)`. Each returns or yields `(id, row)`.
+///
+/// `#[btb::table(version = N)]` sets the table's schema version (default 1);
+/// `#[btb::table(version = N, of = "Table")]` declares an earlier row shape for a
+/// `#[btb::migration]` (codec only). Trailing `Option` fields decode as `None` when a stored row
+/// ends before them, so appending options is a compatible change.
 #[proc_macro_attribute]
 pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
     let st = parse_macro_input!(item as ItemStruct);
-    if !attr.is_empty() {
-        return syn::Error::new(
-            TokenStream2::from(attr).span(),
-            "no arguments supported yet",
-        )
-        .to_compile_error()
-        .into();
-    }
-    expand_table(st)
+    let args = match syn::parse::<TableArgs>(attr) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    expand_table(st, args)
         .unwrap_or_else(|e| e.to_compile_error())
         .into()
+}
+
+/// Migrate the rows of a table to its new layout after a contract upgrade.
+///
+/// ```ignore
+/// #[btb::table(version = 1, of = "Todo")]   // the old row type: same fields as the stored rows
+/// pub struct TodoV1 { pub owner: Address, pub done: bool, pub text: String }
+///
+/// #[btb::table(version = 2)]
+/// pub struct Todo { #[index] pub owner: Address, pub status: u8, pub text: String }
+///
+/// #[btb::migration(from = 1)]
+/// fn todo_v1_to_v2(row: TodoV1) -> Todo {
+///     Todo { owner: row.owner, status: row.done as u8, text: row.text }
+/// }
+/// ```
+///
+/// The function must be pure: the chain runs it row by row in a state-less VM (no storage, no
+/// tables, no clock), charging its gas to the upgrade budget. It exports
+/// `btb_transform_migrate_<table lowercased>_<from>` and a schema marker
+/// `btb_schema_migrate_<Table>_<from>_<hex>`; the table is the name of the return type.
+#[proc_macro_attribute]
+pub fn migration(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    match expand_migration(attr.into(), &func) {
+        Ok(ts) => ts.into(),
+        Err(e) => {
+            let e = e.to_compile_error();
+            quote!(#func #e).into()
+        }
+    }
+}
+
+fn expand_migration(attr: TokenStream2, func: &ItemFn) -> syn::Result<TokenStream2> {
+    struct From(u32);
+    impl syn::parse::Parse for From {
+        fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+            let key: syn::Ident = input.parse()?;
+            if key != "from" {
+                return Err(syn::Error::new(key.span(), "expected `from = N`"));
+            }
+            input.parse::<syn::Token![=]>()?;
+            let lit: syn::LitInt = input.parse()?;
+            let n: u32 = lit.base10_parse()?;
+            if n == 0 {
+                return Err(syn::Error::new(lit.span(), "versions start at 1"));
+            }
+            Ok(From(n))
+        }
+    }
+    let from = syn::parse2::<From>(attr)?.0;
+    let sig = &func.sig;
+    if sig.asyncness.is_some() || !sig.generics.params.is_empty() || sig.inputs.len() != 1 {
+        return Err(syn::Error::new(
+            sig.span(),
+            "a migration takes exactly one argument (the old row) and is not async or generic",
+        ));
+    }
+    let old_ty = match &sig.inputs[0] {
+        FnArg::Typed(t) => &*t.ty,
+        FnArg::Receiver(r) => {
+            return Err(syn::Error::new(r.span(), "a migration cannot take self"))
+        }
+    };
+    let new_ty = match &sig.output {
+        ReturnType::Type(_, ty) => &**ty,
+        ReturnType::Default => {
+            return Err(syn::Error::new(
+                sig.span(),
+                "a migration returns the new row type",
+            ))
+        }
+    };
+    let table = match new_ty {
+        syn::Type::Path(p) if p.qself.is_none() => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .ok_or_else(|| syn::Error::new(new_ty.span(), "empty type path"))?,
+        _ => {
+            return Err(syn::Error::new(
+                new_ty.span(),
+                "a migration returns a `#[btb::table]` struct",
+            ))
+        }
+    };
+    let export = format_ident!(
+        "btb_transform_{}",
+        btb_runtime_migration_entry(&table, from)
+    );
+    let marker = format_ident!("btb_schema_migrate_{}_{}_{}", table, from, hex("m=1"));
+    let fn_name = &sig.ident;
+    Ok(quote! {
+        #func
+
+        #[doc(hidden)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        #[no_mangle]
+        pub extern "C" fn #export(ptr: *const u8, len: usize) {
+            // SAFETY: the VM passes a pointer to `len` readable input bytes.
+            let (__old,) = unsafe { ::btb_sdk::__private::decode_args::<(#old_ty,)>(ptr, len) };
+            let __new: #new_ty = #fn_name(__old);
+            ::btb_sdk::__private::return_value(&__new);
+        }
+
+        #[doc(hidden)]
+        #[no_mangle]
+        pub extern "C" fn #marker() {}
+    })
+}
+
+/// Same as `btb_runtime::schema::migration_entry` (the macro crate cannot depend on the host).
+fn btb_runtime_migration_entry(table: &str, from: u32) -> String {
+    format!("migrate_{}_{from}", table.to_ascii_lowercase())
+}
+
+/// `#[btb::table(version = N, of = "Table")]`: the optional arguments of the table macro.
+struct TableArgs {
+    version: Option<u32>,
+    of: Option<LitStr>,
+}
+
+impl syn::parse::Parse for TableArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut a = TableArgs {
+            version: None,
+            of: None,
+        };
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            if key == "version" {
+                let lit: syn::LitInt = input.parse()?;
+                let n: u32 = lit.base10_parse()?;
+                if n == 0 {
+                    return Err(syn::Error::new(lit.span(), "versions start at 1"));
+                }
+                if a.version.replace(n).is_some() {
+                    return Err(syn::Error::new(key.span(), "`version` given twice"));
+                }
+            } else if key == "of" {
+                if a.of.replace(input.parse()?).is_some() {
+                    return Err(syn::Error::new(key.span(), "`of` given twice"));
+                }
+            } else {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "expected `version = N` or `of = \"Table\"`",
+                ));
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+        Ok(a)
+    }
 }
 
 /// How an indexed field turns into a `Key`.
@@ -491,7 +649,7 @@ fn unwrap_option(ty: &syn::Type) -> &syn::Type {
     ty
 }
 
-fn expand_table(mut st: ItemStruct) -> syn::Result<TokenStream2> {
+fn expand_table(mut st: ItemStruct, args: TableArgs) -> syn::Result<TokenStream2> {
     if !st.generics.params.is_empty() {
         return Err(syn::Error::new(
             st.generics.span(),
@@ -551,12 +709,34 @@ fn expand_table(mut st: ItemStruct) -> syn::Result<TokenStream2> {
     }
     let name = &st.ident;
     let table_name = name.to_string();
+    // Trailing `Option` fields decode as `None` when the row ends before them: rows stored
+    // before the field was appended (a compatible schema change) stay readable.
+    let is_option = |ty: &syn::Type| !std::ptr::eq(unwrap_option(ty), ty);
+    let first_trailing_opt = {
+        let tys: Vec<&syn::Type> = st.fields.iter().map(|f| &f.ty).collect();
+        let mut i = tys.len();
+        while i > 0 && is_option(tys[i - 1]) {
+            i -= 1;
+        }
+        i
+    };
     let (encode, decode) = match &st.fields {
         Fields::Named(f) => {
             let ids: Vec<_> = f.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+            let reads = ids.iter().enumerate().map(|(i, id)| {
+                if i >= first_trailing_opt {
+                    quote! { #id: if r.remaining() == 0 {
+                        ::core::option::Option::None
+                    } else {
+                        ::btb_sdk::Decode::decode_from(r)?
+                    }, }
+                } else {
+                    quote! { #id: ::btb_sdk::Decode::decode_from(r)?, }
+                }
+            });
             (
                 quote! { #(::btb_sdk::Encode::encode_to(&self.#ids, out);)* },
-                quote! { Ok(#name { #(#ids: ::btb_sdk::Decode::decode_from(r)?,)* }) },
+                quote! { Ok(#name { #(#reads)* }) },
             )
         }
         Fields::Unnamed(f) => {
@@ -588,7 +768,55 @@ fn expand_table(mut st: ItemStruct) -> syn::Result<TokenStream2> {
         .find(|(_, p)| *p)
         .map(|(pos, _)| descs[*pos].0.clone())
         .unwrap_or_default();
-    let payload = format!("f={fields_txt};i={idx_txt};p={pri_txt}");
+    if let Some(of) = &args.of {
+        // An earlier row shape: codec only, no table, no lookups. It exists so that a
+        // migration can name the old row type, and so the chain can check it against the stored
+        // schema.
+        let version = args.version.ok_or_else(|| {
+            syn::Error::new(
+                of.span(),
+                "an old row shape needs `version = N` (its version)",
+            )
+        })?;
+        let table = of.value();
+        if table.is_empty()
+            || !table
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(syn::Error::new(
+                of.span(),
+                "`of` names a table (an identifier)",
+            ));
+        }
+        let payload = format!("f={fields_txt};i=;p=");
+        let sym = format_ident!("btb_schema_prev_{}_{}_{}", table, version, hex(&payload));
+        return Ok(quote! {
+            #st
+
+            impl ::btb_sdk::Encode for #name {
+                fn encode_to(&self, out: &mut ::btb_sdk::__private::Vec<u8>) {
+                    let _ = &out;
+                    #encode
+                }
+            }
+
+            impl ::btb_sdk::Decode for #name {
+                fn decode_from(
+                    r: &mut ::btb_sdk::codec::Reader<'_>,
+                ) -> ::core::result::Result<Self, ::btb_sdk::DecodeError> {
+                    let _ = &r;
+                    #decode
+                }
+            }
+
+            #[doc(hidden)]
+            #[no_mangle]
+            pub extern "C" fn #sym() {}
+        });
+    }
+    let version_txt = args.version.map_or(String::new(), |v| format!(";v={v}"));
+    let payload = format!("f={fields_txt};i={idx_txt};p={pri_txt}{version_txt}");
     let schema_sym = format_ident!("btb_schema_table_{}_{}", table_name, hex(&payload));
 
     // Typed lookups.

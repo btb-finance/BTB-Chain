@@ -5,7 +5,7 @@
 //! hint exists for the table (`--fields Table:addr,bool,string`) and the row matches it.
 
 use super::*;
-use btb_codec::{Address, Decode, Reader};
+use btb_codec::{Address as CodecAddress, Decode, Reader};
 use btb_runtime::kv::BatchOp;
 use btb_runtime::{by_id, by_index_eq, scan_table, Cursor, Order, QueryOptions};
 
@@ -66,7 +66,9 @@ fn decode_one(ty: &str, r: &mut Reader<'_>) -> Result<String, String> {
     }
     Ok(match ty {
         "addr" => js(&hexs(
-            &Address::decode_from(r).map_err(|e| format!("{e:?}"))?.0,
+            &CodecAddress::decode_from(r)
+                .map_err(|e| format!("{e:?}"))?
+                .0,
         )),
         "bool" => bool::decode_from(r)
             .map_err(|e| format!("{e:?}"))?
@@ -170,7 +172,10 @@ fn scan_prefix<S: KvStore>(
 
 /// Every table of the contract with its row count (a table with a row-id counter but no rows
 /// is listed with 0).
-fn discover<S: KvStore>(store: &S) -> Result<BTreeMap<String, u64>, (&'static str, String)> {
+fn discover<S: KvStore>(
+    store: &S,
+    contract: &Address,
+) -> Result<BTreeMap<String, u64>, (&'static str, String)> {
     let mut out = BTreeMap::new();
     // Name from a key `tag A len(name) name ...`.
     let name_of = |k: &[u8]| -> Option<Vec<u8>> {
@@ -178,14 +183,14 @@ fn discover<S: KvStore>(store: &S) -> Result<BTreeMap<String, u64>, (&'static st
         k.get(37..37 + n).map(<[u8]>::to_vec)
     };
     let mut c_prefix = vec![layout::TAG_COUNTER];
-    c_prefix.extend_from_slice(&CONTRACT);
+    c_prefix.extend_from_slice(contract);
     for (k, _) in scan_prefix(store, &c_prefix, 10_000)? {
         if let Some(n) = name_of(&k) {
             out.insert(String::from_utf8_lossy(&n).into_owned(), 0);
         }
     }
     let mut r_prefix = vec![layout::TAG_ROW];
-    r_prefix.extend_from_slice(&CONTRACT);
+    r_prefix.extend_from_slice(contract);
     let end = layout::prefix_successor(&r_prefix);
     let mut start = r_prefix;
     loop {
@@ -196,7 +201,7 @@ fn discover<S: KvStore>(store: &S) -> Result<BTreeMap<String, u64>, (&'static st
             break;
         };
         let Some(name) = name_of(&k) else { break };
-        let prefix = layout::row_prefix(&CONTRACT, &name);
+        let prefix = layout::row_prefix(contract, &name);
         let pend = layout::prefix_successor(&prefix);
         let (mut n, mut from) = (0u64, prefix);
         loop {
@@ -221,21 +226,99 @@ fn discover<S: KvStore>(store: &S) -> Result<BTreeMap<String, u64>, (&'static st
     Ok(out)
 }
 
-fn overview<S: KvStore>(sh: &Shared<S>) -> Reply {
+/// The contract an admin request is about: `?contract=<name or address hex>`, default the
+/// primary one.
+fn contract_of<S: KvStore>(
+    sh: &Shared<S>,
+    req: &Request,
+) -> Result<Address, (&'static str, String)> {
+    sh.target(req.query.get("contract").map(String::as_str))
+        .map(|t| t.0)
+}
+
+fn name_of_contract<S: KvStore>(sh: &Shared<S>, addr: &Address) -> String {
+    sh.names()
+        .into_iter()
+        .find(|(_, a)| a == addr)
+        .map_or_else(String::new, |(n, _)| n)
+}
+
+/// `GET /contracts` and `/admin/contracts`: every contract of the server with its address and
+/// entry points.
+pub fn contracts_json<S: KvStore>(sh: &Shared<S>) -> String {
+    let cs = sh.contracts.read().unwrap();
+    let items: Vec<String> = cs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let entries: Vec<String> = c
+                .contract
+                .entry_points()
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{{\"kind\":{},\"name\":{}}}",
+                        js(&format!("{:?}", e.kind).to_lowercase()),
+                        js(&e.name)
+                    )
+                })
+                .collect();
+            format!(
+                "{{\"name\":{},\"address\":{},\"primary\":{},\"tables\":{},\"entry_points\":[{}]}}",
+                js(&c.name),
+                js(&hexs(&c.addr)),
+                i == 0,
+                c.schema.tables.len(),
+                entries.join(",")
+            )
+        })
+        .collect();
+    format!("{{\"contracts\":[{}]}}", items.join(","))
+}
+
+/// `GET /admin/files`: files the dev server knows (uploaded bytes or recorded roots) with the
+/// status `file_info` reports for them.
+fn files_json<S: KvStore>(sh: &Shared<S>) -> Reply {
+    let st = sh.state.lock().unwrap();
+    let height = st.height;
+    let mut items = Vec::new();
+    for (root, bytes) in sh.files.list() {
+        let rec = sh
+            .files
+            .status(st.occ.store(), &root, height)
+            .map_err(fault)?;
+        let status = match rec.status {
+            1 => "stored",
+            2 => "expired",
+            _ => "unknown",
+        };
+        items.push(format!(
+            "{{\"root\":{},\"bytes\":{bytes},\"status\":{},\"expiry\":{}}}",
+            js(&hexs(&root)),
+            js(status),
+            rec.expiry
+        ));
+    }
+    Ok(format!("{{\"files\":[{}]}}", items.join(",")))
+}
+
+fn overview<S: KvStore>(sh: &Shared<S>, req: &Request) -> Reply {
+    let contract = contract_of(sh, req)?;
+    let contract = &contract;
     let st = sh.state.lock().unwrap();
     let store = st.occ.store();
-    let tables = discover(store)?;
+    let tables = discover(store, contract)?;
     let mut t = Vec::new();
     for (name, n) in &tables {
         let idx: Vec<String> = sh
             .tables
             .read()
             .unwrap()
-            .index_names(&CONTRACT, name.as_bytes())
+            .index_names(contract, name.as_bytes())
             .iter()
             .map(|i| js(i))
             .collect();
-        let f = sh.hint(name).map_or("null".to_string(), |f| {
+        let f = sh.hint(contract, name).map_or("null".to_string(), |f| {
             format!(
                 "[{}]",
                 f.iter().map(|x| js(x)).collect::<Vec<_>>().join(",")
@@ -248,14 +331,15 @@ fn overview<S: KvStore>(sh: &Shared<S>) -> Reply {
         ));
     }
     let get = |k: Vec<u8>| store.get(&k).map_err(fault);
-    let balance = u64_le(get(layout::balance_key(&CONTRACT))?);
-    let usage = u64_le(get(layout::usage_key(&CONTRACT))?);
-    let deposit = u64_le(get(layout::deposit_key(&CONTRACT))?);
-    let skey = layout::storage_key(&CONTRACT, b"");
+    let balance = u64_le(get(layout::balance_key(contract))?);
+    let usage = u64_le(get(layout::usage_key(contract))?);
+    let deposit = u64_le(get(layout::deposit_key(contract))?);
+    let skey = layout::storage_key(contract, b"");
     let storage_keys = scan_prefix(store, &skey, 100_000)?.len();
     Ok(format!(
-        "{{\"contract\":{},\"height\":{},\"balance\":{balance},\"storage_usage\":{usage},\"storage_deposit\":{deposit},\"deposit_per_byte\":{},\"storage_keys\":{storage_keys},\"merkle\":{{\"tracked\":false,\"root\":null,\"version\":{}}},\"tables\":[{}]}}",
-        js(&hexs(&CONTRACT)),
+        "{{\"contract\":{},\"name\":{},\"height\":{},\"balance\":{balance},\"storage_usage\":{usage},\"storage_deposit\":{deposit},\"deposit_per_byte\":{},\"storage_keys\":{storage_keys},\"merkle\":{{\"tracked\":false,\"root\":null,\"version\":{}}},\"tables\":[{}]}}",
+        js(&hexs(contract)),
+        js(&name_of_contract(sh, contract)),
         st.height,
         layout::DEPOSIT_PER_BYTE,
         st.height,
@@ -264,14 +348,16 @@ fn overview<S: KvStore>(sh: &Shared<S>) -> Reply {
 }
 
 fn table_rows<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str) -> Reply {
+    let contract = contract_of(sh, req)?;
+    let contract = &contract;
     let st = sh.state.lock().unwrap();
     let store = st.occ.store();
-    let known = discover(store)?;
+    let known = discover(store, contract)?;
     let Some(total) = known.get(table) else {
         return Err(("404 Not Found", format!("no such table {table:?}")));
     };
-    let page = scan_table(store, &CONTRACT, table.as_bytes(), &opts(req)?).map_err(fault)?;
-    let hint = sh.hint(table);
+    let page = scan_table(store, contract, table.as_bytes(), &opts(req)?).map_err(fault)?;
+    let hint = sh.hint(contract, table);
     let rows: Vec<String> = page
         .rows
         .iter()
@@ -297,24 +383,26 @@ fn index_value(addr: Option<bool>, v: &str) -> Result<IndexValue, String> {
 }
 
 fn index_browse<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str, index: &str) -> Reply {
+    let contract = contract_of(sh, req)?;
+    let contract = &contract;
     let st = sh.state.lock().unwrap();
     let store = st.occ.store();
     if !sh
         .tables
         .read()
         .unwrap()
-        .index_names(&CONTRACT, table.as_bytes())
+        .index_names(contract, table.as_bytes())
         .iter()
         .any(|i| i == index)
     {
         return Err(("404 Not Found", "no such index".into()));
     }
     let o = opts(req)?;
-    let hint = sh.hint(table);
+    let hint = sh.hint(contract, table);
     if let Some(v) = req.query.get("value").filter(|v| !v.is_empty()) {
-        let value = index_value(sh.index_is_addr(table, index), v).map_err(bad)?;
+        let value = index_value(sh.index_is_addr(contract, table, index), v).map_err(bad)?;
         let page =
-            by_index_eq(store, &CONTRACT, table.as_bytes(), index, &value, &o).map_err(fault)?;
+            by_index_eq(store, contract, table.as_bytes(), index, &value, &o).map_err(fault)?;
         let rows: Vec<String> = page
             .rows
             .iter()
@@ -330,7 +418,7 @@ fn index_browse<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str, index: &
         ));
     }
     // No value: list the index entries (encoded value as hex, row id), paged.
-    let prefix = layout::index_prefix(&CONTRACT, table.as_bytes(), index);
+    let prefix = layout::index_prefix(contract, table.as_bytes(), index);
     let end = layout::prefix_successor(&prefix);
     let desc = o.order == Order::Desc;
     let (mut start, mut stop) = (prefix.clone(), end);
@@ -370,9 +458,11 @@ fn index_browse<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str, index: &
 }
 
 fn storage<S: KvStore>(sh: &Shared<S>, req: &Request) -> Reply {
+    let contract = contract_of(sh, req)?;
+    let contract = &contract;
     let st = sh.state.lock().unwrap();
     let store = st.occ.store();
-    let prefix = layout::storage_key(&CONTRACT, b"");
+    let prefix = layout::storage_key(contract, b"");
     let (mut start, end) = (prefix.clone(), layout::prefix_successor(&prefix));
     if let Some(c) = cursor_of(req)? {
         start = c.0;
@@ -444,23 +534,27 @@ fn tokens<S: KvStore>(sh: &Shared<S>) -> Reply {
     Ok(format!("{{\"tokens\":[{}]}}", out.join(",")))
 }
 
-fn one_row<S: KvStore>(sh: &Shared<S>, table: &str, id: &str) -> Reply {
+fn one_row<S: KvStore>(sh: &Shared<S>, req: &Request, table: &str, id: &str) -> Reply {
+    let contract = contract_of(sh, req)?;
+    let contract = &contract;
     let st = sh.state.lock().unwrap();
     let id: u64 = id.parse().map_err(|_| bad("id must be a number"))?;
-    let row = by_id(st.occ.store(), &CONTRACT, table.as_bytes(), id).map_err(fault)?;
+    let row = by_id(st.occ.store(), contract, table.as_bytes(), id).map_err(fault)?;
     let Some(r) = row else {
         return Err(("404 Not Found", "no such row".into()));
     };
-    Ok(row_json(sh.hint(table).as_ref(), r.id, &r.data))
+    Ok(row_json(sh.hint(contract, table).as_ref(), r.id, &r.data))
 }
 
 /// Serve `GET /admin/...` (everything except the SSE stream).
 pub fn route<S: KvStore>(sh: &Shared<S>, req: &Request) -> Reply {
     let parts: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
     match parts.as_slice() {
-        ["admin"] | ["admin", "overview"] | ["admin", "tables"] => overview(sh),
+        ["admin"] | ["admin", "overview"] | ["admin", "tables"] => overview(sh, req),
+        ["admin", "contracts"] => Ok(contracts_json(sh)),
+        ["admin", "files"] => files_json(sh),
         ["admin", "table", t] => table_rows(sh, req, t),
-        ["admin", "table", t, id] => one_row(sh, t, id),
+        ["admin", "table", t, id] => one_row(sh, req, t, id),
         ["admin", "index", t, i] => index_browse(sh, req, t, i),
         ["admin", "storage"] => storage(sh, req),
         ["admin", "tokens"] => tokens(sh),
@@ -469,14 +563,22 @@ pub fn route<S: KvStore>(sh: &Shared<S>, req: &Request) -> Reply {
 }
 
 /// What a committed batch touched, as an SSE payload.
-pub fn commit_event(height: u64, batch: &WriteBatch) -> String {
+pub fn commit_event(height: u64, batch: &WriteBatch, contracts: &[(String, Address)]) -> String {
     let (mut tables, mut storage, mut tokens, mut accounts) = (Vec::new(), false, false, false);
+    let mut touched: Vec<String> = Vec::new();
     for op in batch.ops() {
         let (BatchOp::Put(key, _) | BatchOp::Delete(key)) = op;
         match key.first() {
             Some(&(layout::TAG_ROW | layout::TAG_COUNTER | layout::TAG_INDEX))
-                if key.get(1..33) == Some(&CONTRACT[..]) =>
+                if contracts
+                    .iter()
+                    .any(|(_, a)| key.get(1..33) == Some(&a[..])) =>
             {
+                for (n, a) in contracts {
+                    if key.get(1..33) == Some(&a[..]) && !touched.contains(n) {
+                        touched.push(n.clone());
+                    }
+                }
                 let n = key
                     .get(33..37)
                     .and_then(|b| <[u8; 4]>::try_from(b).ok())
@@ -488,14 +590,23 @@ pub fn commit_event(height: u64, batch: &WriteBatch) -> String {
                     }
                 }
             }
-            Some(&layout::TAG_STORAGE) => storage = true,
+            Some(&layout::TAG_STORAGE) => {
+                storage = true;
+                for (n, a) in contracts {
+                    if key.get(1..33) == Some(&a[..]) && !touched.contains(n) {
+                        touched.push(n.clone());
+                    }
+                }
+            }
             Some(&(layout::TAG_TOKEN | layout::TAG_TOKEN_BALANCE)) => tokens = true,
             _ => accounts = true,
         }
     }
     let t: Vec<String> = tables.iter().map(|t| js(t)).collect();
+    let c: Vec<String> = touched.iter().map(|n| js(n)).collect();
     format!(
-        "{{\"height\":{height},\"tables\":[{}],\"storage\":{storage},\"tokens\":{tokens},\"accounts\":{accounts}}}",
-        t.join(",")
+        "{{\"height\":{height},\"tables\":[{}],\"contracts\":[{}],\"storage\":{storage},\"tokens\":{tokens},\"accounts\":{accounts}}}",
+        t.join(","),
+        c.join(",")
     )
 }

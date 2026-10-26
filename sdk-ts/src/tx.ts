@@ -19,6 +19,7 @@ const PKCS8_PREFIX = Uint8Array.from([
 ]);
 const U64_MAX = (1n << 64n) - 1n;
 const RELAYER_FLAG = 0x80;
+const SESSION_FLAG = 0x40;
 
 /** A transaction kind: its tag and encoded fields. */
 export interface TxKind {
@@ -31,6 +32,11 @@ export interface TxBody {
   nonce: bigint;
   /** 32-byte address of the hosting node that relays the transaction and earns 20% of the fee. */
   relayer?: Uint8Array;
+  /**
+   * 32-byte account address: the transaction is signed by a session key of that account (see
+   * `BtbAuth`) and acts as it. Sets tag bit 0x40; the address follows the relayer.
+   */
+  session?: Uint8Array;
   kind: TxKind;
 }
 
@@ -101,13 +107,17 @@ export function callKind(
 /** The signed part of a transaction. */
 export function encodeTxBody(b: TxBody): Uint8Array {
   const head = concat(u64le(b.chainId, "chainId"), u64le(b.nonce, "nonce"));
-  if (b.relayer === undefined) return concat(head, Uint8Array.of(b.kind.tag), b.kind.fields);
-  return concat(
-    head,
-    Uint8Array.of(b.kind.tag | RELAYER_FLAG),
-    bytes32(b.relayer, "relayer"),
-    b.kind.fields,
-  );
+  let tag = b.kind.tag;
+  const extra: Uint8Array[] = [];
+  if (b.relayer !== undefined) {
+    tag |= RELAYER_FLAG;
+    extra.push(bytes32(b.relayer, "relayer"));
+  }
+  if (b.session !== undefined) {
+    tag |= SESSION_FLAG;
+    extra.push(bytes32(b.session, "session"));
+  }
+  return concat(head, Uint8Array.of(tag), ...extra, b.kind.fields);
 }
 
 /** The 32-byte account address of an Ed25519 public key. */
@@ -131,11 +141,75 @@ export async function publicKeyOf(seed: Uint8Array): Promise<Uint8Array> {
 
 /** Sign `body` with a 32-byte seed; returns the transaction's wire bytes. */
 export async function signTransaction(body: TxBody, seed: Uint8Array): Promise<Uint8Array> {
+  const key = await importSeed(seed);
+  return signTransactionWith(body, await publicKeyOf(seed), key);
+}
+
+/**
+ * Sign `body` with a WebCrypto Ed25519 private key (which may be non-extractable) whose public
+ * key is `publicKey`; returns the transaction's wire bytes.
+ */
+export async function signTransactionWith(
+  body: TxBody,
+  publicKey: Uint8Array,
+  key: CryptoKey,
+): Promise<Uint8Array> {
   const enc = encodeTxBody(body);
   const hash = await sha256(SIG_DOMAIN, enc);
-  const key = await importSeed(seed);
   const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", key, bufs(hash)));
-  return concat(enc, await publicKeyOf(seed), sig);
+  return concat(enc, bytes32(publicKey, "public key"), sig);
+}
+
+/** One contract a session may call; `functions` undefined allows every mutation of it. */
+export interface SessionScope {
+  contract: Uint8Array;
+  functions?: string[];
+}
+
+/** What the account signs once to authorize a session key (`btb-chain` `session::Grant`). */
+export interface SessionGrant {
+  sessionKey: Uint8Array;
+  /** The first block height at which the grant no longer works. */
+  expiresHeight: bigint;
+  allowed: SessionScope[];
+  /** Fee budget in base units over the grant's life. */
+  spendLimit: bigint;
+}
+
+function lenPrefixed(b: Uint8Array): Uint8Array {
+  return concat(u32le(b.length), b);
+}
+
+/** `Session` (tag 22) `Grant` (sub 0). Send it signed by the ACCOUNT key, never by a session. */
+export function grantKind(g: SessionGrant): TxKind {
+  const scopes = g.allowed.map((s) =>
+    concat(
+      bytes32(s.contract, "contract"),
+      s.functions === undefined
+        ? Uint8Array.of(0)
+        : concat(
+            Uint8Array.of(1),
+            u32le(s.functions.length),
+            ...s.functions.map((f) => lenPrefixed(new TextEncoder().encode(f))),
+          ),
+    ),
+  );
+  return {
+    tag: 22,
+    fields: concat(
+      Uint8Array.of(0),
+      bytes32(g.sessionKey, "sessionKey"),
+      u64le(g.expiresHeight, "expiresHeight"),
+      u32le(scopes.length),
+      ...scopes,
+      u64le(g.spendLimit, "spendLimit"),
+    ),
+  };
+}
+
+/** `Session` (tag 22) `Revoke` (sub 1) of a session public key. */
+export function revokeKind(sessionKey: Uint8Array): TxKind {
+  return { tag: 22, fields: concat(Uint8Array.of(1), bytes32(sessionKey, "sessionKey")) };
 }
 
 /** Transaction id: `SHA256("btb.tx.id.v1" || wire bytes)`. */

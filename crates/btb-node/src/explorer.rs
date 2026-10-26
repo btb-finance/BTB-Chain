@@ -33,6 +33,8 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Dkg(_) => "dkg",
         TxKind::Cross(_) => "cross",
         TxKind::Host(_) => "host",
+        TxKind::Session(_) => "session",
+        TxKind::Upgrade { .. } => "upgrade",
     }
 }
 
@@ -51,7 +53,17 @@ pub fn tx_json(tx: &Transaction) -> Value {
     if let Some(r) = &tx.body.relayer {
         o.insert("relayer".into(), json!(hex::encode(r)));
     }
+    if tx.body.session.is_some() {
+        // `from` is the account; `public_key` is the session key that signed.
+        o.insert("via_session".into(), json!(true));
+    }
     match &tx.body.kind {
+        TxKind::Session(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
         TxKind::Transfer { to, amount } => {
             o.insert("to".into(), json!(hex::encode(to)));
             o.insert("amount".into(), json!(amount.to_string()));
@@ -71,6 +83,16 @@ pub fn tx_json(tx: &Transaction) -> Value {
         TxKind::Deploy { code, manifest } => {
             o.insert("name".into(), json!(manifest.name));
             o.insert("code_bytes".into(), json!(code.len()));
+        }
+        TxKind::Upgrade {
+            contract,
+            code,
+            budget_gas,
+            ..
+        } => {
+            o.insert("to".into(), json!(hex::encode(contract)));
+            o.insert("code_bytes".into(), json!(code.len()));
+            o.insert("budget_gas".into(), json!(budget_gas));
         }
         TxKind::Stake { validator, amount } => {
             o.insert("validator".into(), json!(hex::encode(validator)));
@@ -180,6 +202,7 @@ mod tests {
         let tx = Transaction::sign(
             TxBody {
                 relayer: None,
+                session: None,
                 chain_id: 7,
                 nonce: 2,
                 kind: TxKind::Transfer {

@@ -23,7 +23,7 @@ Transaction kinds, all encoded with `btb-codec` (little-endian, length-prefixed)
 
 ```
 tx       = body || public_key[32] || signature[64]
-body     = chain_id:u64 || nonce:u64 || tag:u8 [|| relayer[32]] || fields     (relayer present iff tag & 0x80)
+body     = chain_id:u64 || nonce:u64 || tag:u8 [|| relayer[32]] [|| session_account[32]] || fields     (relayer iff tag & 0x80, session account iff tag & 0x40)
 Deploy   (0): code:bytes || manifest
 Call     (1): contract[32] || kind:u8 || function:string || args:bytes || gas_limit:u64 || max_fee:u64
 Transfer (2): to[32] || amount:u64
@@ -36,6 +36,8 @@ Channel  (8): op:u8 || fields   (0 Open: payee[32] || deposit:u64 || expiry_bloc
 Cross    (21): op:u8 || fields   (0 Deal | 1 Complain | 2 Signature | 3 Evidence | 4 Attest | 5 Prepare | 6 Withdraw; see Cross-chain keys and vault)
 Host     (20): op:u8 || fields   (0 Register: url:bytes (at most 256 bytes) | 1 Unregister)
 Action   (13): op:u8 || fields  (0 Request: contract[32] || function:string || args:bytes || gas_limit:u64 || max_fee:u64 | 1 SetHosts: contract[32] || hosts:[string])
+Upgrade  (23): contract[32] || code:bytes || manifest || budget_gas:u64   (see Contract upgrades and migrations)
+Session  (22): op:u8 || fields   (0 Grant: session_key[32] || expires_height:u64 || allowed:[contract[32] || functions:Option<[string]>] || spend_limit:u64 | 1 Revoke: session_key[32]); signed by the account itself
 Site     (9): op:u8 || fields   (0 Publish: contract[32] || path:string || content:bytes | 1 Remove: contract[32] || path:string)
 evidence = 0 || voter:u32 || round:u64 || (id[32] || sig[64]) x2        (DoubleVote)
          | 1 || proposer:u32 || round:u64 || (id[32] || sig[64]) x2     (DoubleProposal)
@@ -46,6 +48,7 @@ manifest = name:string || crons:[(function:string, every_blocks:u64)] || indexes
 - **Signature.** Ed25519 (`ed25519-dalek`, strict verification) over `SHA256("btb.tx.sig.v1" || body)`. The body contains the chain id and nonce, so a signature is valid for one chain and one nonce only.
 - **Transaction id.** `SHA256("btb.tx.id.v1" || wire bytes)`.
 - **Versions and the relayer.** A body may name the hosting node that relayed it (`TxBody::relayer`). Then the tag byte has its high bit set (`tag | 0x80`) and the 32-byte relayer address follows the tag, before the fields. A body with no relayer is **byte for byte the original encoding**, so every old transaction still decodes, keeps its signature and id, and executes (its fee goes wholly to the validator pool). The relayer is inside the signed body: the sender chooses it, and nobody who handles the transaction (the relay host, a proposer, a validator) can add, drop or change it without breaking the signature. See [Fees](#fees).
+- **Session accounts.** A body may also name the account it acts for (`TxBody::session`): tag bit `0x40`, and the 32-byte account follows the relayer. Then `public_key` is a *session key* and the chain executes the transaction as that account; see [Session keys](#session-keys). Without it the bytes are exactly as before.
 - **Manifest.** `crons` lists `(function, every_blocks)`: the `cron` entry point `function` runs every `every_blocks` blocks, `every = "N blocks"` (1 to 2^32; at most 16). `indexes` are table index declarations in the same temporary form as `btb dev --index` (`Table:index:addr@offset` or `Table:index:u64@offset`, see [DEV_SERVER.md](DEV_SERVER.md)); the chain registers them from state, so a restarted node rebuilds them. This is a binary struct, not the CLI's `manifest.json`; the CLI bundle's `manifest.json` already carries `crons` (`{function, every_blocks}`), taken from `#[btb::cron(every = "N blocks")]` ([LANGUAGE.md](LANGUAGE.md)); `btb deploy --rpc` converts a bundle into a `Deploy` transaction ([CLI.md](CLI.md)).
 - **Limits.** Code up to 1 MiB, arguments up to 1 MiB, function names up to 64 bytes.
 
@@ -102,6 +105,30 @@ This is the "80/20" mutation split of [TOKENOMICS.md](TOKENOMICS.md). The **vali
 **Parallel mode.** Relayer credits commute, so they are deferred like the pool credits: each transaction only debits its sender, and the receipts carry the relayer; after the transactions the per-relayer sums are credited once. A block with relayed transactions has them (and any transaction touching a relayer account) on the dynamic path, whose reads are tracked, so the registry check is validated like any other read; a transaction that reads or writes a named relayer's balance makes the block fall back to sequential, exactly as for the pool balances. The differential test (`tests/parallel.rs`) mixes registered, unregistered, self and hot-account relayers, transfers to relayers, and registrations in the same block.
 
 **Design note (implemented above).** The relay share needed three things: (1) an optional signed `relayer: Address` in the transaction body (versioned by the tag's high bit, so old transactions are unchanged); (2) crediting `fee * RELAY_SHARE_BPS / 10000` to that address at execution, with the validator pool as the fallback; (3) a registry of hosting nodes to check against, which is the `Host` transaction. Supply is unchanged: every unit debited from the sender is credited to the validator pool or the relayer.
+
+## Session keys
+
+Convex-style auth for apps: the user's account signs **one** `Session` grant, and from then on the app signs with a throwaway *session key* held by the browser, with no wallet prompt per action. A session transaction acts as the account (`caller()` is the account, the account's nonce and balance are used), but only inside the grant.
+
+```
+Grant { session_key, expires_height, allowed: [(contract, functions: None | Some([name])) ], spend_limit }
+Session(Grant) | Session(Revoke(session_key))        signed by the ACCOUNT's own key
+Call signed by session_key, body.session = Some(account)
+```
+
+Grants live at `0x72 || account || session_key` with a running `spent`. Rules (`crates/btb-chain/src/session.rs`):
+
+- **Scope.** The call's contract must be in `allowed` and, if the entry lists functions, the function must be one of them. Only `Call` can be signed by a session: transfers, staking, deploys, DEX, channels, storage, hosting-node and every other kind are refused, and **so is `Session` itself**, so a session can neither create nor revoke sessions. Transfers are *never* allowed through a session in this version (a later grant flag would have to opt in explicitly). The scope covers the entry contract; it may call others like for any caller.
+- **Expiry.** Valid while `height < expires_height` (the height of the block executing it). A grant must expire in the future when it is made.
+- **Fee budget.** `spend_limit` base units over the grant's life. A call is valid only if `spent + gas_limit * gas_price <= spend_limit`; the fee actually charged is then added to `spent`. The budget bounds what a stolen session key can burn (the account still pays from its own balance).
+- **Invalid, not reverted.** Any scope, expiry, revocation, budget or unknown-session violation makes the transaction *invalid*: the mempool-side admission check (`ChainState::check_session`, run by the node before `Mempool::insert`, which is itself stateless) rejects it, a block that carries one skips it, and it costs nothing and does not use the nonce (same row as a bad signature in [Validity](#validity-nonces-and-failure)). A call that passed and then fails in the VM is an ordinary revert: the account pays and the budget is charged. Pending session transactions are each checked against the budget alone, so a burst can pass admission together and the later ones are skipped in the block.
+- **Replay and nonces.** The nonce is the **account's**, shared by its own key and all its sessions; there is no separate session counter. Replays are impossible, and two keys racing for one nonce just make the loser invalid. The account is part of the signed body, so a session signature cannot be replayed for another account.
+- **Limits.** At most 16 live grants per account, 16 contracts per grant, 32 function names per contract; granting purges the account's expired grants. Re-granting a key replaces its grant and resets `spent`. `Revoke` of an unknown key is a (charged) revert.
+- **Gas.** `Session` costs 10,000 gas. Supply is unaffected: grants move no balance.
+- **Contracts.** `btb_sdk::auth::caller()` and `auth::via_session()` (host call 60, 5 gas) tell a function whether the account signed itself; `auth::require_direct()` aborts for sessions. A nested contract-to-contract call always sees `false`. Use it for actions that deserve the owner's own signature.
+- **Parallel execution.** Session transactions run on the multi-version engine (they read and write the grant), never the owner-only fast path; receipts and roots equal the sequential executor's (tested).
+
+Clients: `BtbAuth` in `@btb/client` ([TS_SDK.md](TS_SDK.md)); `btb-dev --auth signed` runs the same rules on a dev server ([DEV_SERVER.md](DEV_SERVER.md)).
 
 ## Staking, epochs and slashing
 
@@ -253,6 +280,24 @@ A contract can call another with the `call_contract` host call ([LANGUAGE.md](LA
 - **Gas and fees.** The caller pays the callee's exact VM gas inside its own VM gas, so the transaction's `gas_used` and fee already include everything; there is no separate callee fee. A function marked `randomness` is charged its whole limit as before.
 - **Crons** may call too (a cron is a mutation). Actions' first phase and queries are read-only and so may call queries only; `call_transform` runs with no host at all.
 - **Parallel execution.** A call transaction's footprint was already dynamic (a contract may touch any account), so transactions that call contracts always take the tracked (Block-STM) path; the contract record, storage and balances a callee reads are logged like any other read, and a callee's table schemas are registered lazily per worker like those of a directly called contract. The differential test (`tests/parallel.rs`) includes routers that call the token and each other, with aborts, out-of-gas callees, re-entrancy and deposit failures, and requires byte-identical receipts, roots and stores.
+
+## Contract upgrades and migrations
+
+`Upgrade { contract, code, manifest, budget_gas }` (tag 23, `crates/btb-chain/src/upgrade.rs`) replaces the code and manifest of a deployed contract at the same address; state (storage, tables, balance, deposit) stays. Intrinsic gas `UPGRADE_BASE_GAS` (100,000) + `DEPLOY_BYTE_GAS` per code byte; if the schema change needs row work the sender also prepays `budget_gas * gas_price` (so `max_cost` includes it).
+
+**Who may upgrade.** The contract's *upgrade authority*, read from the manifest it was deployed with: the deployer by default; a named account (`Manifest::with_upgrade_policy(UpgradePolicy::Authority(a))`); or nobody (`Immutable`, `btb deploy --immutable`). The policy travels as a reserved `"!upgrade=deployer|none|<hex>"` entry of `Manifest.indexes`, so the manifest wire format and old manifests are unchanged. An upgrade whose manifest names no policy keeps the current one; naming one transfers the authority or gives it up for good. Refusals (`Revert::Upgrade`, the intrinsic gas is still charged, nothing else changes): `NoSuchContract`, `Immutable`, `NotAuthorized`, `InProgress` (the previous upgrade's job is still running or rolling back), `BadContract`, `BadManifest` (crons must exist; new crons are scheduled from the upgrade height, dropped ones stop, a changed period applies from the next run) and `Incompatible(reason)`.
+
+**Compatibility** is decided by `btb_runtime::evolve::diff` on the two ELFs ([STATE.md](STATE.md#schema-evolution), [LANGUAGE.md](LANGUAGE.md#schema-evolution-versions-and-migrations)): new tables, appended `Option` fields, new and removed indexes are accepted; removed, reordered or retyped fields and removed primaries need a declared migration with the old row type matching the stored schema.
+
+**Jobs.** Work on existing rows (a `Migrate` task per migrated table, a `Backfill` task for added and removed indexes) is a *job* stored under the contract (`TAG 0x78`, record kept after the end so the outcome stays queryable). At the end of each block, after crons and actions, the chain advances active jobs by at most `ROWS_PER_BLOCK` (32) rows in total, in contract address then row id order. A small table is done in the block of the upgrade. For each row the chain runs the migration in a state-less VM (gas limit: `cron_gas_limit`), checks that the output is exactly one well-formed row of the new table, rewrites row and index entries in one batch (`Tables::rewrite`), settles the contract's storage deposit like any write, and keeps the old bytes in an undo log (`TAG 0x79`, not metered).
+
+**Gas and budget.** Per row: migration `MIGRATE_ROW_GAS` (1,000) + the migration's VM gas + `ROW_BYTE_GAS` (1) per byte of old plus new row + `INDEX_ENTRY_GAS` (100) per index entry written or deleted; backfill `BACKFILL_ROW_GAS` (300) + the index entry cost. The charge moves from the escrow (`upgrade_pool()`, an ordinary balance, so the supply invariant covers it) to the validator pool after each batch. A row that does not fit in what is left of the budget fails the job. When the job ends, the unused escrow is refunded to the upgrader.
+
+**Consistency: the table is locked.** The new code is live at once and each table of the job is **locked** (`layout::TAG_TABLE_LOCK`): every table host call on it by that contract, reads included, faults with `TableLocked` until the job ends, so no call can see a mix of old and new rows (the alternative, dual-reading old and new shapes, would need both layouts in every call). Queries on the table fail meanwhile and mutations touching it revert (fee charged); other tables, contract storage, balances and other contracts are unaffected, and a subscribed query re-runs when the lock is lifted. Progress is queryable: `ChainState::upgrade_status` / RPC `btb_upgradeStatus` / `btb upgrade --status` give the phase (`migrating`, `cleanup`, `done`, `rolling_back`, `rolled_back`), the error, and per table the rows done, the cursor and the next row id (an upper bound of the rows to do). After success the undo log is deleted in the background (`CLEANUP_PER_BLOCK` entries per block, phase `cleanup`); the tables are already open then.
+
+**Failure rolls back.** A migration that aborts or traps, a malformed output row, a duplicate in a unique index, an exhausted budget, or a storage deposit the contract cannot pay aborts the job. The batch in progress is discarded, rows converted by earlier batches are restored from the undo log (and index entries moved back, backfills undone), the old code and manifest are reinstalled, the tables are unlocked and the unused escrow is refunded; the status says `rolled_back` and why. The upgrader keeps the cost of the work done before the failure; rolling back is free (paid by that work). If restoring rows needs a deposit the contract cannot pay, the rollback waits and retries every block (fund the contract). A new upgrade can be sent once the job is over.
+
+**Parallel execution.** A block with an `Upgrade` runs sequentially (deterministic fallback); the job step runs after the transactions in every mode, so receipts, state roots and fees are identical (`tests/upgrade.rs` compares both executors byte for byte). Recovery: jobs, locks and the undo log are ordinary state, `ChainState::open` re-registers the tables of the (new) contract record, so a restart in the middle continues.
 
 ## Parallel execution
 

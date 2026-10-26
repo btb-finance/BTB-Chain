@@ -14,23 +14,29 @@
 //! `Content-Type: application/json`) a flat JSON array, see `demo`. Results are hex, or JSON with
 //! `?format=json`. The caller is the `X-BTB-Caller` header or `?caller=` (EventSource cannot set
 //! headers): 64 hex characters are the address, any other text is hashed with SHA-256. There is
-//! no authentication; never expose this server.
+//! no authentication by default; `--auth signed` (see `auth`) requires signed transactions and
+//! supports session keys. Never expose this server.
 
 mod admin;
+pub mod auth;
 mod demo;
+mod evolve;
+mod files;
 
 pub use admin::parse_fields;
+pub use files::dev_config as files_config;
 
 use btb_runtime::schema::{IndexKind, Schema, Ty};
 use btb_runtime::{
-    layout, IndexDef, IndexValue, KvStore, Occ, OccError, ReadSet, RuntimeHost, SubId,
-    SubscriptionManager, Tables, WriteBatch,
+    layout, Callee, IndexDef, IndexValue, KvError, KvStore, Occ, OccError, ReadSet, Resolver,
+    RuntimeHost, SubId, SubscriptionManager, Tables, WriteBatch,
 };
 use btb_vm::{CallError, Contract, FunctionKind, Trap};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -97,17 +103,19 @@ impl IndexSpec {
     }
 }
 
-/// Register the indexes the contract declares in its ELF, plus the deprecated `--index` /
-/// `Cargo.toml` specs for tables the ELF does not declare. Returns the ELF's schema.
+/// Register the indexes the contract at `addr` declares in its ELF, plus (for the primary
+/// contract only) the deprecated `--index` / `Cargo.toml` specs for tables the ELF does not
+/// declare. Returns the ELF's schema.
 fn register_tables(
     tables: &mut Tables,
+    addr: Address,
     elf: &[u8],
     legacy: &[IndexSpec],
 ) -> Result<Schema, String> {
     let schema = Schema::from_elf(elf)?;
     for (t, defs) in schema.index_defs()? {
         tables
-            .register(CONTRACT, t.as_bytes(), defs)
+            .register(addr, t.as_bytes(), defs)
             .map_err(|e| e.to_string())?;
     }
     let mut by_table: BTreeMap<&str, Vec<IndexDef>> = BTreeMap::new();
@@ -116,10 +124,51 @@ fn register_tables(
     }
     for (t, defs) in by_table {
         tables
-            .register(CONTRACT, t.as_bytes(), defs)
+            .register(addr, t.as_bytes(), defs)
             .map_err(|e| e.to_string())?;
     }
     Ok(schema)
+}
+
+/// A 32-byte contract address.
+pub type Address = [u8; 32];
+
+/// The stable dev address of the contract called `name` in a multi-contract project:
+/// `SHA-256("btb.dev.contract.v1" || name)`. The same name always gets the same address, so
+/// state kept with `--data` and addresses stored in other contracts survive restarts.
+pub fn dev_address(name: &str) -> Address {
+    let mut h = Sha256::new();
+    h.update(b"btb.dev.contract.v1");
+    h.update(name.as_bytes());
+    h.finalize().into()
+}
+
+/// One contract of a dev server: a name (the project's contract directory or package name) and
+/// its built ELF.
+#[derive(Clone, Debug)]
+pub struct ContractSpec {
+    pub name: String,
+    pub elf: Vec<u8>,
+}
+
+struct DevContract {
+    name: String,
+    addr: Address,
+    contract: Arc<Contract>,
+    /// What the contract's ELF declares (`#[btb::table]`, function signatures).
+    schema: Schema,
+}
+
+/// Lets a running contract call the other contracts of the dev server (`call_contract`).
+struct DevResolver<'a>(&'a [DevContract]);
+
+impl Resolver for DevResolver<'_> {
+    fn resolve(&self, _kv: &dyn KvStore, addr: &Address) -> Result<Option<Callee>, KvError> {
+        Ok(self.0.iter().find(|c| &c.addr == addr).map(|c| Callee {
+            contract: c.contract.clone(),
+            tables: None,
+        }))
+    }
 }
 
 struct Client {
@@ -137,29 +186,63 @@ struct State<S: KvStore> {
 }
 
 struct Shared<S: KvStore> {
-    /// The running contract; swapped by `Server::reload` (state is kept).
-    contract: RwLock<Arc<Contract>>,
+    /// The contracts; the first is the primary one (default target). Each is swapped
+    /// independently by `Server::reload_contract` (state is kept).
+    contracts: RwLock<Vec<DevContract>>,
     /// Page served at `/`; `None` serves the built-in todo demo.
     page: RwLock<Option<String>>,
     tables: RwLock<Tables>,
-    /// What the contract's ELF declares (`#[btb::table]`, function signatures).
-    schema: RwLock<Schema>,
-    /// Index declarations (the dashboard needs their value kinds).
+    /// Index declarations of the primary contract (the dashboard needs their value kinds).
     indexes: Vec<IndexSpec>,
     /// Field-type hints per table for the dashboard (`Table` -> `["addr", "bool", ...]`).
     fields: RwLock<BTreeMap<String, Vec<String>>>,
     state: Mutex<State<S>>,
     stop: AtomicBool,
+    files: files::DevFiles,
+    /// Signed-transaction mode and session grants (`auth`).
+    auth: Mutex<auth::DevAuth>,
 }
 
+type Target = (Address, Arc<Contract>);
+type HttpErr = (&'static str, String);
+
 impl<S: KvStore> Shared<S> {
-    /// Dashboard field hints of `table`: from `--fields` / `Cargo.toml` if given, else derived
-    /// from the contract's schema when every field has a dashboard type.
-    fn hint(&self, table: &str) -> Option<Vec<String>> {
+    /// Find a contract by name, by 64 hex characters of its address, or the primary one.
+    fn target(&self, sel: Option<&str>) -> Result<Target, HttpErr> {
+        let cs = self.contracts.read().unwrap();
+        let found = match sel.filter(|s| !s.is_empty()) {
+            None => cs.first(),
+            Some(s) => cs
+                .iter()
+                .find(|c| c.name == s)
+                .or_else(|| cs.iter().find(|c| demo::hex(&c.addr) == s)),
+        };
+        found
+            .map(|c| (c.addr, c.contract.clone()))
+            .ok_or(("404 Not Found", format!("no such contract {sel:?}")))
+    }
+
+    /// `(name, address)` of every contract, primary first.
+    fn names(&self) -> Vec<(String, Address)> {
+        let cs = self.contracts.read().unwrap();
+        cs.iter().map(|c| (c.name.clone(), c.addr)).collect()
+    }
+
+    fn schema_of(&self, addr: &Address) -> Option<Schema> {
+        let cs = self.contracts.read().unwrap();
+        cs.iter()
+            .find(|c| &c.addr == addr)
+            .map(|c| c.schema.clone())
+    }
+
+    /// Dashboard field hints of `table` of the contract at `addr`: from `--fields` /
+    /// `Cargo.toml` if given, else derived from the contract's schema when every field has a
+    /// dashboard type.
+    fn hint(&self, addr: &Address, table: &str) -> Option<Vec<String>> {
         if let Some(h) = self.fields.read().unwrap().get(table) {
             return Some(h.clone());
         }
-        let schema = self.schema.read().unwrap();
+        let schema = self.schema_of(addr)?;
         schema
             .table(table)?
             .fields
@@ -186,13 +269,10 @@ impl<S: KvStore> Shared<S> {
 
     /// Is index `index` of `table` made of 32-byte addresses (`Some(true)`), numbers
     /// (`Some(false)`), or unknown to the contract and the legacy specs (`None`)?
-    fn index_is_addr(&self, table: &str, index: &str) -> Option<bool> {
+    fn index_is_addr(&self, addr: &Address, table: &str, index: &str) -> Option<bool> {
         if let Some(k) = self
-            .schema
-            .read()
-            .unwrap()
-            .table(table)
-            .and_then(|t| t.index_kind(index))
+            .schema_of(addr)
+            .and_then(|s| s.table(table).and_then(|t| t.index_kind(index)))
         {
             return Some(k == IndexKind::Bytes);
         }
@@ -206,7 +286,8 @@ impl<S: KvStore> Shared<S> {
 /// Dashboard field hints: `(table, field types)`.
 pub type FieldHints = Vec<(String, Vec<String>)>;
 
-type ReloadFn = Arc<dyn Fn(&[u8]) -> Result<Vec<btb_vm::EntryPoint>, String> + Send + Sync>;
+type ReloadFn =
+    Arc<dyn Fn(Option<&str>, &[u8]) -> Result<Vec<btb_vm::EntryPoint>, String> + Send + Sync>;
 
 pub struct Server {
     addr: SocketAddr,
@@ -214,33 +295,112 @@ pub struct Server {
     reload: ReloadFn,
     page: Arc<dyn Fn(Option<String>) + Send + Sync>,
     fields: Arc<dyn Fn(FieldHints) + Send + Sync>,
+    names: Arc<dyn Fn() -> Vec<(String, Address)> + Send + Sync>,
+    set_auth: Arc<dyn Fn(auth::AuthMode) + Send + Sync>,
+    files_dir: PathBuf,
     thread: JoinHandle<()>,
 }
 
 impl Server {
-    /// Start serving on `bind` (port 0 picks a free port).
+    /// Start serving one contract on `bind` (port 0 picks a free port). The contract lives at
+    /// [`CONTRACT`] and is named `main`.
     pub fn start<S: KvStore + Send + 'static>(
         elf: &[u8],
         bind: impl ToSocketAddrs,
-        mut store: S,
+        store: S,
         indexes: Vec<IndexSpec>,
     ) -> Result<Server, String> {
-        let contract = Contract::from_elf(elf).map_err(|e| format!("bad contract: {e:?}"))?;
+        Self::start_named("main", elf, bind, store, indexes, None)
+    }
+
+    /// Like [`Server::start`] for a single contract called `name`, keeping uploaded files in
+    /// `files` (`None`: a temporary directory).
+    pub fn start_named<S: KvStore + Send + 'static>(
+        name: &str,
+        elf: &[u8],
+        bind: impl ToSocketAddrs,
+        store: S,
+        indexes: Vec<IndexSpec>,
+        files: Option<PathBuf>,
+    ) -> Result<Server, String> {
+        Self::launch(
+            vec![(
+                ContractSpec {
+                    name: name.into(),
+                    elf: elf.to_vec(),
+                },
+                CONTRACT,
+            )],
+            bind,
+            store,
+            indexes,
+            files,
+        )
+    }
+
+    /// Start serving several contracts, each at its [`dev_address`]. The first is the primary
+    /// one: it answers the unprefixed `/query/<fn>` paths and gets the deprecated `indexes`.
+    /// Reach the others at `/c/<name>/query/<fn>` (or `?contract=<name>`). Contracts can call
+    /// each other with `call_contract`. `files` is where uploaded files are kept (`None`: a
+    /// temporary directory).
+    pub fn start_multi<S: KvStore + Send + 'static>(
+        contracts: &[ContractSpec],
+        bind: impl ToSocketAddrs,
+        store: S,
+        indexes: Vec<IndexSpec>,
+        files: Option<PathBuf>,
+    ) -> Result<Server, String> {
+        if contracts.is_empty() {
+            return Err("no contracts".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for c in contracts {
+            if c.name.is_empty() || c.name.contains('/') || !seen.insert(c.name.clone()) {
+                return Err(format!("bad or duplicate contract name {:?}", c.name));
+            }
+        }
+        let list = contracts
+            .iter()
+            .map(|c| (c.clone(), dev_address(&c.name)))
+            .collect();
+        Self::launch(list, bind, store, indexes, files)
+    }
+
+    fn launch<S: KvStore + Send + 'static>(
+        specs: Vec<(ContractSpec, Address)>,
+        bind: impl ToSocketAddrs,
+        mut store: S,
+        indexes: Vec<IndexSpec>,
+        files: Option<PathBuf>,
+    ) -> Result<Server, String> {
         let mut tables = Tables::new();
-        let schema = register_tables(&mut tables, elf, &indexes)?;
-        let bal = layout::balance_key(&CONTRACT);
-        if store.get(&bal).map_err(|e| e.to_string())?.is_none() {
-            store
-                .put(&bal, &DEV_BALANCE.to_le_bytes())
-                .map_err(|e| e.to_string())?;
+        let mut devs = Vec::new();
+        for (i, (spec, addr)) in specs.iter().enumerate() {
+            let contract = Contract::from_elf(&spec.elf)
+                .map_err(|e| format!("bad contract {}: {e:?}", spec.name))?;
+            let legacy: &[IndexSpec] = if i == 0 { &indexes } else { &[] };
+            let schema = register_tables(&mut tables, *addr, &spec.elf, legacy)?;
+            let bal = layout::balance_key(addr);
+            if store.get(&bal).map_err(|e| e.to_string())?.is_none() {
+                store
+                    .put(&bal, &DEV_BALANCE.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            devs.push(DevContract {
+                name: spec.name.clone(),
+                addr: *addr,
+                contract: Arc::new(contract),
+                schema,
+            });
         }
         let listener = TcpListener::bind(bind).map_err(|e| format!("bind: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let dev_files = files::DevFiles::open(files, addr.port())?;
+        let files_dir = dev_files.dir().to_path_buf();
         let shared = Arc::new(Shared {
-            contract: RwLock::new(Arc::new(contract)),
+            contracts: RwLock::new(devs),
             page: RwLock::new(None),
             tables: RwLock::new(tables),
-            schema: RwLock::new(schema),
             indexes,
             fields: RwLock::new(BTreeMap::new()),
             state: Mutex::new(State {
@@ -251,6 +411,8 @@ impl Server {
                 admin: Vec::new(),
             }),
             stop: AtomicBool::new(false),
+            files: dev_files,
+            auth: Mutex::new(auth::DevAuth::default()),
         });
         let sh = shared.clone();
         let thread = std::thread::spawn(move || {
@@ -266,23 +428,35 @@ impl Server {
                 }
             }
         });
-        let (sh_reload, sh_page, sh_fields) = (shared.clone(), shared.clone(), shared.clone());
+        let (sh_reload, sh_page, sh_fields, sh_names, sh_auth) = (
+            shared.clone(),
+            shared.clone(),
+            shared.clone(),
+            shared.clone(),
+            shared.clone(),
+        );
         let stop = Arc::new(move || {
             shared.stop.store(true, Ordering::SeqCst);
             // Wake the blocked accept.
             let _ = TcpStream::connect(addr);
         });
-        let reload = Arc::new(move |elf: &[u8]| reload_contract(&sh_reload, elf));
+        let reload =
+            Arc::new(move |name: Option<&str>, elf: &[u8]| reload_contract(&sh_reload, name, elf));
         let page = Arc::new(move |p| *sh_page.page.write().unwrap() = p);
         let fields = Arc::new(move |f: FieldHints| {
             *sh_fields.fields.write().unwrap() = f.into_iter().collect();
         });
+        let names = Arc::new(move || sh_names.names());
+        let set_auth = Arc::new(move |m| sh_auth.auth.lock().unwrap().mode = m);
         Ok(Server {
+            set_auth,
             addr,
             stop,
             reload,
             page,
             fields,
+            names,
+            files_dir,
             thread,
         })
     }
@@ -291,11 +465,37 @@ impl Server {
         self.addr
     }
 
-    /// Swap in a new build of the contract while keeping all state. The ELF is validated first
-    /// (an error leaves the old contract running). Every live subscription is then re-run
-    /// against the new code and pushes its result if it changed. Returns the entry points.
+    /// Choose how callers are identified (`--auth`, see `auth`).
+    pub fn set_auth(&self, mode: auth::AuthMode) {
+        (self.set_auth)(mode)
+    }
+
+    /// `(name, address)` of every contract, primary first.
+    pub fn contracts(&self) -> Vec<(String, Address)> {
+        (self.names)()
+    }
+
+    /// The directory uploaded files are kept in.
+    pub fn files_dir(&self) -> &Path {
+        &self.files_dir
+    }
+
+    /// Swap in a new build of the primary contract while keeping all state. The ELF is
+    /// validated first (an error leaves the old contract running). Every live subscription is
+    /// then re-run against the new code and pushes its result if it changed. Returns the entry
+    /// points.
     pub fn reload(&self, elf: &[u8]) -> Result<Vec<btb_vm::EntryPoint>, String> {
-        (self.reload)(elf)
+        (self.reload)(None, elf)
+    }
+
+    /// Like [`Server::reload`] for the contract called `name`; the other contracts and all
+    /// state are untouched.
+    pub fn reload_contract(
+        &self,
+        name: &str,
+        elf: &[u8],
+    ) -> Result<Vec<btb_vm::EntryPoint>, String> {
+        (self.reload)(Some(name), elf)
     }
 
     /// Serve this HTML at `/` instead of the built-in todo page (`None` restores it).
@@ -323,17 +523,60 @@ impl Server {
 
 fn reload_contract<S: KvStore + Send + 'static>(
     sh: &Arc<Shared<S>>,
+    name: Option<&str>,
     elf: &[u8],
 ) -> Result<Vec<btb_vm::EntryPoint>, String> {
     let contract = Contract::from_elf(elf).map_err(|e| format!("bad contract: {e:?}"))?;
     let entries = contract.entry_points().to_vec();
-    // New or changed tables and indexes apply to new writes; existing rows are not re-indexed.
-    let mut tables = sh.tables.read().unwrap().clone();
-    let schema = register_tables(&mut tables, elf, &sh.indexes)?;
-    *sh.tables.write().unwrap() = tables;
-    *sh.schema.write().unwrap() = schema;
+    let (idx, addr) = {
+        let cs = sh.contracts.read().unwrap();
+        let i = match name {
+            None => 0,
+            Some(n) => cs
+                .iter()
+                .position(|c| c.name == n)
+                .ok_or_else(|| format!("no such contract {n:?}"))?,
+        };
+        (i, cs[i].addr)
+    };
+    // Compare the schemas like a chain upgrade does: refuse an incompatible change without a
+    // migration, backfill new indexes, run migrations. All of it is computed first and committed
+    // as one batch, so a refused reload leaves the old build and the data untouched.
     let mut guard = sh.state.lock().unwrap();
-    *sh.contract.write().unwrap() = Arc::new(contract);
+    let new_schema = Schema::from_elf(elf)?;
+    let old_schema = sh.contracts.read().unwrap()[idx].schema.clone();
+    let (batch, notes) = evolve::plan(
+        guard.occ.store(),
+        &addr,
+        &old_schema,
+        &new_schema,
+        &contract,
+        guard.height,
+    )?;
+    if !batch.is_empty() {
+        let snapshot = guard.occ.snapshot();
+        guard
+            .occ
+            .commit::<(), ()>(btb_runtime::Txn {
+                snapshot,
+                reads: ReadSet::default(),
+                batch,
+                output: (),
+            })
+            .map_err(|e| format!("commit migration: {e:?}"))?;
+    }
+    for n in &notes {
+        eprintln!("btb dev: schema: {n}");
+    }
+    let mut tables = sh.tables.read().unwrap().clone();
+    let legacy: &[IndexSpec] = if idx == 0 { &sh.indexes } else { &[] };
+    let schema = register_tables(&mut tables, addr, elf, legacy)?;
+    *sh.tables.write().unwrap() = tables;
+    {
+        let mut cs = sh.contracts.write().unwrap();
+        cs[idx].contract = Arc::new(contract);
+        cs[idx].schema = schema;
+    }
     let st = &mut *guard;
     let (height, mut dead) = (st.height, Vec::new());
     let ids: Vec<SubId> = st.clients.keys().copied().collect();
@@ -341,8 +584,8 @@ fn reload_contract<S: KvStore + Send + 'static>(
         let client = &st.clients[&id];
         let c = client.caller;
         let store = st.occ.store();
-        let change = st.subs.refresh(id, |_, f, a| {
-            run(sh, store, FunctionKind::Query, f, a, c, height).map(|(o, _, r)| (o, r))
+        let change = st.subs.refresh(id, |a, f, args| {
+            run(sh, store, FunctionKind::Query, a, f, args, c, height).map(|(o, _, r)| (o, r))
         });
         match change {
             Ok(Some(ch)) => {
@@ -427,7 +670,12 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if len > MAX_BODY {
+    let cap = if target.starts_with("/upload") {
+        files::MAX_UPLOAD
+    } else {
+        MAX_BODY
+    };
+    if len > cap {
         return Err("body too large".into());
     }
     let mut body = vec![0u8; len];
@@ -478,18 +726,31 @@ fn call_error(e: &CallError) -> (&'static str, String) {
     }
 }
 
-/// Run `function` as `kind`; returns the output and what it read and wrote.
+/// Run `function` of the contract at `contract` as `kind`; returns the output and what it read
+/// and wrote. Other contracts of the server can be called (`call_contract`).
+#[allow(clippy::too_many_arguments)]
 fn run<S: KvStore>(
     sh: &Shared<S>,
     store: &S,
     kind: FunctionKind,
+    contract: &Address,
     function: &str,
     args: &[u8],
     caller: [u8; 32],
     height: u64,
 ) -> Result<(Vec<u8>, WriteBatch, ReadSet), (&'static str, String)> {
     let tables = sh.tables.read().unwrap();
-    let mut host = RuntimeHost::new(store, &tables, CONTRACT, caller, height);
+    let cs = sh.contracts.read().unwrap();
+    let code = cs
+        .iter()
+        .find(|c| &c.addr == contract)
+        .map(|c| c.contract.clone())
+        .ok_or(("404 Not Found", "no such contract".to_string()))?;
+    let resolver = DevResolver(&cs);
+    let mut host = RuntimeHost::new(store, &tables, *contract, caller, height);
+    host.enable_calls(&resolver, MEM);
+    host.enable_files(&sh.files);
+    host.via_session = auth::via_session();
     if kind != FunctionKind::Query {
         // No beacon on a development server: marked functions get numbers from a fixed seed so
         // they can be tried out. Different on every call; not random in any security sense.
@@ -503,8 +764,7 @@ fn run<S: KvStore>(
         id[8..].copy_from_slice(&caller[..24]);
         host.enable_dev_randomness(*b"btb.dev.randomness.not.secure!!!", id);
     }
-    let contract = sh.contract.read().unwrap().clone();
-    let out = contract
+    let out = code
         .call(kind, function, args, &mut host, GAS, MEM)
         .map_err(|e| call_error(&e))?;
     let (batch, reads) = host
@@ -525,10 +785,28 @@ fn handle<S: KvStore + Send + 'static>(
     sh: &Arc<Shared<S>>,
     mut conn: TcpStream,
 ) -> std::io::Result<()> {
-    let req = match read_request(&mut conn) {
+    let mut req = match read_request(&mut conn) {
         Ok(r) => r,
         Err(e) => return err_json(&mut conn, "400 Bad Request", &e),
     };
+    // `/c/<name or address>/...` names the contract (as on a hosting node); `?contract=` too.
+    if let Some(rest) = req.path.strip_prefix("/c/") {
+        let (sel, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let (sel, tail) = (sel.to_string(), format!("/{tail}"));
+        req.query.insert("contract".into(), sel);
+        req.path = tail;
+    }
+    if req.method == "GET" && req.path == "/contracts" {
+        return respond(
+            &mut conn,
+            "200 OK",
+            "application/json",
+            &admin::contracts_json(sh),
+        );
+    }
+    if req.path == "/upload" || req.path.starts_with("/upload/") || req.path.starts_with("/file/") {
+        return files::route(sh, &mut conn, &req);
+    }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
         let page = sh.page.read().unwrap().clone();
         let html = page.as_deref().unwrap_or(TODO_HTML);
@@ -558,6 +836,31 @@ fn handle<S: KvStore + Send + 'static>(
             Err((s, m)) => err_json(&mut conn, s, &m),
         };
     }
+    if req.method == "GET" && req.path == "/auth/info" {
+        let a = sh.auth.lock().unwrap();
+        let Some(acct) = req
+            .query
+            .get("account")
+            .and_then(|h| demo::unhex(h))
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        else {
+            return err_json(
+                &mut conn,
+                "400 Bad Request",
+                "account must be 64 hex characters",
+            );
+        };
+        let height = sh.state.lock().unwrap().height;
+        let body = format!(
+            "{{\"chain_id\":{},\"height\":{height},\"nonce\":{}}}",
+            auth::DEV_CHAIN_ID,
+            a.nonce(&acct)
+        );
+        return respond(&mut conn, "200 OK", "application/json", &body);
+    }
+    if req.method == "POST" && req.path == "/auth/tx" {
+        return auth_tx(sh, &mut conn, &req);
+    }
     let Some((kind, function)) = req.path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
         return err_json(&mut conn, "404 Not Found", "not found");
     };
@@ -585,14 +888,46 @@ fn handle<S: KvStore + Send + 'static>(
     );
     let json = req.query.get("format").is_some_and(|f| f == "json");
     let function = function.to_string();
+    let (target, _) = match sh.target(req.query.get("contract").map(String::as_str)) {
+        Ok(t) => t,
+        Err((s, m)) => return err_json(&mut conn, s, &m),
+    };
+    let (mut caller, mut args) = (caller, args);
+    auth::set_via_session(false);
+    if kind == FunctionKind::Mutation && sh.auth.lock().unwrap().mode == auth::AuthMode::Signed {
+        // Signed mode: the caller is the signer (or the account a session key acts for).
+        let Some(raw) = req.headers.get("x-btb-tx").and_then(|h| demo::unhex(h)) else {
+            return err_json(
+                &mut conn,
+                "401 Unauthorized",
+                "signed mode: send X-BTB-Tx (hex of a signed Call transaction)",
+            );
+        };
+        let height = sh.state.lock().unwrap().height;
+        match sh.auth.lock().unwrap().call_tx(&raw, height, &target) {
+            Ok(v) if v.function == function => {
+                (caller, args) = (v.account, v.args);
+                auth::set_via_session(v.via_session);
+            }
+            Ok(_) => {
+                return err_json(
+                    &mut conn,
+                    "400 Bad Request",
+                    "the transaction calls another function",
+                )
+            }
+            Err(m) => return err_json(&mut conn, "401 Unauthorized", &m),
+        }
+    }
     match req.path.split('/').nth(1) {
-        Some("mutation") => mutation(sh, &mut conn, &function, &args, caller, json),
+        Some("mutation") => mutation(sh, &mut conn, &target, &function, &args, caller, json),
         Some("query") => {
             let st = sh.state.lock().unwrap();
             match run(
                 sh,
                 st.occ.store(),
                 kind,
+                &target,
                 &function,
                 &args,
                 caller,
@@ -618,7 +953,31 @@ fn handle<S: KvStore + Send + 'static>(
                 }
             }
         }
-        _ => subscribe(sh, &mut conn, &function, args, caller, json),
+        _ => subscribe(sh, &mut conn, &target, &function, args, caller, json),
+    }
+}
+
+/// `POST /auth/tx` (signed mode): a signed `Session` grant or revoke, hex in the body.
+fn auth_tx<S: KvStore + Send + 'static>(
+    sh: &Arc<Shared<S>>,
+    conn: &mut TcpStream,
+    req: &Request,
+) -> std::io::Result<()> {
+    let mut a = sh.auth.lock().unwrap();
+    if a.mode != auth::AuthMode::Signed {
+        return err_json(conn, "404 Not Found", "start btb-dev with --auth signed");
+    }
+    let Some(raw) = demo::unhex(String::from_utf8_lossy(&req.body).trim()) else {
+        return err_json(
+            conn,
+            "400 Bad Request",
+            "body must be hex of a signed transaction",
+        );
+    };
+    let height = sh.state.lock().unwrap().height;
+    match a.session_tx(&raw, height) {
+        Ok(()) => respond(conn, "200 OK", "application/json", "{\"ok\":true}"),
+        Err(m) => err_json(conn, "401 Unauthorized", &m),
     }
 }
 
@@ -642,6 +1001,7 @@ fn request_args(req: &Request) -> Result<Vec<u8>, String> {
 fn mutation<S: KvStore + Send + 'static>(
     sh: &Arc<Shared<S>>,
     conn: &mut TcpStream,
+    target: &Address,
     function: &str,
     args: &[u8],
     caller: [u8; 32],
@@ -657,6 +1017,7 @@ fn mutation<S: KvStore + Send + 'static>(
                 sh,
                 store,
                 FunctionKind::Mutation,
+                target,
                 function,
                 args,
                 caller,
@@ -677,7 +1038,7 @@ fn mutation<S: KvStore + Send + 'static>(
     };
     st.height += 1;
     if !committed.batch.is_empty() {
-        let ev = admin::commit_event(st.height, &committed.batch);
+        let ev = admin::commit_event(st.height, &committed.batch, &sh.names());
         st.admin.retain(|tx| tx.send(ev.clone()).is_ok());
     }
     // Push changed results of affected subscriptions (a subscription runs as its own caller).
@@ -688,8 +1049,8 @@ fn mutation<S: KvStore + Send + 'static>(
         };
         let (c, height) = (client.caller, st.height);
         let store = st.occ.store();
-        let change = st.subs.refresh(id, |_, f, a| {
-            run(sh, store, FunctionKind::Query, f, a, c, height).map(|(o, _, r)| (o, r))
+        let change = st.subs.refresh(id, |ct, f, a| {
+            run(sh, store, FunctionKind::Query, ct, f, a, c, height).map(|(o, _, r)| (o, r))
         });
         match change {
             Ok(Some(ch)) => {
@@ -728,6 +1089,7 @@ fn event(conn: &mut TcpStream, function: &str, out: &[u8], json: bool) -> std::i
 fn subscribe<S: KvStore + Send + 'static>(
     sh: &Arc<Shared<S>>,
     conn: &mut TcpStream,
+    target: &Address,
     function: &str,
     args: Vec<u8>,
     caller: [u8; 32],
@@ -741,13 +1103,14 @@ fn subscribe<S: KvStore + Send + 'static>(
             sh,
             st.occ.store(),
             FunctionKind::Query,
+            target,
             function,
             &args,
             caller,
             st.height,
         ) {
             Ok((out, _, reads)) => {
-                let id = st.subs.subscribe(CONTRACT, function, &args, reads, &out);
+                let id = st.subs.subscribe(*target, function, &args, reads, &out);
                 st.clients.insert(id, Client { caller, tx });
                 (id, out)
             }

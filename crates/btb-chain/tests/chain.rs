@@ -632,10 +632,10 @@ fn tx_and_block_wire_roundtrip_and_rejects_garbage() {
         assert!(Transaction::decode(&wire[..wire.len() - 1]).is_err());
     }
     let mut bad_tag = txs[2].encode();
-    bad_tag[16] = 100;
+    bad_tag[16] = 63;
     assert!(matches!(
         Transaction::decode(&bad_tag),
-        Err(TxError::BadTag(100))
+        Err(TxError::BadTag(63))
     ));
     let blk = Block::new(3, [1; 32], 5, [2; 32], txs);
     assert_eq!(Block::decode(&blk.encode()).unwrap(), blk);

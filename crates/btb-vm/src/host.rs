@@ -93,6 +93,13 @@ pub mod abi {
     /// address that owns its token balances and is matched against a token's mint authority).
     pub const CONTRACT_ADDRESS: u64 = 23;
 
+    /// `caller_via_session() -> 0 | 1`: 1 if the transaction that started this execution was signed
+    /// by a session key of the account `caller()` returns (`docs/CHAIN.md`, "Session keys"), 0 if
+    /// the account signed it itself, and always 0 for a nested `call_contract` frame (there
+    /// `caller()` is the calling contract) and for crons. Own range (60..=69), flat gas
+    /// `HOST_CALLER_VIA_SESSION`.
+    pub const CALLER_VIA_SESSION: u64 = 60;
+
     /// Oracle host calls use their own number range (40..=49) so they never collide with other
     /// modules' additions.
     ///
@@ -165,6 +172,42 @@ pub mod abi {
     pub const CALL_DEPOSIT: u64 = u64::MAX - 8;
     /// The host cannot run other contracts.
     pub const CALL_UNSUPPORTED: u64 = u64::MAX - 9;
+
+    /// File-storage host calls use their own number range (70..=79). Files live on storage nodes
+    /// (`docs/STORAGE.md`); a contract only ever holds their 32-byte root.
+    ///
+    /// `file_info(root_ptr, out_ptr) -> 0 | NOT_FOUND`. Read-only; allowed in queries,
+    /// mutations and crons. Writes 24 bytes to `out_ptr`: `size: u64 LE`, `status: u8`
+    /// (`FILE_UNKNOWN`, `FILE_STORED`, `FILE_EXPIRED`), 7 zero bytes, `expiry: u64 LE` (the
+    /// block height by which the paid periods have all run; 0 when unknown). A root the chain
+    /// has never seen is not an error: it answers `FILE_UNKNOWN` with zeros. `NOT_FOUND`: the
+    /// host has no file storage at all. Gas `HOST_FILE_INFO` (a state read).
+    pub const FILE_INFO: u64 = 70;
+    /// `file_pin(req_ptr, req_len) -> FILE_PIN_*`. Mutations and crons only. Pays the escrow for
+    /// storing a file from the running contract's own balance, exactly as a `Store` transaction
+    /// from the contract would. Request (`FILE_PIN_REQUEST_LEN` bytes): `root[32], size: u64 LE,
+    /// k: u8, m: u8, periods: u32 LE`. The chain cannot derive the shape from the root, so the
+    /// contract passes the `size`/`k`/`m` the uploader got back with the root. Gas
+    /// `HOST_FILE_PIN` (the placement work of a `Store`); the escrow itself is not gas.
+    pub const FILE_PIN: u64 = 71;
+    /// Length of a `file_pin` request.
+    pub const FILE_PIN_REQUEST_LEN: u64 = 46;
+    /// `file_info` statuses.
+    pub const FILE_UNKNOWN: u8 = 0;
+    pub const FILE_STORED: u8 = 1;
+    pub const FILE_EXPIRED: u8 = 2;
+    /// `file_pin` results.
+    pub const FILE_PIN_OK: u64 = 0;
+    /// The root is already stored and live: nothing was paid.
+    pub const FILE_PIN_EXISTS: u64 = 1;
+    /// The contract's balance cannot cover the escrow.
+    pub const FILE_PIN_INSUFFICIENT: u64 = 2;
+    /// Fewer eligible storage nodes than pieces.
+    pub const FILE_PIN_NO_NODES: u64 = 3;
+    /// Bad shape (size 0 or too large, `k`/`m` out of range, `periods` 0 or too large).
+    pub const FILE_PIN_INVALID: u64 = 4;
+    /// The host has no file storage.
+    pub const FILE_PIN_UNSUPPORTED: u64 = 5;
 
     /// Largest `window` accepted by `price_twap`.
     pub const MAX_TWAP_WINDOW: u64 = 10_000;
@@ -351,6 +394,50 @@ pub enum TwapOutcome {
     BadWindow,
 }
 
+/// What `file_info` reports about a root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileRecord {
+    pub size: u64,
+    /// `abi::FILE_UNKNOWN`, `FILE_STORED` or `FILE_EXPIRED`.
+    pub status: u8,
+    /// Block height by which the paid periods have all run; 0 when unknown.
+    pub expiry: u64,
+}
+
+impl FileRecord {
+    pub fn encode(&self) -> [u8; 24] {
+        let mut o = [0u8; 24];
+        o[..8].copy_from_slice(&self.size.to_le_bytes());
+        o[8] = self.status;
+        o[16..].copy_from_slice(&self.expiry.to_le_bytes());
+        o
+    }
+}
+
+/// A decoded `file_pin` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilePin {
+    pub root: [u8; 32],
+    pub size: u64,
+    pub k: u8,
+    pub m: u8,
+    pub periods: u32,
+}
+
+/// Decode a `file_pin` request; `None` if it is not exactly `FILE_PIN_REQUEST_LEN` bytes.
+pub fn parse_file_pin(req: &[u8]) -> Option<FilePin> {
+    if req.len() as u64 != abi::FILE_PIN_REQUEST_LEN {
+        return None;
+    }
+    Some(FilePin {
+        root: req[..32].try_into().ok()?,
+        size: u64::from_le_bytes(req[32..40].try_into().ok()?),
+        k: req[40],
+        m: req[41],
+        periods: u32::from_le_bytes(req[42..46].try_into().ok()?),
+    })
+}
+
 /// A decoded `call_contract` request, as the host gets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallRequest<'a> {
@@ -423,6 +510,11 @@ pub trait Host {
     fn storage_write(&mut self, key: &[u8], value: &[u8]);
     fn storage_remove(&mut self, key: &[u8]);
     fn caller(&self) -> Address;
+    /// Whether `caller()` is an account acting through a session key. Hosts without sessions
+    /// report false.
+    fn caller_via_session(&self) -> bool {
+        false
+    }
     /// Address of the running contract. Hosts that do not track one report the zero address.
     fn contract_address(&self) -> Address {
         [0; 32]
@@ -473,6 +565,15 @@ pub trait Host {
     /// outcome but `Ok`. The default cannot run other contracts.
     fn call_contract(&mut self, _req: &CallRequest<'_>) -> CallReply {
         CallReply::refused(CallEnd::Unsupported)
+    }
+    /// What the host knows about file `root` (`abi::FILE_INFO`). `None`: no file storage.
+    fn file_info(&mut self, _root: &[u8; 32]) -> Option<FileRecord> {
+        None
+    }
+    /// Pay for storing a file from the running contract's balance (`abi::FILE_PIN`); returns an
+    /// `abi::FILE_PIN_*` status. The VM has already refused a read-only frame.
+    fn file_pin(&mut self, _pin: &FilePin) -> u64 {
+        abi::FILE_PIN_UNSUPPORTED
     }
     /// Queue `data` to be threshold-signed as a report for other chains; returns its id. `None`:
     /// the host has no report queue.
@@ -571,6 +672,10 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                 vm.charge_gas(gas::HOST_CALLER)?;
                 vm.write_mem(a0, &host.caller())?;
                 0
+            }
+            abi::CALLER_VIA_SESSION => {
+                vm.charge_gas(gas::HOST_CALLER_VIA_SESSION)?;
+                u64::from(host.caller_via_session())
             }
             abi::CONTRACT_ADDRESS => {
                 vm.charge_gas(gas::HOST_CONTRACT_ADDRESS)?;
@@ -870,6 +975,28 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                 }
                 let data = buf(vm, a0, a1)?;
                 host.report_request(&data).unwrap_or(abi::NOT_FOUND)
+            }
+            abi::FILE_INFO => {
+                vm.charge_gas(gas::HOST_FILE_INFO)?;
+                let root = addr(vm, a0)?;
+                // Validate the output window before doing anything.
+                buf(vm, a1, 24)?;
+                match host.file_info(&root) {
+                    None => abi::NOT_FOUND,
+                    Some(r) => {
+                        vm.write_mem(a1, &r.encode())?;
+                        0
+                    }
+                }
+            }
+            abi::FILE_PIN => {
+                check_write(host)?;
+                vm.charge_gas(gas::HOST_FILE_PIN)?;
+                let req = buf(vm, a0, a1)?;
+                let Some(pin) = parse_file_pin(&req) else {
+                    return Err(Trap::Abort("malformed file_pin request".into()));
+                };
+                host.file_pin(&pin)
             }
             abi::CALL_CONTRACT => {
                 vm.charge_gas(cost(gas::HOST_CALL_CONTRACT, gas::CALL_BYTE, a1))?;

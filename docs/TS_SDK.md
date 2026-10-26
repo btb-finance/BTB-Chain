@@ -74,6 +74,18 @@ The same client talks to a hosting node ([HOSTING.md](HOSTING.md)); the contract
 - `client.proof(keys, height?)` fetches a bundle for contract storage keys (default: the newest version whose next block is provably committed).
 - `await verifyProof(bundle, { trustedRoot?, expect? })` (async, uses WebCrypto) checks every entry against the bundle's state root and the header of the next block, and throws `ProofError` otherwise. It returns the proven `(key, value)` pairs. `trustedRoot` (for example a validator's `state_root_after` for that height) pins the root; without it the root is only the host's claim. The quorum evidence in the bundle is checked by the Rust verifier (`btb_host::proof::verify_bundle`), not here. What is and is not provable: [HOSTING.md](HOSTING.md#proofs).
 
+## Files
+
+`uploadFile(client, data, opts?)` sends the bytes to the node's upload endpoint (`btb dev`, or a hosting node started with `--upload-dir`) and returns `{ root, rootHex, size, k, m, stored, url }`. `root` is a 32-byte `Uint8Array`, ready for a mutation parameter declared as `t.address` (`Address` in Rust). `fileUrl(client, root)` is the URL of the stored file for `<img src>` or `fetch` (`/file/<root>` on the node, without any `/c/<contract>` suffix; the node verifies the pieces against the root and the response is immutable). `finishUpload(client, root)` asks a hosting node to push the pieces to the storage nodes once the file is stored on chain (a no-op on `btb dev`; status 409 until the chain knows the file).
+
+```ts
+const f = await uploadFile(client, file);                  // bytes go off chain, the root comes back
+await client.mutation(api.attach, ["photo", f.root]);       // the contract checks files::require_stored
+img.src = fileUrl(client, f.root);
+```
+
+On `btb dev` the upload is stored and paid for you. On a chain the file must be paid for before a contract accepts it: have the contract pay (`files::pin` in the mutation, then `finishUpload`) or send a `Store` transaction (`btb store`). Design and statuses: [STORAGE.md](STORAGE.md#files-from-contracts). Tests: `sdk-ts/test/files.test.ts` (mocked fetch, and a real `btb-dev` running `examples/files`).
+
 ## In a plain page (no bundler)
 
 `btb dev` serves only `web/index.html`, so the example pages inline the built client (`sdk-ts/dist`) in a `<script>` that defines a global `btb`; `node examples/sync-sdk.mjs` refreshes it ([examples/README-web.md](../examples/README-web.md)). Pages use `new btb.BtbClient({ url: location.origin, caller })` and `btb.t`. A page that also has a `<!-- btb-api:begin --><!-- btb-api:end -->` block gets the generated `examples/<app>/api/api.js` inlined as `const api` by the same script, so `examples/todo/web/index.html` calls `client.subscribe(api.list_mine, [], render)` and `client.mutation(api.add, [text])` with no build step; regenerate with `btb codegen --ts examples/todo/api` and then `node examples/sync-sdk.mjs`.
@@ -94,6 +106,33 @@ function Todos() {
 
 `useQuery` is live (a subscription) and resubscribes when the name or encoded arguments change. `mutate` resolves with the result and rejects with `BtbError` (`ContractError` for a contract abort). With a generated reference: `useQuery(api.list_mine)`, `useQuery(api.recent, [10])`, `const [add] = useMutation(api.add)`, fully typed.
 
+## Auth: session keys
+
+`BtbAuth` is "log in once, then the app signs for you" ([CHAIN.md, Session keys](CHAIN.md#session-keys)):
+
+```ts
+const auth = new BtbAuth({
+  wallet: new LocalKeyWallet(seed),          // demos; a real wallet implements Wallet
+  transport: devTransport("http://127.0.0.1:8787"),   // btb-dev --auth signed
+  contract, functions: ["add"],              // the grant's scope
+  ttlBlocks: 10_000n, spendLimit: 1_000_000_000n,     // expiry and fee budget
+});
+const client = new BtbClient({ url, auth });
+await auth.restore();      // on page load: reuse the stored session
+await auth.login();        // creates the key, the wallet signs ONE grant
+await client.mutation("add", ..., ["buy milk"], t.u64);   // signed by the session key
+await auth.logout({ revoke: true });
+```
+
+- The session key is WebCrypto Ed25519 created non-extractable and stored as a `CryptoKey` in **IndexedDB** (`IndexedDbKeyStore`; `MemoryKeyStore` without a browser). Page scripts can use it to sign but cannot read its bytes. Anyone with script access to the page can still *use* it until expiry or revocation, which is why the grant is scoped and budgeted.
+- `Wallet` is `{ address(), signTransaction(body) }` and signs only `Session` transactions. `LocalKeyWallet` holds a seed in memory: demos and tests, not for real funds.
+- Transports: `devTransport(url)` (`GET /auth/info`, `POST /auth/tx`), `hostTransport(client, rootUrl)` (a relaying hosting node: `GET /account/<addr>`, `GET /relay`, `POST /tx`; every transaction names the host as relayer, the account needs funds for the grant fee). Against a chain, mutations are transactions: `auth.send(client, fn, args)` signs with the session key, submits through the relay and waits for the receipt. Against `btb-dev --auth signed`, `client.mutation` sends `X-BTB-Tx` itself.
+- With an identity, `client.caller` (queries and subscriptions) is the account.
+- Refused signed transactions (outside the grant, expired, revoked, over budget) come back as `BtbError` (status 401 on btb-dev, 400 through a relay) naming the reason, e.g. `FunctionNotAllowed`; the local nonce counter is reset.
+- `signTransactionWith(body, publicKey, cryptoKey)`, `grantKind`, `revokeKind` and `TxBody.session` are the low-level pieces; encodings are checked byte for byte against `test/fixtures/session.json`.
+
+React: `const { identity, loading, error, login, logout } = useAuth();` (the provider's client needs an `auth`).
+
 ## Tests
 
-`cd sdk-ts && npm ci && npm test`. Codec cases are checked against `sdk-ts/test/fixtures/codec.json`, generated by `btb-codec`; `crates/btb-tests/tests/ts_fixtures.rs` fails when it is stale (`BTB_UPDATE_FIXTURES=1 cargo test -p btb-tests --test ts_fixtures` rewrites it). The integration test builds `examples/todo` and `btb-dev` and subscribes against a real server. CI job: `sdk-ts`.
+`cd sdk-ts && npm ci && npm test`. Codec cases are checked against `sdk-ts/test/fixtures/codec.json`, generated by `btb-codec`; `crates/btb-tests/tests/ts_fixtures.rs` fails when it is stale (`BTB_UPDATE_FIXTURES=1 cargo test -p btb-tests --test ts_fixtures` rewrites it). The integration tests build `examples/todo` and `btb-dev` and run against a real server (also `--auth signed`, `test/auth-dev.test.ts`). `test/auth-relay.test.ts` runs the session flow against a 4-validator cluster through a hosting node's relay; it is started by `ts_session_flow_through_the_relay` in `crates/btb-host/tests/host.rs`. `test/fixtures/session.json` is generated by `crates/btb-chain/tests/session.rs` (`BTB_WRITE_FIXTURES=1`). CI job: `sdk-ts`.

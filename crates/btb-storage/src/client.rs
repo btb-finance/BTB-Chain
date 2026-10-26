@@ -34,15 +34,23 @@ pub fn store(chain: &dyn Chain, data: &[u8], k: u8, m: u8, periods: u32) -> Resu
         m,
         periods,
     })?;
-    let view =
-        chain::file(chain, &enc.id)?.ok_or("the chain does not know the file after Store")?;
+    push(chain, &enc)
+}
+
+/// Upload the pieces of an already encoded file to the nodes the chain assigned them to. The
+/// file must be stored on chain (by a `Store` transaction of its owner, or a contract's
+/// `file_pin`); nothing is paid here.
+pub fn push(chain: &dyn Chain, enc: &erasure::Encoded) -> Result<Stored, String> {
+    let (k, m) = (enc.k, enc.m);
+    let view = chain::file(chain, &enc.id)?
+        .ok_or("the chain does not know this file: store it first (StoreFile or a contract pin)")?;
     let mut failed = Vec::new();
     let results: Vec<(u8, Result<(), String>)> = std::thread::scope(|sc| {
         let hs: Vec<_> = view
             .pieces
             .iter()
             .map(|p| {
-                let (enc, p) = (&enc, p);
+                let (enc, p) = (enc, p);
                 sc.spawn(move || {
                     let i = usize::from(p.index);
                     (

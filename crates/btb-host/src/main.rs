@@ -27,6 +27,7 @@ fn run() -> Result<(), String> {
     let mut serve = false;
     let mut poll = None;
     let (mut relayer, mut relay_rpc) = (None, Vec::new());
+    let mut upload_dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -41,6 +42,7 @@ fn run() -> Result<(), String> {
             "--poll-ms" => poll = Some(val("--poll-ms")?.parse().map_err(|_| "--poll-ms: number")?),
             "--serve-followers" => serve = true,
             "--relayer" => relayer = Some(btb_node::hex::decode32(&val("--relayer")?)?),
+            "--upload-dir" => upload_dir = Some(val("--upload-dir")?.into()),
             "--relay-rpc" => relay_rpc.push(val("--relay-rpc")?),
             "-h" | "--help" => {
                 println!("{}", include_str!("usage.txt"));
@@ -78,6 +80,7 @@ fn run() -> Result<(), String> {
         (None, true) => {}
         _ => return Err("--relayer and --relay-rpc go together".into()),
     }
+    cfg.upload_dir = upload_dir;
     let host = Host::start(cfg)?;
     println!("btb-host listening on http://{}", host.http_addr());
     host.run_until_stopped();

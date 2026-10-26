@@ -58,6 +58,10 @@ pub struct HostConfig {
     pub max_connections: usize,
     /// Relay client-signed transactions to validators and earn the relay share of their fees.
     pub relay: Option<RelayConfig>,
+    /// Upload gateway: `POST /upload` keeps files here until `POST /upload/<root>/push` sends
+    /// their pieces to the storage nodes the chain assigned (after a `Store` or a contract
+    /// `file_pin`). `None`: off. This node never pays; put rate limits in front.
+    pub upload_dir: Option<std::path::PathBuf>,
 }
 
 impl HostConfig {
@@ -73,6 +77,7 @@ impl HostConfig {
             serve_followers: None,
             max_connections: 256,
             relay: None,
+            upload_dir: None,
         }
     }
 }
@@ -119,6 +124,7 @@ impl Host {
             node: node.clone(),
             shared: shared.clone(),
             relay: cfg.relay.clone(),
+            upload_dir: cfg.upload_dir.clone(),
             chain_id: cfg.genesis.chain_id,
         });
         let sh = shared.clone();

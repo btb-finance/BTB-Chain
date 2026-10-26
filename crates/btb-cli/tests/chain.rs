@@ -55,7 +55,12 @@ fn deploy_call_query_over_rpc() {
     assert!(!btb(&counter, &["deploy", "--key", key_s]).status.success());
 
     let out = ok(btb(&counter, &["deploy", "--rpc", rpc_s, "--key", key_s]));
-    let addr = field(&out, "deployed: contract ").to_string();
+    // "deployed: contract <address> (<name>)"
+    let addr = field(&out, "deployed: contract ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
     assert_eq!(addr.len(), 64);
     c.faucet.nonce = 1;
     let fund = c.faucet.transfer(

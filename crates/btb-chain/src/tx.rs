@@ -15,6 +15,8 @@
 //! SubmitEvidence    (tag 6): epoch:u64 || evidence
 //! Dkg               (tag 14): sub:u8 || fields (`dkg.rs`: 0 deal, 1 complain), sent by a consensus key
 //! Cross             (tag 21): sub:u8 || fields (`cross.rs`: 0 deal, 1 complain, 2 signature, 3 evidence, 4 attest, 5 prepare, 6 withdraw)
+//! Upgrade           (tag 23): contract[32] || code:bytes || manifest || budget_gas:u64 (`upgrade.rs`)
+//! Session           (tag 22): sub:u8 || fields (`session.rs`: 0 grant, 1 revoke), signed by the account
 //! Host              (tag 20): sub:u8 || fields (`host.rs`: 0 register url:bytes, 1 unregister)
 //! Action            (tag 13): sub:u8 || fields (`actions.rs`: 0 request an HTTPS action, 1 set the contract's hosts)
 //! Storage           (tag 12): sub:u8 || fields (`storage.rs`: 0 register, 1 add deposit, 2 withdraw, 3 store, 4 prove)
@@ -31,6 +33,12 @@
 //! A body without a relayer is byte-for-byte the original encoding, so old transactions still
 //! decode, keep their signatures and ids, and execute (the fee then goes wholly to the
 //! validator pool). The relayer is inside the signed body: changing it breaks the signature.
+//!
+//! A body may also say it is signed by a **session key** for an account (`session.rs`): the tag's
+//! bit `0x40` is set and the 32-byte account address follows the relayer (if any). The
+//! transaction's `public_key` is then the session key, the sender (nonce, fee payer, `caller()`)
+//! is the account, and the chain checks the account's grant. The field is inside the signed body.
+//! A body without a session is byte-for-byte what it was before.
 //!
 //! `kind` is the entry-point kind (0 query, 1 mutation, 2 cron, 3 action). All four decode so
 //! the error is a clear "kind not allowed", but only mutation is valid in a `Call`: queries never
@@ -60,6 +68,9 @@ pub const MAX_ARG_BYTES: usize = 1 << 20;
 
 /// High bit of the tag byte: a 32-byte relayer address follows the tag (tx encoding v2).
 const RELAYER_FLAG: u8 = 0x80;
+/// Second-highest bit of the tag byte: a 32-byte account address follows (after the relayer, if
+/// any): the transaction is signed by a session key of that account (tx encoding v3).
+const SESSION_FLAG: u8 = 0x40;
 
 const SIG_DOMAIN: &[u8] = b"btb.tx.sig.v1";
 const ID_DOMAIN: &[u8] = b"btb.tx.id.v1";
@@ -107,6 +118,66 @@ impl Decode for Manifest {
             crons: Vec::decode_from(r)?,
             indexes: Vec::decode_from(r)?,
         })
+    }
+}
+
+/// Reserved `Manifest.indexes` entry that carries the upgrade policy (wire compatible: the
+/// manifest encoding is unchanged, old manifests have no such entry).
+pub const UPGRADE_ENTRY: &str = "!upgrade=";
+
+/// Who may replace a contract's code (`TxKind::Upgrade`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradePolicy {
+    /// The account that deployed it (the default).
+    Deployer,
+    /// Nobody: the contract is immutable.
+    Immutable,
+    /// This account.
+    Authority(Address),
+}
+
+impl Manifest {
+    /// The upgrade policy the manifest names; `None` if it names none (deployer on deploy,
+    /// unchanged on upgrade).
+    pub fn upgrade_policy(&self) -> Result<Option<UpgradePolicy>, String> {
+        let mut found = None;
+        for e in self
+            .indexes
+            .iter()
+            .filter_map(|i| i.strip_prefix(UPGRADE_ENTRY))
+        {
+            if found.is_some() {
+                return Err("upgrade policy given twice".into());
+            }
+            found = Some(match e {
+                "deployer" => UpgradePolicy::Deployer,
+                "none" => UpgradePolicy::Immutable,
+                hex if hex.len() == 64 && hex.is_ascii() => {
+                    let mut a = [0u8; 32];
+                    for (i, b) in a.iter_mut().enumerate() {
+                        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                            .map_err(|_| format!("bad upgrade authority {hex:?}"))?;
+                    }
+                    UpgradePolicy::Authority(a)
+                }
+                other => return Err(format!("bad upgrade policy {other:?}")),
+            });
+        }
+        Ok(found)
+    }
+
+    /// Set (or replace) the upgrade policy entry.
+    pub fn with_upgrade_policy(mut self, p: UpgradePolicy) -> Self {
+        self.indexes.retain(|i| !i.starts_with(UPGRADE_ENTRY));
+        self.indexes.push(format!(
+            "{UPGRADE_ENTRY}{}",
+            match p {
+                UpgradePolicy::Deployer => "deployer".to_string(),
+                UpgradePolicy::Immutable => "none".to_string(),
+                UpgradePolicy::Authority(a) => a.iter().map(|b| format!("{b:02x}")).collect(),
+            }
+        ));
+        self
     }
 }
 
@@ -168,7 +239,12 @@ impl Manifest {
         if self.indexes.len() > MAX_INDEX_SPECS {
             return Err("too many indexes".into());
         }
-        self.indexes.iter().map(|s| IndexSpec::parse(s)).collect()
+        self.upgrade_policy()?;
+        self.indexes
+            .iter()
+            .filter(|s| !s.starts_with(UPGRADE_ENTRY))
+            .map(|s| IndexSpec::parse(s))
+            .collect()
     }
 }
 
@@ -227,6 +303,16 @@ pub enum TxKind {
     Action(crate::actions::ActionOp),
     /// Register or remove the sender as a hosting node that may be paid as relayer (`crate::host`).
     Host(crate::host::HostOp),
+    /// Replace the code of a deployed contract (`crate::upgrade`), by its upgrade authority.
+    /// `budget_gas` is prepaid (at the gas price) for the migration and backfill work.
+    Upgrade {
+        contract: Address,
+        code: Vec<u8>,
+        manifest: Manifest,
+        budget_gas: u64,
+    },
+    /// Grant or revoke a session key (`crate::session`), signed by the account itself.
+    Session(crate::session::SessionOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -304,6 +390,9 @@ pub struct TxBody {
     /// (see `host.rs`). Chosen by the sender and covered by the signature, so no relay or
     /// proposer can change it. `None` encodes exactly as before this field existed.
     pub relayer: Option<Address>,
+    /// `Some(account)`: signed by a session key of `account` and acting as it (`session.rs`).
+    /// `None` encodes exactly as before this field existed.
+    pub session: Option<Address>,
     pub kind: TxKind,
 }
 
@@ -393,12 +482,35 @@ impl Encode for TxBody {
                 20u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Upgrade {
+                contract,
+                code,
+                manifest,
+                budget_gas,
+            } => {
+                23u8.encode_to(out);
+                contract.encode_to(out);
+                code.encode_to(out);
+                manifest.encode_to(out);
+                budget_gas.encode_to(out);
+            }
+            TxKind::Session(op) => {
+                22u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
-        // v2: a relayer sets the tag's high bit and follows it as 32 bytes.
+        // v2: a relayer sets the tag's high bit and follows it as 32 bytes; v3: a session
+        // account sets bit 0x40 and follows the relayer.
+        let mut extra: Vec<u8> = Vec::new();
         if let Some(relayer) = &self.relayer {
             out[tag_pos] |= RELAYER_FLAG;
-            out.splice(tag_pos + 1..tag_pos + 1, relayer.iter().copied());
+            extra.extend_from_slice(relayer);
         }
+        if let Some(account) = &self.session {
+            out[tag_pos] |= SESSION_FLAG;
+            extra.extend_from_slice(account);
+        }
+        out.splice(tag_pos + 1..tag_pos + 1, extra);
     }
 }
 
@@ -412,7 +524,12 @@ impl TxBody {
         } else {
             None
         };
-        let kind = match tag & !RELAYER_FLAG {
+        let session = if tag & SESSION_FLAG != 0 {
+            Some(<[u8; 32]>::decode_from(r)?)
+        } else {
+            None
+        };
+        let kind = match tag & !(RELAYER_FLAG | SESSION_FLAG) {
             0 => TxKind::Deploy {
                 code: Vec::decode_from(r)?,
                 manifest: Manifest::decode_from(r)?,
@@ -476,12 +593,23 @@ impl TxBody {
                 Ok(op) => TxKind::Host(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
+            23 => TxKind::Upgrade {
+                contract: <[u8; 32]>::decode_from(r)?,
+                code: Vec::decode_from(r)?,
+                manifest: Manifest::decode_from(r)?,
+                budget_gas: u64::decode_from(r)?,
+            },
+            22 => match crate::session::SessionOp::decode_from(r)? {
+                Ok(op) => TxKind::Session(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
             t => return Err(TxError::BadTag(t)),
         };
         Ok(TxBody {
             chain_id,
             nonce,
             relayer,
+            session,
             kind,
         })
     }
@@ -520,7 +648,14 @@ impl Transaction {
         }
     }
 
+    /// The account the transaction acts as: the session's account if a session key signed it,
+    /// else the address of the signing key. Nonce, fee and `caller()` are this account's.
     pub fn sender(&self) -> Address {
+        self.body.session.unwrap_or_else(|| self.signer())
+    }
+
+    /// The address of the key that signed (the session key's, for a session transaction).
+    pub fn signer(&self) -> Address {
         account_address(&self.public_key)
     }
 
@@ -586,6 +721,9 @@ impl Transaction {
             TxKind::Cross(op) => op.gas(),
             TxKind::Action(op) => op.gas(),
             TxKind::Host(op) => op.gas(),
+            TxKind::Session(op) => op.gas(),
+            TxKind::Upgrade { code, .. } => crate::upgrade::UPGRADE_BASE_GAS
+                .saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64)),
             TxKind::Deploy { code, .. } => {
                 DEPLOY_BASE_GAS.saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64))
             }

@@ -1315,6 +1315,7 @@ fn edge_relays_only_transactions_that_name_it() {
                 chain_id: CHAIN_ID,
                 nonce: 0,
                 relayer,
+                session: None,
                 kind: TxKind::Transfer {
                     to: [9; 32],
                     amount: 1,

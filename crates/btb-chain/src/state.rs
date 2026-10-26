@@ -658,6 +658,18 @@ impl<S: KvStore> ChainState<S> {
     }
 
     /// The bond locked by a registered hosting node (0 if none).
+    /// The stored session grants of `account` (`crate::session`), expired ones included.
+    pub fn sessions(&self, account: &Address) -> Result<Vec<crate::session::Stored>, StateError> {
+        crate::session::list(&self.kv, account)
+    }
+
+    /// Whether a session transaction would be valid in the next block (`session::check_admission`
+    /// against the head state). `Ok` for a transaction without a session.
+    pub fn check_session(&self, tx: &crate::tx::Transaction) -> Result<(), crate::exec::Invalid> {
+        let next = self.head().map_or(1, |h| h.height + 1);
+        crate::session::check_admission(&self.kv, tx, next, &self.config)
+    }
+
     pub fn host_bond(&self, a: &Address) -> Result<u64, KvError> {
         crate::host::bond(&self.kv, a)
     }

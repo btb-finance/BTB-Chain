@@ -43,6 +43,13 @@ impl IndexDef {
     }
 }
 
+/// What [`Tables::rewrite`] did to the index: entries deleted and entries written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rewrite {
+    pub deleted: u32,
+    pub put: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableError {
     Kv(KvError),
@@ -294,6 +301,85 @@ impl Tables {
         batch.delete(key);
         kv.commit(batch)?;
         Ok(true)
+    }
+
+    /// Replace the stored row `id` (bytes `old_row`, whose index entries follow `from`'s
+    /// definitions) by `new_row`, whose entries follow `self`'s. Entries of indexes both define
+    /// with the same value are left alone; the rest are deleted or written. This is what a
+    /// contract upgrade does to each row (`from` = the registry of the old code, `self` = the
+    /// new one); with `old_row == new_row` it only adds and removes index entries (backfill).
+    ///
+    /// Unique indexes are checked against rows with a lower id only: an upgrade rewrites rows in
+    /// id order, so the rows above `id` still hold their old entries, and each of them is
+    /// checked against this one when its turn comes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rewrite(
+        &self,
+        from: &Tables,
+        kv: &mut impl KvStore,
+        contract: &Address,
+        table: &[u8],
+        id: u64,
+        old_row: &[u8],
+        new_row: &[u8],
+    ) -> Result<Rewrite, TableError> {
+        let old_idx = from.extract(contract, table, old_row)?;
+        let new_idx = self.extract(contract, table, new_row)?;
+        for (i, d) in self.defs(contract, table).iter().enumerate() {
+            let Some((_, Some(v))) = new_idx.get(i) else {
+                continue;
+            };
+            if !d.unique {
+                continue;
+            }
+            let same = old_idx
+                .iter()
+                .find(|(n, _)| *n == d.name)
+                .is_some_and(|(_, o)| o.as_ref() == Some(v));
+            if same {
+                continue;
+            }
+            let mut prefix = layout::index_prefix(contract, table, &d.name);
+            v.encode_into(&mut prefix);
+            let Some(end) = layout::prefix_successor(&prefix) else {
+                continue;
+            };
+            let found = kv.scan(&prefix, Some(&end), false, 2)?;
+            if found.iter().any(|(k, _)| {
+                k.len() == prefix.len() + 8 && layout::id_from_key(k).is_some_and(|o| o < id)
+            }) {
+                return Err(TableError::Duplicate {
+                    index: d.name.clone(),
+                });
+            }
+        }
+        let mut batch = WriteBatch::new();
+        let mut work = Rewrite::default();
+        for (name, o) in &old_idx {
+            let kept = new_idx.iter().find(|(n, _)| n == name);
+            if kept.is_some_and(|(_, n)| n == o) {
+                continue;
+            }
+            if let Some(o) = o {
+                batch.delete(layout::index_key(contract, table, name, o, id));
+                work.deleted += 1;
+            }
+        }
+        for (name, n) in &new_idx {
+            let had = old_idx.iter().find(|(o, _)| o == name);
+            if had.is_some_and(|(_, o)| o == n) {
+                continue;
+            }
+            if let Some(n) = n {
+                batch.put(layout::index_key(contract, table, name, n, id), Vec::new());
+                work.put += 1;
+            }
+        }
+        if old_row != new_row {
+            batch.put(layout::row_key(contract, table, id), new_row.to_vec());
+        }
+        kv.commit(batch)?;
+        Ok(work)
     }
 
     /// Index definitions of a table (names, in registration order).

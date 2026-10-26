@@ -14,6 +14,8 @@ path = "src/main.rs"
 btb-vm = { path = "../btb-vm" }
 btb-runtime = { path = "../btb-runtime" }
 btb-codec = { path = "../btb-codec" }
+btb-chain = { path = "../btb-chain" }
+btb-storage = { path = "../btb-storage" }
 sha2 = "0.11.1"
 
 [features]

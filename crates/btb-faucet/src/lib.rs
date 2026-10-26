@@ -403,6 +403,7 @@ impl Faucet {
             let tx = Transaction::sign(
                 TxBody {
                     relayer: None,
+                    session: None,
                     chain_id,
                     nonce,
                     kind: TxKind::Transfer { to, amount },

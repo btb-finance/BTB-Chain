@@ -53,6 +53,10 @@ pub const TAG_DEPOSIT: u8 = 9;
 pub const TAG_TOKEN: u8 = 0x0A;
 pub const TAG_TOKEN_BALANCE: u8 = 0x0B;
 pub const TAG_TOKEN_NONCE: u8 = 0x0C;
+/// `0D A len(table) table`: the table is being rewritten by a contract upgrade (a migration or
+/// an index backfill, see `btb-chain` `upgrade.rs`). While the key exists every table host call
+/// on that table by that contract faults. The value is the job summary, opaque here.
+pub const TAG_TABLE_LOCK: u8 = 0x0D;
 /// Oracle state written by `btb-chain` (`oracle.rs`) and read by the host calls: see
 /// `oracle_seed_key` and `oracle_price_key`.
 pub const TAG_ORACLE: u8 = 0x50;
@@ -189,6 +193,11 @@ pub fn storage_key(contract: &Address, key: &[u8]) -> Vec<u8> {
     k.extend_from_slice(contract);
     k.extend_from_slice(key);
     k
+}
+
+/// The lock key of a table under an upgrade job (see `TAG_TABLE_LOCK`).
+pub fn table_lock_key(contract: &Address, table: &[u8]) -> Vec<u8> {
+    with_table(TAG_TABLE_LOCK, contract, table)
 }
 
 /// Prefix shared by every row key of the table.

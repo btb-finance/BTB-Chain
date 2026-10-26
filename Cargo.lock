@@ -369,6 +369,7 @@ dependencies = [
  "btb-codec",
  "btb-consensus",
  "btb-dev",
+ "btb-host",
  "btb-node",
  "btb-runtime",
  "btb-storage",
@@ -393,8 +394,10 @@ dependencies = [
 name = "btb-dev"
 version = "0.1.0"
 dependencies = [
+ "btb-chain",
  "btb-codec",
  "btb-runtime",
+ "btb-storage",
  "btb-vm",
  "sha2 0.11.1",
 ]
@@ -533,10 +536,12 @@ dependencies = [
 name = "btb-tests"
 version = "0.1.0"
 dependencies = [
+ "btb-chain",
  "btb-codec",
  "btb-dev",
  "btb-runtime",
  "btb-sdk",
+ "btb-storage",
  "btb-vm",
  "btb-voucher",
  "ed25519-dalek 2.2.0",

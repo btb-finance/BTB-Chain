@@ -53,7 +53,23 @@ Builds, starts `btb-dev` (as a library) on `127.0.0.1:<port>` (default 8787, `0`
 - **Subscriptions re-run** against the new code and push a new event if their result changed.
 - **Errors do not crash it**: a failed build or an invalid ELF is printed and the previous build keeps running until the next successful save.
 
-Same limits as the dev server: one contract, no auth, development only. Never expose it. Schema changes that are incompatible with stored rows (a different `Note` layout) are not migrated: restart `btb dev` for a clean state.
+Same limits as the dev server: no auth, development only. Never expose it. On reload it also **evolves the schema**: new indexes are backfilled for existing rows, `#[btb::migration]` functions run over stored rows, and an incompatible change without a migration is refused (the old build keeps running) with a printed explanation; see [DEV_SERVER.md](DEV_SERVER.md#schema-evolution-on-reload).
+
+### Several contracts
+
+A project can hold several contracts. List their directories (relative to the project root, each one a contract project made by `btb init`) in the root `Cargo.toml`:
+
+```toml
+[workspace]
+exclude = ["router", "token"]
+
+[workspace.metadata.btb]
+contracts = ["router", "token"]       # [package.metadata.btb] works too
+```
+
+`btb build`, `btb dev` and `btb deploy` then act on every listed contract (the first is the primary one). `btb dev` builds all of them, serves them from one server and one dashboard, gives each the stable address `SHA256("btb.dev.contract.v1" || package name)` (printed at startup), and lets them call each other with `call_contract`. It watches each contract directory separately: saving `router/src/main.rs` rebuilds and reloads only the router, state of every contract is kept, subscriptions re-run. Reach a contract at `/c/<package name>/query/<fn>` (see [DEV_SERVER.md](DEV_SERVER.md#several-contracts)); pass the other contract's address as an argument to the router (`dev_address("token")` in Rust, or `GET /contracts`). `web/index.html` of the root (else of the first contract) is served at `/`. A project without `contracts` is the single-contract project `btb init` makes. `btb codegen` and `btb upgrade` still work on one contract at a time (run them in its directory). Test: `multi_contract_dev_cross_calls_and_independent_reloads` in `crates/btb-cli/tests/cli.rs`.
+
+Uploaded files ([DEV_SERVER.md](DEV_SERVER.md#file-storage)) are kept in `target/btb/files`.
 
 ## `btb deploy`
 
@@ -67,6 +83,15 @@ Without `--rpc` that is all: it prints the hash and where the bundle is.
 With `--rpc URL --key FILE` it also deploys the bundle to a node ([NODE.md](NODE.md#json-rpc--http)): the ELF and the manifest's name, crons and indexes become a `Deploy` transaction (binary `Manifest`, see [CHAIN.md](CHAIN.md#transactions)), signed with the key file. It reads `chain_id` from `btb_status` and the nonce from `btb_getBalance`, submits with `btb_sendTransaction`, polls `btb_getReceipt` until the transaction is in a block (a reverted deploy is an error) and prints `deployed: contract <address>` (the address is derived from the sender and the nonce). `--gas-limit N` is only checked against the deploy cost (a deploy always uses exactly its intrinsic gas). The contract account needs a balance for crons to pay their gas, so fund it with a transfer.
 
 `URL` is `host:port` or `http://host:port` (the node's RPC is plain HTTP on loopback; put a proxy in front for remote use).
+
+## `btb upgrade`
+
+```
+btb upgrade --rpc URL --key FILE <contract> [--budget-gas N] [--gas-limit N]
+btb upgrade --rpc URL <contract> --status
+```
+
+Builds the project (like `btb deploy`) and sends an `Upgrade` transaction that replaces the code of the deployed `<contract>` at the same address. The key must be the contract's **upgrade authority**: the deployer by default; `btb deploy --upgrade-authority ADDR` names another account and `btb deploy --immutable` makes the contract impossible to upgrade (an upgrade can also set the policy for later ones; `manifest.json` accepts `"upgrade": "deployer" | "none" | "<address>"`). The chain compares the old and new schema and refuses an incompatible change without a `#[btb::migration]` with the reason; compatible changes and migrations run on chain in the background, paid from `--budget-gas` (default 5,000,000 gas, prepaid at the gas price, the unused part refunded). `--status` prints the progress of the latest upgrade (`migrating`, `cleanup`, `done`, `rolling_back`, `rolled_back` with the error, and per table the rows done and the gas charged; RPC `btb_upgradeStatus`). Details: [CHAIN.md](CHAIN.md#contract-upgrades-and-migrations).
 
 ## `btb keygen <FILE>`
 

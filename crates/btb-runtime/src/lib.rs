@@ -4,6 +4,7 @@
 //! Deterministic: no floats, no system time, no hash-map iteration order in anything that
 //! reaches state.
 
+pub mod evolve;
 pub mod host;
 pub mod kv;
 pub mod layout;
@@ -18,7 +19,7 @@ pub mod subscribe;
 pub mod tables;
 pub mod twap;
 
-pub use host::{Callee, Fault, Resolver, RuntimeHost};
+pub use host::{Callee, Fault, FileService, Resolver, RuntimeHost};
 pub use kv::{KvError, KvStore, MemKv, Overlay, WriteBatch};
 pub use layout::IndexValue;
 pub use occ::{execute_with_retry, Committed, Occ, OccError, Txn};
@@ -27,4 +28,4 @@ pub use query::{
 };
 pub use readset::{KeyRange, ReadSet};
 pub use subscribe::{Change, ResultHash, SubId, Subscription, SubscriptionManager};
-pub use tables::{IndexDef, TableError, Tables};
+pub use tables::{IndexDef, Rewrite, TableError, Tables};

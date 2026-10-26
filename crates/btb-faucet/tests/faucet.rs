@@ -525,6 +525,7 @@ fn nonce_conflicts_with_other_users_of_the_key_are_retried() {
     let tx = Transaction::sign(
         TxBody {
             relayer: None,
+            session: None,
             chain_id: CHAIN_ID,
             nonce,
             kind: TxKind::Transfer {

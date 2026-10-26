@@ -45,3 +45,4 @@ examples/launcher/launcher.elf
 examples/nft/nft.elf
 examples/oracle/oracle.elf
 examples/caller/caller.elf
+examples/files/files.elf

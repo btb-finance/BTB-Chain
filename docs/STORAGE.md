@@ -94,6 +94,27 @@ Pieces are files `<dir>/<file hex>/<index>.piece`, written atomically.
 
 `btb fetch <root> --rpc URL [--out FILE]` asks the chain for the holders, downloads pieces until it has `k` that verify against the root (dead or lying nodes are skipped), decodes, encodes the result again and checks that it reproduces the root. It needs no key.
 
+## Files from contracts
+
+A contract can reference files and pay for their storage without touching bytes (the Convex file-storage model). Host calls `file_info` (70) and `file_pin` (71), the Rust wrappers `btb_sdk::files`, the gas and the byte layouts are in [LANGUAGE.md](LANGUAGE.md#files); the example is `examples/files`.
+
+```
+client                  hosting node / btb dev        chain                       storage nodes
+  | POST /upload (bytes) ->| encode, keep bytes        |                              |
+  |<- {root,size,k,m} -----|                           |                              |
+  | mutation(root,size,k,m) ---------------------------> file_pin: escrow from the     |
+  |                        |                           | contract's balance, assign   |
+  | POST /upload/<root>/push ->| pieces ------------------------------------------->  |
+  | GET /file/<root> ----->| any k pieces, verified    |                              |
+```
+
+- **`file_info(root) -> (size, status, expiry)`** reads the file record (tag `0x42`) and, for a file whose last piece retired, a small **ended-file record** (tag `0x48`: size, created, periods, deleted when the root is stored again), so `expired` is told apart from `unknown`. `expiry = created + periods * epoch_blocks`, the height by which every piece has run its last round. It is a state read (400 gas), tracked in the read set, so a subscription that uses it updates when the file is stored.
+- **Who pays.** Either the client sends `StoreFile` (`btb store`, which pays the escrow from its account) or the contract calls **`file_pin`**, which runs exactly the `Store` rules (`apply` with the contract as owner): the escrow `(k + m) * periods * pay` is taken from the contract's balance, the pieces are assigned, and when the file ends the unspent escrow goes back **to the contract**. A pin that fails answers a status and changes nothing (balance too low, not enough nodes, bad shape, already stored); the supply invariant holds as for any `Store`. `file_pin` needs `size`, `k` and `m` because the root cannot be inverted. Re-storing an expired root is allowed.
+- **Uploads are off chain.** `btb-host --upload-dir DIR` turns on the upload gateway: `POST /upload[?k=&m=]` encodes the body (up to 64 MiB), keeps it and answers `{root, size, k, m, stored, url}`; `POST /upload/<root>/push` sends the pieces to the assigned nodes once the chain knows the file (409 before), deleting its copy when all arrive. The gateway never spends: someone else pays (client `Store` or contract pin). `GET /file/<root>` serves the verified file. The `@btb/client` helpers are `uploadFile`, `finishUpload` and `fileUrl` ([TS_SDK.md](TS_SDK.md#files)).
+- **`btb dev`** emulates all of it with files on disk and the same API ([DEV_SERVER.md](DEV_SERVER.md#file-storage)), with the same roots.
+
+Tests: `crates/btb-chain/tests/files.rs` (unknown root, client-paid store visible to the contract, contract-funded pin and escrow accounting under the supply invariant, failures as statuses, no nodes, expiry and re-store), `crates/btb-tests/tests/dev_multi.rs` and `sdk-ts/test/files.test.ts` (upload, attach, `file_info`, fetch by URL on `btb dev`), `crates/btb-cli/tests/files_e2e.rs` (4 validators, 6 storage-node daemons, a hosting node with the gateway: upload, contract pin, push, serve verified).
+
 ## RPC views
 
 `btb_storageConfig`, `btb_storageNodes`, `btb_storageFile [root]` (file, escrow, pieces with holder, endpoint, state, open challenge, proven and missed counts), `btb_storageFiles`, `btb_storageDuties [address]`. Amounts are decimal strings.

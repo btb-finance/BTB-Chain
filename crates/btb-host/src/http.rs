@@ -20,6 +20,7 @@
 //! | `GET /status`, `GET /health` | node and sync status |
 //! | `GET /relay` | the relayer address to sign into a transaction (404 if this node does not relay) |
 //! | `POST /tx` (hex or `{"tx": hex}`) | relay a client-signed transaction naming this node as relayer to the validators: `{id, relayer}` |
+//! | `GET /account/<address hex>` | `{nonce, balance, height, chain_id}` of the account at this node's head; `height` is the next block's (what `BtbAuth` needs to build a session grant) |
 //! | `GET /tx/<id>` | the receipt, or `null` until this node has executed the block |
 //!
 //! Mutations are not run here: a signed transaction goes to a validator, either directly
@@ -49,7 +50,13 @@ const ROOT_SUFFIX: &str = ".root";
 const MAX_BODY: usize = 64 * 1024;
 const MAX_LINE: u64 = 8192;
 
+/// Largest upload body the upload gateway reads.
+pub(crate) const MAX_UPLOAD: usize = 64 << 20;
+
 pub(crate) struct Ctx {
+    /// Where the upload gateway keeps files until they are pushed to storage nodes; `None`
+    /// turns the gateway off (`POST /upload` answers 501).
+    pub upload_dir: Option<std::path::PathBuf>,
     pub node: Arc<Node>,
     pub shared: Arc<Shared>,
     pub relay: Option<crate::relay::RelayConfig>,
@@ -82,7 +89,7 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&o).into_owned()
 }
 
-fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
+fn read_request(conn: &mut TcpStream, upload: bool) -> Result<Request, String> {
     conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut r = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
@@ -114,7 +121,7 @@ fn read_request(conn: &mut TcpStream) -> Result<Request, String> {
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if len > MAX_BODY {
+    if len > MAX_BODY && !(upload && target.starts_with("/upload") && len <= MAX_UPLOAD) {
         return Err("body too large".into());
     }
     let mut body = vec![0u8; len];
@@ -194,7 +201,7 @@ pub(crate) fn handle(ctx: &Ctx, mut conn: TcpStream) {
     let r = if n >= ctx.shared.max_connections {
         err(&mut conn, "503 Service Unavailable", "too many connections")
     } else {
-        match read_request(&mut conn) {
+        match read_request(&mut conn, ctx.upload_dir.is_some()) {
             Ok(req) => route(ctx, &mut conn, &req),
             Err(e) => err(&mut conn, "400 Bad Request", &e),
         }
@@ -231,7 +238,10 @@ fn route(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<()> 
         ("GET", ["relay"]) => relay_info(ctx, conn),
         ("POST", ["tx"]) => relay_tx(ctx, conn, req),
         ("GET", ["tx", id]) => receipt(ctx, conn, id),
+        ("GET", ["account", a]) => account(ctx, conn, a),
         ("GET", ["file", root]) => storage_file_route(ctx, conn, req, root),
+        ("POST", ["upload"]) => upload(ctx, conn, req),
+        ("POST", ["upload", root, "push"]) => upload_push(ctx, conn, root),
         ("GET", ["site", c]) => site_file(ctx, conn, req, c, ""),
         ("GET", ["site", c, rest @ ..]) => site_file(ctx, conn, req, c, &rest.join("/")),
         ("GET", ["api", "site", c]) => site_list(ctx, conn, c),
@@ -285,6 +295,26 @@ fn relay_tx(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<(
 fn receipt(ctx: &Ctx, conn: &mut TcpStream, id: &str) -> std::io::Result<()> {
     match ctx.node.call("btb_getReceipt", json!([id])) {
         Ok(v) => json_response(conn, "200 OK", &v),
+        Err(e) => err(conn, "400 Bad Request", &e.message),
+    }
+}
+
+/// `GET /account/<hex>`: nonce, balance and the next block height, for building transactions.
+fn account(ctx: &Ctx, conn: &mut TcpStream, a: &str) -> std::io::Result<()> {
+    let Ok(addr) = hex::decode32(a) else {
+        return err(conn, "400 Bad Request", "account must be 64 hex characters");
+    };
+    match ctx.node.call("btb_getBalance", json!([hex::encode(&addr)])) {
+        Ok(v) => json_response(
+            conn,
+            "200 OK",
+            &json!({
+                "nonce": v["nonce"],
+                "balance": v["balance"],
+                "height": ctx.shared.head.load(Ordering::SeqCst) + 1,
+                "chain_id": ctx.chain_id,
+            }),
+        ),
         Err(e) => err(conn, "400 Bad Request", &e.message),
     }
 }
@@ -560,6 +590,111 @@ impl btb_storage::chain::Chain for NodeChain<'_> {
     }
     fn address(&self) -> [u8; 32] {
         [0; 32]
+    }
+}
+
+/// `POST /upload[?k=4&m=2]` (raw body): the upload gateway. Encodes the file, keeps the bytes
+/// until the file is stored on chain, and answers `{root, size, k, m, stored, url}`. Paying is
+/// the client's (a `Store` transaction) or a contract's (`file_pin`); this node never spends.
+fn upload(ctx: &Ctx, conn: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    let Some(dir) = &ctx.upload_dir else {
+        return err(
+            conn,
+            "501 Not Implemented",
+            "this hosting node has no upload gateway (--upload-dir)",
+        );
+    };
+    if req.body.is_empty() {
+        return err(conn, "400 Bad Request", "cannot store an empty file");
+    }
+    let num = |k: &str, d: u8| req.query.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (k, m) = (num("k", 4), num("m", 2));
+    let enc = match btb_storage::erasure::encode(&req.body, k, m) {
+        Ok(e) => e,
+        Err(e) => return err(conn, "400 Bad Request", &e.to_string()),
+    };
+    let tag = hex::encode(&enc.id);
+    let write = std::fs::create_dir_all(dir)
+        .and_then(|_| std::fs::write(dir.join(format!("{tag}.tmp")), &req.body))
+        .and_then(|_| {
+            std::fs::rename(
+                dir.join(format!("{tag}.tmp")),
+                dir.join(format!("{tag}.bin")),
+            )
+        })
+        .and_then(|_| std::fs::write(dir.join(format!("{tag}.meta")), format!("{k} {m}")));
+    if let Err(e) = write {
+        return err(
+            conn,
+            "500 Internal Server Error",
+            &format!("keep upload: {e}"),
+        );
+    }
+    let stored = btb_storage::chain::file(&NodeChain(&ctx.node), &enc.id)
+        .ok()
+        .flatten()
+        .is_some();
+    json_response(
+        conn,
+        "200 OK",
+        &json!({"root": tag, "size": enc.size, "k": k, "m": m, "stored": stored,
+                "url": format!("/file/{tag}")}),
+    )
+}
+
+/// `POST /upload/<root>/push`: once the file is stored on chain, send its pieces to the storage
+/// nodes the chain assigned. 409 until the chain knows the file.
+fn upload_push(ctx: &Ctx, conn: &mut TcpStream, root: &str) -> std::io::Result<()> {
+    let Some(dir) = &ctx.upload_dir else {
+        return err(
+            conn,
+            "501 Not Implemented",
+            "no upload gateway (--upload-dir)",
+        );
+    };
+    let Ok(id) = hex::decode32(root) else {
+        return err(conn, "400 Bad Request", "root must be 64 hex characters");
+    };
+    let tag = hex::encode(&id);
+    let (Ok(data), Ok(meta)) = (
+        std::fs::read(dir.join(format!("{tag}.bin"))),
+        std::fs::read_to_string(dir.join(format!("{tag}.meta"))),
+    ) else {
+        return err(conn, "404 Not Found", "no such upload");
+    };
+    let mut km = meta.split_whitespace().filter_map(|x| x.parse::<u8>().ok());
+    let (Some(k), Some(m)) = (km.next(), km.next()) else {
+        return err(conn, "500 Internal Server Error", "corrupt upload record");
+    };
+    let enc = match btb_storage::erasure::encode(&data, k, m) {
+        Ok(e) if e.id == id => e,
+        _ => {
+            return err(
+                conn,
+                "500 Internal Server Error",
+                "stored upload does not match its root",
+            )
+        }
+    };
+    match btb_storage::client::push(&NodeChain(&ctx.node), &enc) {
+        Ok(st) => {
+            let failed: Vec<Value> = st
+                .failed
+                .iter()
+                .map(|(i, e)| json!({"index": i, "error": e}))
+                .collect();
+            if failed.is_empty() {
+                let _ = std::fs::remove_file(dir.join(format!("{tag}.bin")));
+                let _ = std::fs::remove_file(dir.join(format!("{tag}.meta")));
+            }
+            json_response(
+                conn,
+                "200 OK",
+                &json!({"pushed": st.assignments.len() - failed.len(), "failed": failed}),
+            )
+        }
+        Err(e) if e.contains("store it first") => err(conn, "409 Conflict", &e),
+        Err(e) => err(conn, "502 Bad Gateway", &e),
     }
 }
 

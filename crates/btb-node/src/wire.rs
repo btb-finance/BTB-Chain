@@ -277,6 +277,7 @@ mod tests {
         Transaction::sign(
             TxBody {
                 relayer: None,
+                session: None,
                 chain_id,
                 nonce,
                 kind: TxKind::Transfer {

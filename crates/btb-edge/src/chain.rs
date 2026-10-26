@@ -121,6 +121,7 @@ impl Submitter for RpcSubmitter {
         let tx = Transaction::sign(
             TxBody {
                 relayer: None,
+                session: None,
                 chain_id,
                 nonce,
                 kind: TxKind::Channel(ChannelOp::Close { voucher: *voucher }),

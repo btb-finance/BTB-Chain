@@ -20,6 +20,7 @@ extern crate self as btb_sdk;
 
 pub mod call;
 pub mod error;
+pub mod files;
 pub mod host;
 pub mod oracle;
 #[cfg(all(feature = "runtime", target_os = "none"))]
@@ -66,6 +67,37 @@ pub mod __private {
 
     pub fn return_value<T: btb_codec::Encode>(v: &T) {
         crate::host::return_data(&v.encode());
+    }
+}
+
+/// Who is calling: the account, and whether it signed through a session key.
+pub mod auth {
+    use btb_codec::Address;
+
+    /// The account that called this function (same as `host::caller()`).
+    pub fn caller() -> Address {
+        crate::host::caller()
+    }
+
+    /// Whether the call came from a session key of `caller()` instead of the account's own key.
+    /// A session is scoped by the account's grant (contract, functions, expiry, fee budget), so
+    /// most functions need not care; check it for actions that deserve the account's own
+    /// signature (the chain already refuses transfers, staking and new sessions from sessions).
+    /// Always false in a nested contract-to-contract call. Costs 5 gas.
+    pub fn via_session() -> bool {
+        crate::host::caller_via_session()
+    }
+
+    /// `(account, via_session)`.
+    pub fn who() -> (Address, bool) {
+        (caller(), via_session())
+    }
+
+    /// Abort unless the account signed this call itself, not through a session key.
+    pub fn require_direct() {
+        if via_session() {
+            crate::host::abort("this action needs the account's own signature");
+        }
     }
 }
 

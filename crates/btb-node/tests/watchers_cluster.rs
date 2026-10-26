@@ -51,6 +51,7 @@ impl Wallet {
         let tx = BtbTx::sign(
             TxBody {
                 relayer: None,
+                session: None,
                 chain_id: CHAIN_ID,
                 nonce: self.nonce,
                 kind,

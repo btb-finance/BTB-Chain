@@ -132,6 +132,46 @@ Todo::by_owner(addr).filter(|(_, t)| !t.done) // Iterator::filter on an index lo
 
   A lookup is an `Iterator` that fetches 64 ids per host call (`table_index_scan`) and loads each row with `table_get`; `.limit(n)` caps the total and `.cursor()` / `Page::next` is the opaque cursor to pass to `.after(..)` for the next page (return it from a query as `Vec<u8>`). String and byte fields take `&str` / `&[u8]` in `by_<field>`, and `String` / `Vec<u8>` ranges. A query that reads an index range is re-run by subscriptions exactly when an entry in that range changes.
 
+## Schema evolution: versions and migrations
+
+A deployed contract can be replaced at the same address (`btb upgrade`, [CHAIN.md](CHAIN.md#contract-upgrades-and-migrations)); the chain compares the table schemas of the old and the new ELF.
+
+**Compatible, no code needed.** A new table; a new `#[index]` or `#[primary]` (existing rows are **backfilled**); a removed `#[index]`; and **`Option` fields appended at the end** of a row. Old rows are shorter than the new struct, so the generated `Decode` reads trailing `Option` fields as `None` when the row ends early (`note: Option<String>` on an old `Todo` is `None`), and index extractors do the same.
+
+```rust
+#[btb::table]
+pub struct Todo {
+    #[index] pub owner: Address,
+    pub done: bool,
+    pub text: String,
+    pub note: Option<String>,        // appended: old rows read None
+}
+```
+
+**Incompatible: declare a migration.** Removing, renaming, reordering or retyping a field, appending a non-`Option` field, or removing or changing the `#[primary]` is refused unless you keep the old row type, bump the table `version` (default 1) and write a pure function from old row to new row:
+
+```rust
+#[btb::table(version = 1, of = "Todo")]   // the shape that is stored today
+pub struct TodoV1 { pub owner: Address, pub done: bool, pub text: String }
+
+#[btb::table(version = 2)]
+pub struct Todo { #[index] pub owner: Address, #[index] pub status: u8, pub text: String }
+
+#[btb::migration(from = 1)]
+fn todo_v1_to_v2(row: TodoV1) -> Todo {
+    Todo { owner: row.owner, status: row.done as u8, text: row.text }
+}
+```
+
+- `#[btb::table(version = N, of = "Table")]` declares an old row shape: codec only, no table, no lookups. The chain checks that it matches the stored schema field by field; a wrong one refuses the upgrade before anything runs.
+- `#[btb::migration(from = N)]` takes exactly the old row and returns the new row type (its name is the table). It exports `btb_transform_migrate_<table lowercased>_<N>` and runs in a state-less VM, like a `#[btb::transform]`: no storage, tables, clock or randomness, so it is deterministic; an `abort` fails the migration. Its output must be exactly one well-formed row of the new table.
+- A migration is one step: from the stored version straight to the current one. To skip versions, keep one old shape per version you still have data for (`version` must go up).
+- A migration declared next to a compatible change, with a higher `version`, also runs (to normalize data).
+- Tables cannot be removed. Functions can change freely.
+- A migration that changes the values of a unique (`#[primary]`) index is checked row by row in id order against the rows already converted, so it fails (and rolls back) on a real duplicate.
+
+How it runs on a chain (background batches, table lock, gas budget, rollback): [CHAIN.md](CHAIN.md#contract-upgrades-and-migrations). On `btb dev` it runs at once on reload ([DEV_SERVER.md](DEV_SERVER.md#schema-evolution-on-reload)).
+
 ## Example: a DEX in Rust
 
 ```rust
@@ -259,7 +299,9 @@ Contracts reach the chain through `ecall`: call number in a7, arguments in a0..a
 | 43 | `price_twap(pair_id, window, out_ptr) -> 0 ok \| u64::MAX \| 1 \| 2` (writes 32 bytes: `twap: u128 LE`, `window: u32 LE`, `decimals: u8`, 11 zero bytes; time-weighted average over the last `window` blocks, 1 to 10,000; read-only; allowed everywhere; `u64::MAX` unknown pair or no price, `1` = `PRICE_PAUSED`, `2` = `PRICE_BAD_WINDOW`) | 500 in a query (not billed); 20,500 in a mutation or cron (500 plus a 20,000 per-read fee) |
 | 50 | `call_contract(req_ptr, req_len, out_ptr, out_cap) -> output_len \| CALL_*` (run a `query` or `mutation` of another contract, see [Calling other contracts](#calling-other-contracts); a mutation from a query traps `WriteInQuery`; a randomness-marked callee or an action callback traps; errors are statuses `>= u64::MAX - 15` that revert only the callee) | 3,000 + 2/request byte, then the callee's exact gas, then 1/byte of output copied |
 
-Oracle calls use the range 40 to 49 and cross-contract calls the range 50 to 59, so they never collide with other additions. Queries run in read-only mode: calls 2, 3, 7, 10, 12, 13, 16, 17, 21 and 22 trap with `WriteInQuery`, call 50 traps with `WriteInQuery` when it names a mutation, and call 40 traps with `RandomnessForbidden`. Bad guest pointers trap; unknown numbers trap. Cross-chain calls are added later with their own numbers and gas costs. Call 42 (`report_request`) also traps `WriteInQuery` in a query, in an action's first phase and in a transform.
+| 60 | `caller_via_session() -> 0 \| 1` (1 if `caller()` is an account acting through a session key, see [CHAIN.md](CHAIN.md#session-keys); always 0 in a nested call and in crons) | 5 |
+
+File-storage calls 70 and 71 are described in [Files](#files). Oracle calls use the range 40 to 49 and cross-contract calls the range 50 to 59, so they never collide with other additions. Queries run in read-only mode: calls 2, 3, 7, 10, 12, 13, 16, 17, 21 and 22 trap with `WriteInQuery`, call 50 traps with `WriteInQuery` when it names a mutation, and call 40 traps with `RandomnessForbidden`. Bad guest pointers trap; unknown numbers trap. Cross-chain calls are added later with their own numbers and gas costs. Call 42 (`report_request`) also traps `WriteInQuery` in a query, in an action's first phase and in a transform.
 
 **Oracles (calls 40 to 43).** `random_bytes` derives from the block's beacon: `SHA256("btb.rand.out.v1" || SHA256("btb.rand.tx.v1" || beacon_seed || tx_id) || call_index:u64be || block:u32be)`, so replicas agree, transactions differ and every call in a transaction differs. `btb dev` has no beacon and answers marked functions from a fixed public seed (not random). `price` returns the last published stake-weighted median of the validators' signed observations (`NOT_FOUND` before the first one, `PRICE_PAUSED` while the circuit breaker is open); `price_twap` averages it over a window of blocks. In Rust: `price(pair) -> Option<Price>`, `price_checked(pair) -> Result<Price, PriceError>` (`NotFound | Paused`) and `price_twap(pair, window) -> Result<Twap, PriceError>` (adds `BadWindow`); in C `btb_price`/`btb_price_twap` with `BTB_PRICE_PAUSED` and `BTB_PRICE_BAD_WINDOW`. Design, safety argument and fees: [ORACLES.md](ORACLES.md).
 
@@ -268,6 +310,38 @@ Oracle calls use the range 40 to 49 and cross-contract calls the range 50 to 59,
 **Declaring indexes (temporary).** Contracts cannot declare indexes yet. For now the host registers them per table (`btb_runtime::Tables::register`; `btb-dev` takes `--index Table:index:addr@offset`). A table with no registered index returns no results. A declaration in the contract itself (and in its deploy manifest) replaces this later; see [DEV_SERVER.md](DEV_SERVER.md).
 
 **User tokens (calls 16 to 23).** `btb_sdk::token::Token` wraps them: `Token::create(name, symbol, decimals, initial_supply, mint_authority)`, `.transfer(&to, amount)`, `.balance_of(&holder)`, `.info()`, `.holders(cursor, limit)`, `.mint(&to, amount)`, `.burn(amount)`; `contract_address()` gives a contract its own address (for naming itself as mint authority). They are separate from native BTB (calls 6 and 7): creating a token never mints BTB. `status` is `0` ok, `1` invalid name/symbol/decimals, `2` insufficient balance, `3` unknown token, `4` not the mint authority, `5` overflow, `6` unsupported by the host. Semantic failures return a status and change nothing; a malformed request traps. Balances belong to addresses, and as with native `token_transfer`, a contract moves tokens only from its own balance. Holders are paged by **address** (ascending, non-zero balances only; the last address returned is the cursor), which stays stable while balances change; rank by balance in a contract-owned table if needed. In C see the `btb_token_*` wrappers in `include/btb.h`. Details: [TOKENOMICS.md](TOKENOMICS.md#user-tokens).
+
+### Who is calling: `btb_sdk::auth`
+
+`auth::caller()` is `caller()`; `auth::via_session()` says whether the account signed through a session key (scoped, expiring, budgeted grant); `auth::who()` returns both; `auth::require_direct()` aborts unless the account signed itself. Most functions need not care: the chain already limits a session to the granted contract, functions, lifetime and fee budget, and refuses transfers, staking and new sessions from it. Use `require_direct` for what deserves a deliberate signature (changing an owner, withdrawing). In C: `btb_caller_via_session()`.
+
+### Files
+
+Large files never go on every validator ([STORAGE.md](STORAGE.md)); a contract holds only a file's 32-byte **root** and asks the host about it. Two host calls (range 70 to 79), wrapped by `btb_sdk::files`:
+
+| # | Call | Gas |
+| --- | --- | --- |
+| 70 | `file_info(root_ptr, out_ptr) -> 0 \| NOT_FOUND`: writes 24 bytes, `size: u64 LE`, `status: u8` (0 unknown, 1 stored, 2 expired) + 7 zero bytes, `expiry: u64 LE` (block height by which the paid periods have all run). Allowed in queries, mutations and crons. An unknown root is status 0, not an error; `NOT_FOUND` only on a host with no file storage | 400 |
+| 71 | `file_pin(req_ptr, req_len) -> FILE_PIN_*`: mutations and crons only. Pays the escrow of a `Store` from the **contract's own balance**. Request, 46 bytes: `root[32], size: u64 LE, k: u8, m: u8, periods: u32 LE`. Statuses: 0 ok, 1 already stored (nothing paid), 2 balance too low, 3 no storage nodes, 4 bad shape, 5 unsupported | 30,000 (also when refused) |
+
+```rust
+use btb_sdk::files;
+
+#[btb::mutation]
+pub fn attach(name: String, root: Address) -> u64 {
+    let f = files::require_stored(&root.0);          // aborts unless stored and paid
+    /* save name -> root */
+    f.size
+}
+
+#[btb::mutation]
+pub fn attach_and_pay(name: String, root: Address, size: u64, k: u8, m: u8) -> Result<()> {
+    files::ensure_pinned(&root.0, size, k, m, 12)?;  // contract-funded; "already stored" counts as done
+    Ok(())
+}
+```
+
+`files::info(&root)` returns `FileInfo { size, status, expiry }`, `is_stored`, `require_stored`, `pin(root, size, k, m, periods) -> Result<(), PinError>`; in C `btb_file_info` / `btb_file_pin`. The root commits to the size and the coding shape but the chain cannot recover them from it, so the uploader's answer (`size`, `k`, `m`) is passed along to `file_pin`. The flow, from the client: upload the bytes off chain (`uploadFile`, [TS_SDK.md](TS_SDK.md#files)), get the root, call a mutation with it; the mutation either checks the file is stored (the client sent `Store`, `btb store`) or pins it itself. `file_info` reads the file record, so a query using it is re-run by a subscription when the file is stored or ends. `examples/files` is a complete contract; `btb dev` emulates the storage ([DEV_SERVER.md](DEV_SERVER.md#file-storage)).
 
 ### Calling other contracts
 
@@ -310,7 +384,7 @@ let bal: u128 = query::<_, u128>(token, "balance_of", &(me,), GAS_ALL)?;
 | `CALL_REENTRANT` (`- 6`) | the target is already on the call stack |
 | `CALL_OUTPUT_TOO_LARGE` (`- 7`) | the result did not fit `out_cap` (the callee is reverted: a mutation cannot be retried) |
 | `CALL_DEPOSIT` (`- 8`) | the callee's balance cannot pay the storage deposit of what it wrote |
-| `CALL_UNSUPPORTED` (`- 9`) | the host cannot run other contracts (`btb dev`, `MemHost`) |
+| `CALL_UNSUPPORTED` (`- 9`) | the host cannot run other contracts (a `MemHost` without `add_contract`) |
 
 The caller may carry on (its own earlier writes stay) or `abort`, which reverts everything. The Rust wrappers return `Err(CallError::...)`. The result buffer of `call`/`query` is `DEFAULT_OUTPUT_CAP` (2 KiB) bytes; use `call_with_cap`/`query_with_cap` for bigger results.
 
@@ -318,7 +392,7 @@ The caller may carry on (its own earlier writes stay) or `abort`, which reverts 
 
 **Storage deposits.** Each frame's growth is paid by the contract whose bytes grew: when a callee returns successfully its storage growth is locked from the callee's own balance (and shrinkage returns the deposit to it), exactly as for a top-level call. If the callee cannot pay, the call fails with `CALL_DEPOSIT` and is reverted. The caller is never charged for the callee's state. Fund contracts that others will call.
 
-**Not allowed / not done.** No calls from actions' transforms, no delegate-call (the callee never runs with the caller's storage), no value attached to a call (use a token transfer), no cross-chain calls. Hosts without a code resolver (`btb dev`, `MemHost`) answer `CALL_UNSUPPORTED`.
+**Not allowed / not done.** No calls from actions' transforms, no delegate-call (the callee never runs with the caller's storage), no value attached to a call (use a token transfer), no cross-chain calls. Hosts without a code resolver answer `CALL_UNSUPPORTED`; the chain and `btb dev` have one (a multi-contract project, [DEV_SERVER.md](DEV_SERVER.md#several-contracts)), and a test can give a `MemHost` one with `host.add_contract(address, Arc<Contract>)`: callees run in a fresh VM against their own storage (kept between calls), the shared balances and token ledger, with the chain's rules, and are undone unless they succeed.
 
 Argument and result bytes use the canonical encoding specified in [ENCODING.md](ENCODING.md).
 

@@ -43,6 +43,8 @@ pub fn cost(i: &Instr) -> u64 {
 
 /// `caller(out_ptr)`: flat, writes 32 bytes.
 pub const HOST_CALLER: u64 = 10;
+/// `caller_via_session()`: flat.
+pub const HOST_CALLER_VIA_SESSION: u64 = 5;
 /// `contract_address(out_ptr)`: flat, writes 32 bytes.
 pub const HOST_CONTRACT_ADDRESS: u64 = 10;
 /// `block_height()`: flat.
@@ -148,3 +150,13 @@ pub const REPORT_BYTE: u64 = 10;
 pub const HOST_CALL_CONTRACT: u64 = 3_000;
 pub const CALL_BYTE: u64 = 2;
 pub const CALL_RETURN_BYTE: u64 = 1;
+
+// ---- File storage ---------------------------------------------------------------------------
+
+/// `file_info(root_ptr, out_ptr)`: two state reads (the file record and its expiry marker). In a
+/// query it is free to the caller like every read there.
+pub const HOST_FILE_INFO: u64 = 400;
+/// `file_pin(req_ptr, req_len)`: the placement work of a `Store` transaction (`STORE_GAS` in
+/// `btb-chain`), charged first, also when the pin is refused. The escrow is paid from the
+/// contract's balance and is not gas.
+pub const HOST_FILE_PIN: u64 = 30_000;

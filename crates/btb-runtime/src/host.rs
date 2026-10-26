@@ -14,8 +14,8 @@ use crate::readset::ReadSet;
 use crate::tables::{TableError, Tables};
 use btb_vm::decode::Trap;
 use btb_vm::host::{
-    abi, Address, CallEnd, CallReply, CallRequest, Host, IndexBound, IndexKey, IndexScan,
-    IndexScanPage,
+    abi, Address, CallEnd, CallReply, CallRequest, FilePin, FileRecord, Host, IndexBound, IndexKey,
+    IndexScan, IndexScanPage,
 };
 use btb_vm::token::{TokenId, TokenInfo, TokenStore};
 use btb_vm::{CallError, Contract, FunctionKind};
@@ -38,6 +38,23 @@ pub trait Resolver {
     fn resolve(&self, kv: &dyn KvStore, addr: &Address) -> Result<Option<Callee>, KvError>;
 }
 
+/// File storage for `file_info` and `file_pin`: what the chain (or `btb dev`) knows about a file
+/// root, and how a contract pays to have one stored. `kv` is the running call's overlay, so a
+/// read lands in the read set (subscriptions on `file_info` work) and a pin is undone with the
+/// call.
+pub trait FileService {
+    fn info(&self, kv: &dyn KvStore, root: &[u8; 32], height: u64) -> Result<FileRecord, KvError>;
+    /// Store `pin.root` for `contract`, paying the escrow from its balance. Returns an
+    /// `abi::FILE_PIN_*` status; a refused pin must leave `kv` untouched.
+    fn pin(
+        &self,
+        kv: &mut dyn KvStore,
+        contract: &Address,
+        pin: &FilePin,
+        height: u64,
+    ) -> Result<u64, KvError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     Kv(KvError),
@@ -51,6 +68,8 @@ pub enum Fault {
     DepositOverflow,
     /// A stored user-token record did not decode.
     CorruptToken,
+    /// The table is locked by a contract upgrade (migration or index backfill in progress).
+    TableLocked(String),
 }
 
 fn index_value(k: &IndexKey) -> IndexValue {
@@ -77,6 +96,9 @@ pub struct RuntimeHost<'a, S: KvStore> {
     /// The contract being run (its storage, tables and token balance).
     pub contract: Address,
     pub caller: Address,
+    /// `caller` is an account acting through a session key (only the outermost frame of a
+    /// session-signed transaction; nested frames and crons see false).
+    pub via_session: bool,
     pub height: u64,
     pub read_only: bool,
     fault: Option<Fault>,
@@ -89,6 +111,7 @@ pub struct RuntimeHost<'a, S: KvStore> {
     /// Cross-contract calls: where to find code, the memory of a callee's VM, the contracts
     /// below the running frame (outermost first) and the tables of callees merged in.
     resolver: Option<&'a dyn Resolver>,
+    files: Option<&'a dyn FileService>,
     vm_memory: usize,
     ancestors: Vec<Address>,
     extra_tables: Option<Tables>,
@@ -110,6 +133,7 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             tables,
             contract,
             caller,
+            via_session: false,
             height,
             read_only: false,
             fault: None,
@@ -117,6 +141,7 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             random: None,
             reports: 0,
             resolver: None,
+            files: None,
             vm_memory: 1 << 20,
             ancestors: Vec::new(),
             extra_tables: None,
@@ -130,6 +155,12 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
     pub fn enable_calls(&mut self, resolver: &'a dyn Resolver, vm_memory: usize) {
         self.resolver = Some(resolver);
         self.vm_memory = vm_memory;
+    }
+
+    /// Let the running contract use `file_info` and `file_pin`. Without this `file_info` answers
+    /// `NOT_FOUND` and `file_pin` `FILE_PIN_UNSUPPORTED`.
+    pub fn enable_files(&mut self, files: &'a dyn FileService) {
+        self.files = Some(files);
     }
 
     /// Development hosts (`btb dev`) have no beacon: derive from a fixed, public `seed`
@@ -239,6 +270,24 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
         }
         self.settled.insert(c, net);
         Ok(())
+    }
+
+    /// The call's overlay, for the chain's upgrade jobs: they rewrite rows directly and then
+    /// call `finish` so that the storage deposit of the change is settled like any other.
+    pub fn overlay_mut(&mut self) -> &mut Overlay<'a, S> {
+        &mut self.kv
+    }
+
+    /// Is `table` of the running contract locked by an upgrade job? Faults the call if so.
+    fn table_locked(&mut self, table: &[u8]) -> bool {
+        let r = self.kv.get(&layout::table_lock_key(&self.contract, table));
+        let locked = self.kv(r).is_some();
+        if locked {
+            self.note(Fault::TableLocked(
+                String::from_utf8_lossy(table).into_owned(),
+            ));
+        }
+        locked
     }
 
     /// The read set so far.
@@ -429,6 +478,30 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         }
     }
 
+    fn file_info(&mut self, root: &[u8; 32]) -> Option<FileRecord> {
+        let files = self.files?;
+        match files.info(&self.kv, root, self.height) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                self.note(Fault::Kv(e));
+                Some(FileRecord::default())
+            }
+        }
+    }
+
+    fn file_pin(&mut self, pin: &FilePin) -> u64 {
+        let Some(files) = self.files else {
+            return abi::FILE_PIN_UNSUPPORTED;
+        };
+        match files.pin(&mut self.kv, &self.contract, pin, self.height) {
+            Ok(r) => r,
+            Err(e) => {
+                self.note(Fault::Kv(e));
+                abi::FILE_PIN_INVALID
+            }
+        }
+    }
+
     fn call_contract(&mut self, req: &CallRequest<'_>) -> CallReply {
         let refused = CallReply::refused;
         let Some(resolver) = self.resolver else {
@@ -479,6 +552,7 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         let outer_fault = self.fault.take();
         let (outer_contract, outer_caller, outer_read_only) =
             (self.contract, self.caller, self.read_only);
+        let outer_session = std::mem::take(&mut self.via_session);
         self.ancestors.push(outer_contract);
         self.caller = outer_contract;
         self.contract = req.target;
@@ -494,6 +568,7 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         self.ancestors.pop();
         self.contract = outer_contract;
         self.caller = outer_caller;
+        self.via_session = outer_session;
         self.read_only = outer_read_only;
         let frame_fault = self.fault.take();
         self.fault = outer_fault;
@@ -571,6 +646,9 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
     fn caller(&self) -> Address {
         self.caller
     }
+    fn caller_via_session(&self) -> bool {
+        self.via_session
+    }
     fn contract_address(&self) -> Address {
         self.contract
     }
@@ -602,28 +680,43 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         true
     }
     fn table_insert(&mut self, table: &[u8], row: &[u8]) -> u64 {
+        if self.table_locked(table) {
+            return 0;
+        }
         let t = self.extra_tables.as_ref().unwrap_or(self.tables);
         let c = self.contract;
         let r = t.insert(&mut self.kv, &c, table, row);
         self.tbl(r)
     }
     fn table_get(&mut self, table: &[u8], id: u64) -> Option<Vec<u8>> {
+        if self.table_locked(table) {
+            return None;
+        }
         let r = self.tables.get(&self.kv, &self.contract, table, id);
         self.tbl(r)
     }
     fn table_update(&mut self, table: &[u8], id: u64, row: &[u8]) -> bool {
+        if self.table_locked(table) {
+            return false;
+        }
         let t = self.extra_tables.as_ref().unwrap_or(self.tables);
         let c = self.contract;
         let r = t.update(&mut self.kv, &c, table, id, row);
         self.tbl(r)
     }
     fn table_delete(&mut self, table: &[u8], id: u64) -> bool {
+        if self.table_locked(table) {
+            return false;
+        }
         let t = self.extra_tables.as_ref().unwrap_or(self.tables);
         let c = self.contract;
         let r = t.delete(&mut self.kv, &c, table, id);
         self.tbl(r)
     }
     fn table_scan(&mut self, table: &[u8], start_id: u64, max: u64) -> Vec<u64> {
+        if self.table_locked(table) {
+            return Vec::new();
+        }
         let prefix = layout::row_prefix(&self.contract, table);
         let end = layout::prefix_successor(&prefix);
         let mut from = prefix;
@@ -636,6 +729,9 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
             .collect()
     }
     fn table_index_scan(&mut self, scan: &IndexScan) -> IndexScanPage {
+        if self.table_locked(&scan.table) {
+            return IndexScanPage::default();
+        }
         let (lo, hi) = (bound(&scan.lo), bound(&scan.hi));
         let opts = QueryOptions {
             order: if scan.descending {

@@ -23,6 +23,7 @@ fn table() -> TableSchema {
         ],
         indexes: vec!["owner".into(), "n".into(), "name".into()],
         primary: Some("name".into()),
+        version: 1,
     }
 }
 
@@ -30,6 +31,7 @@ fn schema() -> Schema {
     Schema {
         tables: vec![table()],
         functions: vec![],
+        ..Schema::default()
     }
 }
 

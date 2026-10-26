@@ -1121,6 +1121,7 @@ impl<S: KvStore + 'static> Driver<S> {
             let tx = Transaction::sign(
                 TxBody {
                     relayer: None,
+                    session: None,
                     chain_id: self.chain_id,
                     nonce,
                     kind: TxKind::Dkg(op),
@@ -1624,6 +1625,7 @@ impl<S: KvStore + 'static> Driver<S> {
         let tx = Transaction::sign(
             TxBody {
                 relayer: None,
+                session: None,
                 chain_id: self.chain_id,
                 nonce,
                 kind: TxKind::SubmitEvidence {
@@ -1669,6 +1671,12 @@ impl<S: KvStore + 'static> Driver<S> {
             } else {
                 Err("duplicate".into())
             };
+        }
+        if tx.body.session.is_some() {
+            // The mempool is stateless; a session grant lives in state (`btb-chain::session`).
+            self.state
+                .check_session(&tx)
+                .map_err(|e| format!("Invalid({e:?})"))?;
         }
         let sender = tx.sender();
         let nonce = self.state.nonce(&sender).map_err(|e| e.to_string())?;
@@ -1771,6 +1779,32 @@ impl<S: KvStore + 'static> Driver<S> {
                     .query(&mut self.state, &contract, &function, &args, &caller)
                     .map_err(|e| RpcError::app(format!("query failed: {e:?}")))?;
                 Ok(json!({"output": hex::encode(&out), "gas_used": gas}))
+            }
+            "btb_upgradeStatus" => {
+                // [contract]: the latest upgrade job of a contract (null if it never had one).
+                let contract = h32(0)?;
+                let st = self
+                    .state
+                    .upgrade_status(&contract)
+                    .map_err(|e| RpcError::app(e.to_string()))?;
+                Ok(match st {
+                    None => Value::Null,
+                    Some(st) => json!({
+                        "phase": st.phase,
+                        "error": st.error,
+                        "upgrader": hex::encode(&st.upgrader),
+                        "started": st.started,
+                        "budget_gas": st.budget_gas,
+                        "charged_gas": st.charged_gas,
+                        "tables": st.tasks.iter().map(|t| json!({
+                            "table": t.table,
+                            "kind": t.kind,
+                            "done": t.done,
+                            "cursor": t.cursor,
+                            "next_id": t.next_id,
+                        })).collect::<Vec<_>>(),
+                    }),
+                })
             }
             "btb_getBlocks" => {
                 // [before?, limit?]: newest first, heights strictly below `before`.
@@ -2110,6 +2144,7 @@ mod tests {
                 Transaction::sign(
                     TxBody {
                         relayer: None,
+                        session: None,
                         chain_id: CHAIN_ID,
                         nonce,
                         kind: TxKind::Transfer {

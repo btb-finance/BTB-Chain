@@ -35,6 +35,7 @@
 #define BTB_TOKEN_MINT 21
 #define BTB_TOKEN_BURN 22
 #define BTB_CONTRACT_ADDRESS 23
+#define BTB_CALLER_VIA_SESSION 60
 /* Oracles (range 40..49): see docs/ORACLES.md. */
 #define BTB_RANDOM_BYTES 40
 #define BTB_PRICE 41
@@ -42,6 +43,20 @@
 #define BTB_PRICE_TWAP 43
 /* Cross-contract calls (range 50..59): see docs/LANGUAGE.md, "Calling other contracts". */
 #define BTB_CALL_CONTRACT 50
+/* File storage (range 70..79): see docs/STORAGE.md, "Files from contracts". */
+#define BTB_FILE_INFO 70
+#define BTB_FILE_PIN 71
+
+/* file_info status byte and file_pin results. */
+#define BTB_FILE_UNKNOWN 0
+#define BTB_FILE_STORED 1
+#define BTB_FILE_EXPIRED 2
+#define BTB_FILE_PIN_OK 0
+#define BTB_FILE_PIN_EXISTS 1
+#define BTB_FILE_PIN_INSUFFICIENT 2
+#define BTB_FILE_PIN_NO_NODES 3
+#define BTB_FILE_PIN_INVALID 4
+#define BTB_FILE_PIN_UNSUPPORTED 5
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
@@ -187,6 +202,11 @@ static inline void btb_contract_address(uint8_t out[32]) {
   btb_ecall5(BTB_CONTRACT_ADDRESS, BTB_P(out), 0, 0, 0, 0);
 }
 
+/* 1 if caller() is an account acting through a session key (never in nested calls), else 0. */
+static inline uint64_t btb_caller_via_session(void) {
+  return btb_ecall5(BTB_CALLER_VIA_SESSION, 0, 0, 0, 0, 0);
+}
+
 /* Writes len (at most 1024) bytes from the beacon to out. Only in a mutation or cron marked with
  * BTB_RANDOMNESS; anywhere else (queries, unmarked functions) the call traps. */
 static inline void btb_random_bytes(uint8_t *out, uint64_t len) {
@@ -284,6 +304,18 @@ static inline uint64_t btb_call_request(uint8_t *buf, uint64_t cap, const uint8_
 static inline uint64_t btb_call_contract(const uint8_t *req, uint64_t req_len, uint8_t *out,
                                          uint64_t out_cap) {
   return btb_ecall5(BTB_CALL_CONTRACT, BTB_P(req), req_len, BTB_P(out), out_cap, 0);
+}
+
+/* Size, status and expiry of the file with the 32-byte root: out gets 24 bytes (size u64 LE,
+ * status u8 + 7 zero bytes, expiry u64 LE). Returns 0, or BTB_NOT_FOUND on a host without file
+ * storage. An unknown root is status BTB_FILE_UNKNOWN. */
+static inline uint64_t btb_file_info(const uint8_t root[32], uint8_t out[24]) {
+  return btb_ecall5(BTB_FILE_INFO, BTB_P(root), BTB_P(out), 0, 0, 0);
+}
+/* Pay for storing a file from this contract's balance (mutations and crons). req is 46 bytes:
+ * root[32], size u64 LE, k u8, m u8, periods u32 LE. Returns a BTB_FILE_PIN_* status. */
+static inline uint64_t btb_file_pin(const uint8_t req[46]) {
+  return btb_ecall5(BTB_FILE_PIN, BTB_P(req), 46, 0, 0, 0);
 }
 
 #endif /* BTB_H */

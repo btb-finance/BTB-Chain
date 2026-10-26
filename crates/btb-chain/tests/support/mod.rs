@@ -56,6 +56,7 @@ impl Wallet {
         let tx = Transaction::sign(
             TxBody {
                 relayer,
+                session: None,
                 chain_id: self.chain_id,
                 nonce: self.nonce,
                 kind,

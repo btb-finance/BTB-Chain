@@ -46,7 +46,24 @@ Contracts declare tables with `#[btb::table]` and indexes with `#[index]` / `#[p
 - **Value families.** `u8`..`u64` and `bool` index as `U64`; `i8`..`i64` as `I64`; `u128` as `U128`; `string` as `Str`; `address`, `bytes` and `[u8; N]` as `Bytes`; `Option<T>` as `T`, with `None` left out of the index. The contract's `Key` for a lookup must be of the same family (the generated lookups guarantee it).
 - **Unique indexes.** `IndexDef::unique()` (what `#[primary]` sets) makes `Tables::insert` and `update` check, before building the batch, that no other row has the value; a clash is `TableError::Duplicate`, which is a `Fault` for the running call, so the whole call commits nothing. The check is a one-entry range read of the index, which is tracked in the read set like any scan.
 - **Host-side fallback.** `Tables::register(contract, table, indexes)` with a hand-written extractor still exists, and `Manifest.indexes` specs (`Table:index:addr@offset`) still register tables the ELF does not declare. A table in the ELF always wins over a spec.
-- Adding or changing an index does not rebuild entries of rows already stored; schema migration is future work.
+- `Tables::register` alone does not rebuild entries of rows already stored. Rebuilding is what a **contract upgrade** does ([CHAIN.md](CHAIN.md#contract-upgrades-and-migrations), `btb dev` reload): `Tables::rewrite(from, kv, contract, table, id, old_row, new_row)` replaces one row and moves its index entries from the old registry's definitions to the new one's (entries both define with the same value are left alone), one `WriteBatch` per row. Unique indexes are checked against rows with a lower id only, because an upgrade rewrites in id order.
+
+## Schema evolution
+
+`btb_runtime::evolve::diff(old, new)` compares the two schemas read from the ELFs and returns a `Plan` of tasks (`Migrate` or `Backfill`) or the reason the change is refused. Rules per table:
+
+| change | verdict |
+| --- | --- |
+| new table | compatible |
+| new fields appended at the end, all `Option<_>` | compatible, no work: a row that ends early reads the missing trailing options as `None` (generated `Decode`, index extractors, `Schema::validate_row`) |
+| new `#[index]`; `#[primary]` added where there was none | compatible, **backfill** |
+| removed `#[index]` | compatible, entries deleted |
+| field removed, renamed, reordered or retyped; non-`Option` field appended; primary changed, removed, or promoted from an index | **incompatible**: needs `#[btb::migration]`, a higher `version` and the old row type |
+| table removed | always refused |
+
+Schema markers: `btb_schema_table_<Name>_<hex>` carries `;v=<version>` (default 1); `btb_schema_prev_<Name>_<ver>_<hex>` an earlier row shape (`#[btb::table(version = N, of = "Name")]`); `btb_schema_migrate_<Name>_<from>_<hex>` a migration. A migration is the pure entry `btb_transform_migrate_<name lowercased>_<from>` (old row bytes in, new row bytes out, run with `Contract::call_transform`).
+
+**Table lock.** Key `0D A len(table) table` (`layout::TAG_TABLE_LOCK`) marks a table an upgrade job is rewriting. While it exists, every table host call by that contract on that table (`table_insert/get/update/delete/scan/index_scan`) faults with `Fault::TableLocked`; the lock read is tracked, so subscribed queries re-run when it is lifted. See [CHAIN.md](CHAIN.md#contract-upgrades-and-migrations).
 
 ## Storage deposits
 

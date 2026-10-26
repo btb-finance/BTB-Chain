@@ -2,6 +2,7 @@
 //! Plain HTTP/1.1 JSON-RPC over `std::net` (the node's RPC has no TLS, see docs/NODE.md).
 use btb_chain::{
     account_address, contract_address, Manifest, SigningKey, Transaction, TxBody, TxKind,
+    UpgradePolicy,
 };
 use btb_codec::Encode;
 use serde_json::{json, Value};
@@ -220,6 +221,7 @@ impl Session {
         let tx = Transaction::sign(
             TxBody {
                 relayer: self.relay.as_ref().map(|r| r.relayer),
+                session: None,
                 chain_id: self.chain_id,
                 nonce,
                 kind,
@@ -259,12 +261,27 @@ impl Session {
 
     /// Deploy a bundle directory written by `btb deploy`. Returns the contract address.
     pub fn deploy_bundle(&self, dir: &Path, gas_limit: Option<u64>) -> Result<[u8; 32], String> {
-        let (code, manifest) = read_bundle(dir)?;
+        self.deploy_bundle_with(dir, gas_limit, None)
+    }
+
+    /// `deploy_bundle`, naming who may upgrade the contract later (`None`: what the bundle's
+    /// `manifest.json` says, else the deployer).
+    pub fn deploy_bundle_with(
+        &self,
+        dir: &Path,
+        gas_limit: Option<u64>,
+        policy: Option<UpgradePolicy>,
+    ) -> Result<[u8; 32], String> {
+        let (code, mut manifest) = read_bundle(dir)?;
+        if let Some(p) = policy {
+            manifest = manifest.with_upgrade_policy(p);
+        }
         let kind = TxKind::Deploy { code, manifest };
         if let Some(g) = gas_limit {
             let need = Transaction::sign(
                 TxBody {
                     relayer: None,
+                    session: None,
                     chain_id: self.chain_id,
                     nonce: 0,
                     kind: kind.clone(),
@@ -278,6 +295,31 @@ impl Session {
         }
         let (nonce, _) = self.send(kind)?;
         Ok(contract_address(&self.sender(), nonce))
+    }
+
+    /// Replace the code of `contract` with a bundle written by `btb deploy`. `budget_gas` is
+    /// prepaid for migrations and index backfills; the unused part is refunded. Returns the
+    /// receipt (output: the number of tables the upgrade has to rewrite).
+    pub fn upgrade_bundle(
+        &self,
+        contract: [u8; 32],
+        dir: &Path,
+        budget_gas: u64,
+    ) -> Result<Value, String> {
+        let (code, manifest) = read_bundle(dir)?;
+        let (_, rc) = self.send(TxKind::Upgrade {
+            contract,
+            code,
+            manifest,
+            budget_gas,
+        })?;
+        Ok(rc)
+    }
+
+    /// The latest upgrade job of a contract (`null` if none).
+    pub fn upgrade_status(&self, contract: [u8; 32]) -> Result<Value, String> {
+        self.rpc
+            .call("btb_upgradeStatus", json!([hex_encode(&contract)]))
     }
 
     pub fn call(
@@ -331,11 +373,15 @@ pub fn read_bundle(dir: &Path) -> Result<(Vec<u8>, Manifest), String> {
         .iter()
         .map(|i| i.as_str().map(String::from).ok_or("index spec".to_string()))
         .collect::<Result<Vec<_>, String>>()?;
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         name,
         crons,
         indexes,
     };
+    // Optional: "upgrade": "deployer" | "none" | "<64 hex address>".
+    if let Some(u) = v["upgrade"].as_str() {
+        manifest = manifest.with_upgrade_policy(parse_policy(u)?);
+    }
     manifest.validate()?;
     Ok((code, manifest))
 }
@@ -370,6 +416,15 @@ pub fn parse_args(s: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// `deployer`, `none` (immutable) or the hex address of an upgrade authority.
+pub fn parse_policy(s: &str) -> Result<UpgradePolicy, String> {
+    match s {
+        "deployer" => Ok(UpgradePolicy::Deployer),
+        "none" => Ok(UpgradePolicy::Immutable),
+        hex => Ok(UpgradePolicy::Authority(parse_address(hex)?)),
+    }
 }
 
 pub fn parse_address(s: &str) -> Result<[u8; 32], String> {

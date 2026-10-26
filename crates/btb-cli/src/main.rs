@@ -1,5 +1,5 @@
 //! `btb init <name> | build | codegen | dev | deploy`, see docs/CLI.md.
-use btb_cli::{chain, deploy, init, print_entries, sha256_hex, DevSession, SdkSource};
+use btb_cli::{chain, deploy, deploy_all, init, print_entries, sha256_hex, DevSession, SdkSource};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -9,7 +9,9 @@ const USAGE: &str = "usage: btb <command>\n\
   btb build                                          build target/btb/<name>.elf and list entry points\n\
   btb codegen --ts DIR                               build and write the typed TypeScript client (api.ts, api.js, api.d.ts) to DIR\n\
   btb dev [--port N] [--data DIR]                    build, serve and hot reload (default port 8787)\n\
-  btb deploy [--rpc URL --key FILE [--gas-limit N]]  write a deploy bundle; with --rpc deploy it to a node\n\
+  btb deploy [--rpc URL --key FILE [--gas-limit N]] [--immutable | --upgrade-authority ADDR]   write a deploy bundle; with --rpc deploy it to a node\n\
+  btb upgrade --rpc URL --key FILE <contract> [--budget-gas N] [--gas-limit N]   build and upgrade a deployed contract (migrations and index backfills run on chain; budget prepaid)\n\
+  btb upgrade --rpc URL <contract> --status          progress of the latest upgrade (migration phase, rows done, gas)\n\
   btb call --rpc URL --key FILE [--gas-limit N] [--relayer HOST_URL] <contract> <fn> [args]   send a mutation (--relayer: submit via a hosting node, which earns 20% of the fee)\n\
   btb query --rpc URL <contract> <fn> [args]         run a read-only query\n\
   btb keygen <FILE>                                  write a new account key file\n\
@@ -60,9 +62,13 @@ fn run() -> Result<(), String> {
         }
         "build" => {
             no_args(&rest)?;
-            let b = btb_cli::build(&project)?;
-            print_entries(&b);
-            println!("wrote {}", b.elf_path.display());
+            let dirs = btb_cli::project_contracts(&project)?;
+            let dirs = if dirs.is_empty() { vec![project] } else { dirs };
+            for d in dirs {
+                let b = btb_cli::build(&d)?;
+                print_entries(&b);
+                println!("wrote {}", b.elf_path.display());
+            }
             Ok(())
         }
         "codegen" => {
@@ -89,10 +95,12 @@ fn run() -> Result<(), String> {
             if !f.positional.is_empty() {
                 return Err(format!("unexpected argument {}", f.positional[0]));
             }
-            let (b, dir) = deploy(&project)?;
-            print_entries(&b);
-            println!("code hash (sha256): {}", sha256_hex(&b.elf));
-            println!("wrote deploy bundle to {}", dir.display());
+            let bundles = deploy_all(&project)?;
+            for (b, dir) in &bundles {
+                print_entries(b);
+                println!("code hash (sha256): {}", sha256_hex(&b.elf));
+                println!("wrote deploy bundle to {}", dir.display());
+            }
             match f.rpc {
                 None => {
                     if f.key.is_some() || f.gas_limit.is_some() {
@@ -102,9 +110,55 @@ fn run() -> Result<(), String> {
                 }
                 Some(_) => {
                     let s = f.session()?;
-                    let addr = s.deploy_bundle(&dir, f.gas_limit)?;
-                    println!("deployed: contract {}", chain::hex_encode(&addr));
+                    for (b, dir) in &bundles {
+                        let addr = s.deploy_bundle(dir, f.gas_limit)?;
+                        println!(
+                            "deployed: contract {} ({})",
+                            chain::hex_encode(&addr),
+                            b.name
+                        );
+                    }
                 }
+            }
+            Ok(())
+        }
+        "upgrade" => {
+            let f = Flags::parse(rest)?;
+            let [c] = f.positional.as_slice() else {
+                return Err(
+                    "usage: btb upgrade --rpc URL --key FILE <contract> [--budget-gas N]".into(),
+                );
+            };
+            let contract = chain::parse_address(c)?;
+            if f.status {
+                let rpc = f.rpc.as_deref().ok_or("--rpc is required")?;
+                let r = chain::Rpc::new(rpc).call(
+                    "btb_upgradeStatus",
+                    serde_json::json!([chain::hex_encode(&contract)]),
+                )?;
+                println!(
+                    "{}",
+                    if r.is_null() {
+                        "no upgrade job".into()
+                    } else {
+                        serde_json::to_string_pretty(&r).unwrap_or_default()
+                    }
+                );
+                return Ok(());
+            }
+            let (b, dir) = deploy(&project)?;
+            print_entries(&b);
+            println!("code hash (sha256): {}", sha256_hex(&b.elf));
+            let s = f.session()?;
+            let rc = s.upgrade_bundle(contract, &dir, f.budget_gas.unwrap_or(5_000_000))?;
+            println!("upgraded: contract {}", chain::hex_encode(&contract));
+            println!("gas_used {} height {}", rc["gas_used"], rc["height"]);
+            let st = s.upgrade_status(contract)?;
+            if !st.is_null() {
+                println!(
+                    "migration: {} (btb upgrade <contract> --rpc URL --status)",
+                    st["phase"]
+                );
             }
             Ok(())
         }
@@ -183,6 +237,15 @@ fn run() -> Result<(), String> {
                 "btb dev: http://{}/ (dev only: no auth). Edit src/ to hot reload; Ctrl-C to stop.",
                 s.addr()
             );
+            if s.contracts().len() > 1 {
+                for (name, addr) in s.contracts() {
+                    println!(
+                        "  contract {name}: {}  (/c/{name}/...)",
+                        chain::hex_encode(&addr)
+                    );
+                }
+                println!("  dashboard: http://{}/dashboard", s.addr());
+            }
             s.join();
             Ok(())
         }
@@ -208,6 +271,12 @@ struct Flags {
     /// A hosting or edge node to submit through (it earns the relay share of the fee).
     relayer: Option<String>,
     gas_limit: Option<u64>,
+    /// `btb upgrade`: gas prepaid for migrations and index backfills.
+    budget_gas: Option<u64>,
+    status: bool,
+    /// `btb deploy`: nobody can upgrade the contract / this account can.
+    immutable: bool,
+    authority: Option<String>,
     positional: Vec<String>,
 }
 
@@ -221,6 +290,18 @@ impl Flags {
                 "--key" => f.key = Some(it.next().ok_or("--key needs a file")?),
                 "--relayer" => {
                     f.relayer = Some(it.next().ok_or("--relayer needs a hosting node URL")?)
+                }
+                "--budget-gas" => {
+                    f.budget_gas = Some(
+                        it.next()
+                            .and_then(|v| v.parse().ok())
+                            .ok_or("--budget-gas needs a number")?,
+                    )
+                }
+                "--status" => f.status = true,
+                "--immutable" => f.immutable = true,
+                "--upgrade-authority" => {
+                    f.authority = Some(it.next().ok_or("--upgrade-authority needs an address")?)
                 }
                 "--gas-limit" => {
                     f.gas_limit = Some(

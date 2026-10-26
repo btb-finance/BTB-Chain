@@ -394,3 +394,143 @@ fn metadata_indexes_still_work_with_a_warning_for_undeclared_tables_only() {
     assert!(manifest.contains("Other:who:addr@0") && !manifest.contains("Note:owner"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+const LEDGER_SRC: &str = r#"#![no_std]
+#![no_main]
+use btb_sdk::btb;
+use btb_sdk::host;
+
+#[btb::mutation]
+pub fn set(v: u64) {
+    host::storage_set(b"v", &v.to_le_bytes());
+}
+
+#[btb::query]
+pub fn get() -> u64 {
+    host::storage_get(b"v").map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])))
+}
+"#;
+
+const ROUTER_SRC: &str = r#"#![no_std]
+#![no_main]
+use btb_sdk::btb;
+use btb_sdk::call::GAS_ALL;
+use btb_sdk::{call, host, query, Address};
+
+/// Read the ledger, add one, write it back through the ledger's own `set`.
+#[btb::mutation]
+pub fn bump(ledger: Address) -> u64 {
+    let Ok(v) = query::<_, u64>(ledger, "get", &(), GAS_ALL) else {
+        host::abort("ledger unreachable")
+    };
+    if call::<_, ()>(ledger, "set", &(v + 1,), GAS_ALL).is_err() {
+        host::abort("ledger refused");
+    }
+    v + 1
+}
+
+#[btb::query]
+pub fn read(ledger: Address) -> u64 {
+    query::<_, u64>(ledger, "get", &(), GAS_ALL).unwrap_or(u64::MAX)
+}
+"#;
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn u64_result(body: &str) -> u64 {
+    let b: Vec<u8> = (0..body.len() / 2)
+        .map(|i| u8::from_str_radix(&body[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    u64::from_le_bytes(b.try_into().unwrap())
+}
+
+/// A project of two contracts: `btb dev` builds and serves both, a router calls a ledger,
+/// and reloading one keeps the other's state.
+#[test]
+fn multi_contract_dev_cross_calls_and_independent_reloads() {
+    let dir = temp("multi");
+    let root = dir.join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, src, entry) in [
+        ("router", ROUTER_SRC, "btb_query_read"),
+        ("ledger", LEDGER_SRC, "btb_query_get"),
+    ] {
+        let p = init(&root, name, &sdk()).unwrap();
+        std::fs::write(p.join("src/main.rs"), src).unwrap();
+        let ld = std::fs::read_to_string(p.join("link.ld")).unwrap();
+        std::fs::write(p.join("link.ld"), ld.replace("btb_query_list_mine", entry)).unwrap();
+    }
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nexclude = [\"router\", \"ledger\"]\n\n[workspace.metadata.btb]\ncontracts = [\"router\", \"ledger\"]\n",
+    )
+    .unwrap();
+    assert_eq!(btb_cli::project_contracts(&root).unwrap().len(), 2);
+
+    let s = DevSession::start(&root, ("127.0.0.1", 0), Duration::from_millis(100), None).unwrap();
+    let addr = s.addr();
+    let names: Vec<String> = s.contracts().into_iter().map(|c| c.0).collect();
+    assert_eq!(names, ["router", "ledger"]);
+    let ledger = s.contracts()[1].1;
+    assert_eq!(ledger, btb_dev::dev_address("ledger"));
+    let arg = hex(&ledger);
+    let bump = |addr: SocketAddr| {
+        let (st, body) = http(
+            addr,
+            "POST",
+            &format!("/c/router/mutation/bump?caller=a&args={arg}"),
+            "",
+        );
+        assert!(st.contains("200"), "{st} {body}");
+        u64_result(&body)
+    };
+    let get_ledger = |addr: SocketAddr| {
+        let (st, body) = http(addr, "GET", "/c/ledger/query/get", "");
+        assert!(st.contains("200"), "{st} {body}");
+        u64_result(&body)
+    };
+    assert_eq!(bump(addr), 1);
+    assert_eq!(bump(addr), 2);
+    assert_eq!(get_ledger(addr), 2);
+    let (_, body) = http(addr, "GET", &format!("/c/router/query/read?args={arg}"), "");
+    assert_eq!(u64_result(&body), 2);
+    // Both contracts are listed for the dashboard.
+    let (_, list) = http(addr, "GET", "/admin/contracts", "");
+    assert!(list.contains("\"name\":\"router\"") && list.contains("\"name\":\"ledger\""));
+
+    // Edit only the router: it reloads, the ledger is untouched and keeps its state.
+    let rsrc = root.join("router/src/main.rs");
+    std::fs::write(
+        &rsrc,
+        format!("{ROUTER_SRC}\n#[btb::query]\npub fn ping() -> u8 {{\n    7\n}}\n"),
+    )
+    .unwrap();
+    wait_for("router reload", || s.reload_count_of("router") == 1);
+    assert_eq!(s.reload_count_of("ledger"), 0);
+    assert_eq!(get_ledger(addr), 2, "ledger state kept");
+    let (st, pb) = http(addr, "GET", "/c/router/query/ping", "");
+    assert!(st.contains("200"), "{st} {pb}");
+
+    assert_eq!(
+        bump(addr),
+        3,
+        "the reloaded router still reaches the ledger"
+    );
+
+    // Edit only the ledger: the router's calls keep working against the new code, state kept.
+    let lsrc = root.join("ledger/src/main.rs");
+    std::fs::write(
+        &lsrc,
+        format!("{LEDGER_SRC}\n#[btb::query]\npub fn twice() -> u64 {{\n    get() * 2\n}}\n"),
+    )
+    .unwrap();
+    wait_for("ledger reload", || s.reload_count_of("ledger") == 1);
+    assert_eq!(s.reload_count_of("router"), 1);
+    let (_, body) = http(addr, "GET", "/c/ledger/query/twice", "");
+    assert_eq!(u64_result(&body), 6);
+    assert_eq!(bump(addr), 4);
+    s.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}

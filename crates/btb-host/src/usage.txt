@@ -10,3 +10,5 @@ btb-host: a BTB Chain hosting node (follows the chain, serves queries, subscript
   --relayer <hex>            account that clients sign into transactions relayed through POST /tx
                              (register it on chain with a Host transaction to earn 20% of their fees)
   --relay-rpc <host:port>    validator JSON-RPC to forward relayed transactions to (repeatable)
+  --upload-dir <dir>         enable the upload gateway: POST /upload keeps files in <dir> until
+                             POST /upload/<root>/push sends them to the assigned storage nodes

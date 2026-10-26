@@ -1117,3 +1117,77 @@ fn host_without_relay_config_refuses_tx() {
     assert_eq!(http(e.addr(), "GET", "/relay", &[]).status, 404);
     assert_eq!(http_body(e.addr(), "POST", "/tx", &[], "00").status, 501);
 }
+
+/// The TypeScript session flow against a real cluster: `BtbAuth` has the account sign one grant,
+/// then increments the counter with the session key through the host's relay. The Rust side
+/// checks the counter moved exactly by the accepted calls.
+#[test]
+fn ts_session_flow_through_the_relay() {
+    use btb_chain::{HostOp, TxKind};
+    use btb_host::RelayConfig;
+    let _g = serial();
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sdk-ts");
+    let vitest = root.join("node_modules/.bin/vitest");
+    if !vitest.exists() {
+        eprintln!("skipping: run `npm ci` in sdk-ts to enable the TypeScript client test");
+        return;
+    }
+    let mut c = Lite::new(4, 600, Some(FollowerPolicy::default()));
+    let ctr = c.deploy(counter_elf());
+    let mut hostw = Wallet::new(60);
+    let user = Wallet::new(61);
+    let fund_host = c.faucet.transfer(hostw.addr(), 10_001 * 1_000_000_000);
+    c.run(&fund_host);
+    let fund_user = c.faucet.transfer(user.addr(), 100_000_000);
+    c.run(&fund_user);
+    c.run(&hostw.sign(TxKind::Host(HostOp::Register {
+        url: b"http://host".to_vec(),
+    })));
+    let mut cfg = HostConfig::new(
+        c.genesis.clone(),
+        c.validator_addrs(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    cfg.relay = Some(RelayConfig {
+        relayer: hostw.addr(),
+        rpc: (0..4)
+            .map(|i| c.node(i).rpc_addr().unwrap().to_string())
+            .collect(),
+    });
+    let host = Host::start(cfg).unwrap();
+    let addr = host.http_addr();
+    c.wait_until("the host to know the contract", 30, || {
+        http(
+            addr,
+            "GET",
+            &format!("/c/{}/query/get", hex::encode(&ctr)),
+            &[],
+        )
+        .status
+            == 200
+    });
+    let out = std::process::Command::new(&vitest)
+        .args(["run", "test/auth-relay.test.ts"])
+        .current_dir(&root)
+        .env("BTB_RELAY_ROOT", format!("http://{addr}"))
+        .env("BTB_RELAY_CONTRACT", hex::encode(&ctr))
+        .env("BTB_RELAY_SEED", hex::encode(&[61u8; 32]))
+        .output()
+        .expect("run vitest");
+    assert!(
+        out.status.success(),
+        "vitest failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Three increments by 2 landed (the refused ones did not).
+    let value = c
+        .node(0)
+        .call(
+            "btb_query",
+            json!([hex::encode(&ctr), "get", "", hex::encode(&[0u8; 32])]),
+        )
+        .unwrap();
+    assert_eq!(value["output"], hex::encode(&6u64.to_le_bytes()), "{value}");
+    host.shutdown();
+}

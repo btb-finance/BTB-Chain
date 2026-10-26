@@ -378,6 +378,7 @@ impl<'a> Engine<'a> {
             defer_fees: true,
             lazy_tables: true,
             registered: std::mem::take(&mut local.registered),
+            via_session: false,
         };
         let result = ctx.apply_tx(&self.txs[t]);
         let Ctx {
@@ -577,7 +578,11 @@ fn classify(txs: &[Transaction]) -> (Vec<Vec<usize>>, Vec<usize>) {
     }
     for (i, tx) in txs.iter().enumerate() {
         // (a relayer is checked against the host registry, which only the dynamic path tracks)
-        if !matches!(tx.body.kind, TxKind::Transfer { .. }) || tx.body.relayer.is_some() {
+        // (a session transaction reads the account's grant, outside a confined footprint)
+        if !matches!(tx.body.kind, TxKind::Transfer { .. })
+            || tx.body.relayer.is_some()
+            || tx.body.session.is_some()
+        {
             let r = find(&mut parent, tx_acct[i]);
             dynamic[r] = true;
         }
@@ -627,6 +632,15 @@ pub(crate) fn run(
     use_fast_path: bool,
 ) -> ParResult {
     let mut stats = ParStats::default();
+    // An upgrade replaces code, schemas and table locks that later transactions of the block
+    // depend on: such blocks run sequentially (deterministic: it depends on the block only).
+    if txs
+        .iter()
+        .any(|t| matches!(t.body.kind, TxKind::Upgrade { .. }))
+    {
+        stats.fell_back = true;
+        return ParResult::Fallback(stats);
+    }
     let (comps, stm) = if use_fast_path {
         classify(txs)
     } else {
@@ -698,6 +712,7 @@ pub(crate) fn run(
                     defer_fees: true,
                     lazy_tables: true,
                     registered: std::mem::take(&mut local.registered),
+                    via_session: false,
                 };
                 let mut outs = Vec::new();
                 for &i in &comps[c] {

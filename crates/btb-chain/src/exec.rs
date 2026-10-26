@@ -71,6 +71,8 @@ pub enum Invalid {
         max_fee: u64,
     },
     TooLarge,
+    /// A transaction signed by a session key broke its grant (`crate::session`).
+    Session(crate::session::SessionInvalid),
 }
 
 /// Why a valid transaction failed while running (state reverted, fee charged).
@@ -104,6 +106,10 @@ pub enum Revert {
     Action(ActionError),
     /// A hosting-node registry transaction was refused (nothing changed).
     Host(crate::host::HostError),
+    /// A contract upgrade was refused (nothing changed).
+    Upgrade(crate::upgrade::UpgradeError),
+    /// A session grant or revoke was refused (nothing changed).
+    Session(crate::session::SessionError),
     Vm(String),
 }
 
@@ -196,6 +202,9 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
         TxKind::Dex(op) => fee.checked_add(op.debit()),
         TxKind::Storage(op) => fee.checked_add(op.debit(&cfg.storage)),
         TxKind::Action(op) => fee.checked_add(op.debit()),
+        TxKind::Upgrade { budget_gas, .. } => {
+            fee.checked_add(budget_gas.checked_mul(cfg.gas_price)?)
+        }
         _ => Some(fee),
     }
 }
@@ -208,6 +217,7 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
             got: tx.body.chain_id,
         });
     }
+    crate::session::check_kind(tx).map_err(Invalid::Session)?;
     match &tx.body.kind {
         TxKind::Call {
             kind,
@@ -243,6 +253,14 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                     needed,
                     max_fee: *max_fee,
                 });
+            }
+        }
+        TxKind::Upgrade { code, manifest, .. } => {
+            if code.len() > MAX_CODE_BYTES || manifest.name.len() > MAX_NAME_BYTES {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
             }
         }
         TxKind::Deploy { code, manifest } => {
@@ -321,6 +339,14 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::BadSignature);
             }
         }
+        TxKind::Session(op) => {
+            if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
         TxKind::Site(op) => {
             // Too big or malformed files never enter a block.
             if op.check_static().is_err() {
@@ -341,7 +367,7 @@ fn code_hash(code: &[u8]) -> Hash {
     sha256(&[b"btb.code.v1", code])
 }
 
-fn load_contract(
+pub(crate) fn load_contract(
     cache: &mut BTreeMap<Hash, Arc<Contract>>,
     code: &[u8],
 ) -> Result<Arc<Contract>, StateError> {
@@ -409,6 +435,8 @@ pub(crate) struct Ctx<'a, S: KvStore> {
     /// (the shared registry cannot be mutated by concurrent deploys).
     pub(crate) lazy_tables: bool,
     pub(crate) registered: std::collections::BTreeSet<Address>,
+    /// The transaction being run was signed by a session key (`btb_sdk::auth::via_session`).
+    pub(crate) via_session: bool,
 }
 
 /// What running a transaction body did.
@@ -503,7 +531,13 @@ impl<S: KvStore> Ctx<'_, S> {
             lazy_tables: self.lazy_tables,
         };
         let mut host = RuntimeHost::new(&self.overlay, &self.tables, contract, caller, self.height);
+        host.via_session = self.via_session;
         host.enable_calls(&resolver, self.cfg.vm_memory as usize);
+        let files = crate::storage::ChainFiles {
+            cfg: self.cfg.storage,
+            nodeless: false,
+        };
+        host.enable_files(&files);
         // Randomness: only a marked mutation or cron may ask (the VM enforces that); its
         // bytes derive from the block beacon, this id (tx id, or the cron receipt id) and the
         // call index. Such a function is always charged its full gas limit, so a caller
@@ -542,7 +576,10 @@ impl<S: KvStore> Ctx<'_, S> {
         })
     }
 
-    fn contract_record(&self, a: &Address) -> Result<Option<ContractRecord>, StateError> {
+    pub(crate) fn contract_record(
+        &self,
+        a: &Address,
+    ) -> Result<Option<ContractRecord>, StateError> {
         match self.overlay.get(&contract_key(a))? {
             None => Ok(None),
             Some(b) => Ok(Some(ContractRecord::decode(&b)?)),
@@ -979,6 +1016,11 @@ impl<S: KvStore> Ctx<'_, S> {
         if let Err(i) = check_static(tx, &self.cfg) {
             return Ok(invalid(i));
         }
+        let session = match crate::session::authorize(&self.overlay, tx, self.height, &self.cfg) {
+            Ok(s) => s.map(|_| tx.public_key),
+            Err(crate::session::AuthError::Invalid(i)) => return Ok(invalid(Invalid::Session(i))),
+            Err(crate::session::AuthError::State(e)) => return Err(e),
+        };
         let expected = read_u64(&self.overlay, &nonce_key(&sender))?;
         let next = expected.checked_add(1);
         if tx.body.nonce != expected || next.is_none() {
@@ -993,6 +1035,7 @@ impl<S: KvStore> Ctx<'_, S> {
             return Ok(invalid(Invalid::InsufficientBalance { needed, available }));
         }
 
+        self.via_session = session.is_some();
         let done = match &tx.body.kind {
             TxKind::Transfer { to, amount } => self.exec_transfer(&sender, to, *amount)?,
             TxKind::Deploy { code, manifest } => {
@@ -1130,6 +1173,42 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::cross::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Session(op) => {
+                let gas_used = tx.intrinsic_gas();
+                match crate::session::apply(&mut self.overlay, self.height, &sender, op) {
+                    Ok(()) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Ok(()),
+                    },
+                    Err(crate::session::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Session(e)),
+                    },
+                    Err(crate::session::Fail::State(e)) => return Err(e),
+                }
+            }
+            TxKind::Upgrade {
+                contract,
+                code,
+                manifest,
+                budget_gas,
+            } => {
+                let gas_used = tx.intrinsic_gas();
+                match self.exec_upgrade(&sender, contract, code, manifest, *budget_gas)? {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(e) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Upgrade(e)),
+                    },
+                }
+            }
             TxKind::Action(op) => self.exec_action(&sender, op, &id, tx.intrinsic_gas())?,
             TxKind::Host(op) => {
                 let gas_used = tx.intrinsic_gas();
@@ -1187,6 +1266,10 @@ impl<S: KvStore> Ctx<'_, S> {
             .ok_or_else(|| StateError("fee overflow".into()))?;
         self.set_u64(&nonce_key(&sender), next.expect("checked above"))?;
         let relayer = self.charge(&sender, fee, tx.body.relayer)?;
+        self.via_session = false;
+        if let Some(key) = &session {
+            crate::session::add_spent(&mut self.overlay, &sender, key, fee)?;
+        }
         Ok(Receipt {
             id,
             origin,
@@ -1229,10 +1312,20 @@ impl<S: KvStore> Ctx<'_, S> {
                 .map_err(|_| bad())?;
             let function =
                 String::from_utf8(key.get(41..).ok_or_else(bad)?.to_vec()).map_err(|_| bad())?;
-            let every = <[u8; 8]>::try_from(val.as_slice())
+            let _stored_every = <[u8; 8]>::try_from(val.as_slice())
                 .map(u64::from_le_bytes)
                 .map_err(|_| bad())?;
             self.overlay.delete(&key)?;
+            // An upgrade may have dropped the cron or changed its period: the manifest rules.
+            let every = {
+                let rec = self
+                    .contract_record(&contract)?
+                    .ok_or_else(|| StateError("cron of a missing contract".into()))?;
+                match rec.manifest.crons.iter().find(|(f, _)| *f == function) {
+                    Some((_, e)) => *e,
+                    None => continue,
+                }
+            };
             if let Some(next) = self.height.checked_add(every) {
                 self.overlay
                     .put(&cron_key(next, &contract, &function), &every.to_le_bytes())?;
@@ -1447,6 +1540,7 @@ impl Executor {
             defer_fees: false,
             lazy_tables: false,
             registered: Default::default(),
+            via_session: false,
         };
         let mut receipts = Vec::with_capacity(block.txs.len());
         staking::begin_block(&mut ctx.overlay, h.height)?;
@@ -1516,6 +1610,7 @@ impl Executor {
         }
         ctx.run_crons(&mut receipts)?;
         ctx.run_actions(&block.actions, &mut receipts)?;
+        ctx.run_upgrades()?;
         crate::dex::end_block(&mut ctx.overlay, &cfg, h.height)?;
         crate::reports::end_block(&mut ctx.overlay, h.height)?;
         crate::oracle::end_block(
@@ -1600,6 +1695,11 @@ impl Executor {
         };
         let mut host = RuntimeHost::new(&state.kv, &state.tables, *contract, *caller, height);
         host.enable_calls(&resolver, state.config.vm_memory as usize);
+        let files = crate::storage::ChainFiles {
+            cfg: state.config.storage,
+            nodeless: false,
+        };
+        host.enable_files(&files);
         host.read_only = true;
         match c.call(
             FunctionKind::Query,

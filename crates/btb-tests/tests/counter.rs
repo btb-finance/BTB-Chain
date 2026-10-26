@@ -225,6 +225,7 @@ fn sdk_host_call_numbers_match_the_vm() {
         (num::TOKEN_MINT, abi::TOKEN_MINT),
         (num::TOKEN_BURN, abi::TOKEN_BURN),
         (num::CONTRACT_ADDRESS, abi::CONTRACT_ADDRESS),
+        (num::CALLER_VIA_SESSION, abi::CALLER_VIA_SESSION),
         (num::NOT_FOUND, abi::NOT_FOUND),
     ];
     for (a, b) in pairs {

@@ -192,6 +192,25 @@ pub fn ident_m_via(target: Address) -> (Address, Address) {
     ))
 }
 
+/// Who is calling and whether through a session key: `(btb_sdk::auth::who())`.
+#[btb::mutation]
+pub fn auth_m() -> (Address, bool) {
+    btb_sdk::auth::who()
+}
+
+/// `target.auth_m()` as seen from here: a nested frame is never a session.
+#[btb::mutation]
+pub fn auth_m_via(target: Address) -> (Address, bool) {
+    unwrap(call::<_, (Address, bool)>(target, "auth_m", &(), GAS_ALL))
+}
+
+/// Only the account's own signature may do this: aborts when a session key signed.
+#[btb::mutation]
+pub fn direct_only() -> bool {
+    btb_sdk::auth::require_direct();
+    true
+}
+
 /// Burn gas in a loop; the result keeps the loop alive.
 #[btb::mutation]
 pub fn burn(n: u64) -> u64 {

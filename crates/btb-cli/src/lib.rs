@@ -156,7 +156,7 @@ fn metadata_list(project: &Path, key: &str) -> Result<Vec<String>, String> {
     for line in text.lines() {
         let l = line.split('#').next().unwrap_or("").trim();
         if l.starts_with('[') && !in_list {
-            in_sec = l == "[package.metadata.btb]";
+            in_sec = l == "[package.metadata.btb]" || l == "[workspace.metadata.btb]";
             continue;
         }
         if in_sec && l.starts_with(key) && l[key.len()..].trim_start().starts_with('=') {
@@ -168,6 +168,37 @@ fn metadata_list(project: &Path, key: &str) -> Result<Vec<String>, String> {
                 in_list = false;
             }
         }
+    }
+    Ok(out)
+}
+
+/// The contract directories of `[package.metadata.btb] contracts = ["contracts/router", ...]`
+/// (or `[workspace.metadata.btb]`), relative to the project root, in order; empty for an
+/// ordinary single-contract project. The first is the primary contract of `btb dev`. Each
+/// directory is a contract project of its own (`btb init`), built and reloaded independently.
+pub fn project_contracts(project: &Path) -> Result<Vec<PathBuf>, String> {
+    let list = metadata_list(project, "contracts")?;
+    let mut out: Vec<PathBuf> = Vec::new();
+    for rel in list {
+        let dir = project.join(&rel);
+        if !dir.join("Cargo.toml").is_file() {
+            return Err(format!(
+                "contracts entry {rel:?}: no Cargo.toml in {}",
+                dir.display()
+            ));
+        }
+        if out.contains(&dir) {
+            return Err(format!("contracts entry {rel:?} listed twice"));
+        }
+        out.push(dir);
+    }
+    let mut names = Vec::new();
+    for d in &out {
+        let n = package_name(d)?;
+        if names.contains(&n) {
+            return Err(format!("two contracts are named {n:?}"));
+        }
+        names.push(n);
     }
     Ok(out)
 }
@@ -262,11 +293,13 @@ pub fn build(project: &Path) -> Result<Built, String> {
             "cargo build failed ({status}); is the {TARGET} target installed (rustup target add {TARGET})?"
         ));
     }
+    // A contract that is a member of a cargo workspace builds into the workspace's target dir.
+    let rel = Path::new("target").join(TARGET).join("release").join(&name);
     let built = project
-        .join("target")
-        .join(TARGET)
-        .join("release")
-        .join(&name);
+        .ancestors()
+        .map(|a| a.join(&rel))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| project.join(&rel));
     let elf = fs::read(&built).map_err(|e| format!("read {}: {e}", built.display()))?;
     let contract = Contract::from_elf(&elf).map_err(|e| format!("invalid contract: {e:?}"))?;
     let out_dir = project.join("target/btb");
@@ -421,9 +454,18 @@ pub fn deploy(project: &Path) -> Result<(Built, PathBuf), String> {
     Ok((b, dir))
 }
 
+/// [`deploy`] for every contract of a multi-contract project (or the one project itself).
+pub fn deploy_all(project: &Path) -> Result<Vec<(Built, PathBuf)>, String> {
+    let dirs = project_contracts(project)?;
+    if dirs.is_empty() {
+        return Ok(vec![deploy(project)?]);
+    }
+    dirs.iter().map(|d| deploy(d)).collect()
+}
+
 /// Fingerprint of everything that should trigger a rebuild: mtime and size of `src/**`,
-/// `Cargo.toml` and `web/index.html`.
-fn fingerprint(project: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
+/// `Cargo.toml` and (with `web`) `web/index.html`.
+fn fingerprint(project: &Path, web: bool) -> Vec<(PathBuf, SystemTime, u64)> {
     fn walk(dir: &Path, out: &mut Vec<(PathBuf, SystemTime, u64)>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -438,6 +480,9 @@ fn fingerprint(project: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
     let mut out = Vec::new();
     walk(&project.join("src"), &mut out);
     for f in ["Cargo.toml", "web/index.html"] {
+        if f != "Cargo.toml" && !web {
+            continue;
+        }
         if let Ok(m) = fs::metadata(project.join(f)) {
             out.push((
                 project.join(f),
@@ -457,11 +502,23 @@ pub struct DevSession {
     watcher: JoinHandle<()>,
     /// Number of successful reloads so far (the first build does not count).
     reloads: Arc<std::sync::atomic::AtomicU64>,
+    per_contract: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+}
+
+/// One contract a session builds and watches.
+struct Watched {
+    name: String,
+    dir: PathBuf,
+    last: Vec<(PathBuf, SystemTime, u64)>,
 }
 
 impl DevSession {
     /// Build the project, start the server on `bind` and begin watching. `poll` is how often
     /// the sources are checked. Rebuild errors are printed and the old contract keeps running.
+    ///
+    /// A project whose `Cargo.toml` lists `contracts` (see [`project_contracts`]) builds and
+    /// serves all of them, each at its stable dev address, and reloads each independently.
+    /// Uploaded files are kept in `target/btb/files`.
     pub fn start(
         project: &Path,
         bind: impl std::net::ToSocketAddrs,
@@ -469,61 +526,123 @@ impl DevSession {
         data: Option<&str>,
     ) -> Result<DevSession, String> {
         let project = project.to_path_buf();
-        let before = fingerprint(&project);
-        let b = build(&project)?;
-        let mut indexes = legacy_indexes(&project, &b.schema)?;
-        if indexes.is_empty() && b.schema.tables.is_empty() {
+        let dirs = project_contracts(&project)?;
+        let multi = !dirs.is_empty();
+        let dirs = if multi { dirs } else { vec![project.clone()] };
+        let mut watched = Vec::new();
+        let mut builds = Vec::new();
+        for d in &dirs {
+            let before = fingerprint(d, !multi);
+            let b = build(d)?;
+            print_entries(&b);
+            watched.push(Watched {
+                name: b.name.clone(),
+                dir: d.clone(),
+                last: before,
+            });
+            builds.push(b);
+        }
+        let page_before = fingerprint_page(&project);
+        let mut indexes = legacy_indexes(&dirs[0], &builds[0].schema)?;
+        if indexes.is_empty() && builds[0].schema.tables.is_empty() {
             eprintln!("btb: the contract declares no #[btb::table], so no index is registered");
         }
-        print_entries(&b);
+        let files_dir = project.join("target/btb/files");
+        let specs: Vec<btb_dev::ContractSpec> = builds
+            .iter()
+            .map(|b| btb_dev::ContractSpec {
+                name: b.name.clone(),
+                elf: b.elf.clone(),
+            })
+            .collect();
+        let first = &builds[0];
+        macro_rules! launch {
+            ($store:expr) => {
+                if multi {
+                    Server::start_multi(
+                        &specs,
+                        bind,
+                        $store,
+                        std::mem::take(&mut indexes),
+                        Some(files_dir),
+                    )?
+                } else {
+                    Server::start_named(
+                        &first.name,
+                        &first.elf,
+                        bind,
+                        $store,
+                        std::mem::take(&mut indexes),
+                        Some(files_dir),
+                    )?
+                }
+            };
+        }
         let server = match data {
-            None => Server::start(
-                &b.elf,
-                bind,
-                btb_runtime::MemKv::new(),
-                std::mem::take(&mut indexes),
-            )?,
+            None => launch!(btb_runtime::MemKv::new()),
             #[cfg(feature = "rocksdb")]
-            Some(d) => Server::start(
-                &b.elf,
-                bind,
-                btb_runtime::rocks::RocksKv::open(d).map_err(|e| e.to_string())?,
-                std::mem::take(&mut indexes),
-            )?,
+            Some(d) => launch!(btb_runtime::rocks::RocksKv::open(d).map_err(|e| e.to_string())?),
             #[cfg(not(feature = "rocksdb"))]
             Some(_) => return Err("--data needs a build with --features rocksdb".into()),
         };
-        load_page(&server, &project);
+        load_page(&server, &project, &dirs[0]);
         server.set_fields(project_fields(&project)?);
         let server = Arc::new(server);
         let stop = Arc::new(AtomicBool::new(false));
         let reloads = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (s, st, rl) = (server.clone(), stop.clone(), reloads.clone());
+        let per_contract = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let (s, st, rl, pc) = (
+            server.clone(),
+            stop.clone(),
+            reloads.clone(),
+            per_contract.clone(),
+        );
+        let first_dir = dirs[0].clone();
         let watcher = std::thread::spawn(move || {
-            let mut last = before;
+            let mut page_last = page_before;
             while !st.load(Ordering::SeqCst) {
                 std::thread::sleep(poll);
-                let now = fingerprint(&project);
-                if now == last {
-                    continue;
+                let mut page_changed = false;
+                if multi {
+                    let now = fingerprint_page(&project);
+                    if now != page_last {
+                        page_last = now;
+                        page_changed = true;
+                    }
                 }
-                // Fingerprint first: edits made while building trigger another round.
-                last = now;
-                eprintln!("btb: change detected, rebuilding...");
-                match build(&project) {
-                    Ok(b) => match s.reload(&b.elf) {
-                        Ok(_) => {
-                            load_page(&s, &project);
-                            if let Ok(f) = project_fields(&project) {
-                                s.set_fields(f);
+                for w in watched.iter_mut() {
+                    let now = fingerprint(&w.dir, !multi);
+                    if now == w.last {
+                        continue;
+                    }
+                    // Fingerprint first: edits made while building trigger another round.
+                    w.last = now;
+                    eprintln!("btb: change detected in {}, rebuilding...", w.name);
+                    match build(&w.dir) {
+                        Ok(b) => match s.reload_contract(&w.name, &b.elf) {
+                            Ok(_) => {
+                                page_changed = true;
+                                if let Ok(f) = project_fields(&project) {
+                                    s.set_fields(f);
+                                }
+                                rl.fetch_add(1, Ordering::SeqCst);
+                                *pc.lock().unwrap().entry(w.name.clone()).or_default() += 1;
+                                eprintln!("btb: reloaded {} (state kept)", w.name);
+                                print_entries(&b);
                             }
-                            rl.fetch_add(1, Ordering::SeqCst);
-                            eprintln!("btb: reloaded (state kept)");
-                            print_entries(&b);
-                        }
-                        Err(e) => eprintln!("btb: reload failed, keeping the old build: {e}"),
-                    },
-                    Err(e) => eprintln!("btb: build failed, keeping the old build: {e}"),
+                            Err(e) => eprintln!(
+                                "btb: reload of {} failed, keeping the old build: {e}",
+                                w.name
+                            ),
+                        },
+                        Err(e) => eprintln!(
+                            "btb: build of {} failed, keeping the old build: {e}",
+                            w.name
+                        ),
+                    }
+                }
+                if page_changed {
+                    load_page(&s, &project, &first_dir);
                 }
             }
         });
@@ -532,6 +651,7 @@ impl DevSession {
             stop,
             watcher,
             reloads,
+            per_contract,
         })
     }
 
@@ -539,9 +659,24 @@ impl DevSession {
         self.server.addr()
     }
 
-    /// How many hot reloads have succeeded.
+    /// `(name, dev address)` of every contract, primary first.
+    pub fn contracts(&self) -> Vec<(String, [u8; 32])> {
+        self.server.contracts()
+    }
+
+    /// How many hot reloads have succeeded (all contracts).
     pub fn reload_count(&self) -> u64 {
         self.reloads.load(Ordering::SeqCst)
+    }
+
+    /// How many hot reloads of the contract `name` have succeeded.
+    pub fn reload_count_of(&self, name: &str) -> u64 {
+        self.per_contract
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Block until the watcher ends (forever, for the binary).
@@ -559,8 +694,19 @@ impl DevSession {
     }
 }
 
-fn load_page(server: &Server, project: &Path) {
-    server.set_page(fs::read_to_string(project.join("web/index.html")).ok());
+/// Fingerprint of the project's own `web/index.html` (multi-contract projects).
+fn fingerprint_page(project: &Path) -> Option<(SystemTime, u64)> {
+    fs::metadata(project.join("web/index.html"))
+        .ok()
+        .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
+}
+
+/// Serve the project's `web/index.html`, else the first contract's.
+fn load_page(server: &Server, project: &Path, first: &Path) {
+    let page = fs::read_to_string(project.join("web/index.html"))
+        .or_else(|_| fs::read_to_string(first.join("web/index.html")))
+        .ok();
+    server.set_page(page);
 }
 
 /// Print the entry points of a build.

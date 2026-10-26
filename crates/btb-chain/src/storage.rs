@@ -23,6 +23,7 @@
 //! | `0x45` schedule | `45 due:u64be file index` | next challenge round of a piece |
 //! | `0x46` deadline | `46 deadline:u64be file index` | an open challenge's (or repair's) deadline |
 //! | `0x47` holding | `47 node file index` | pieces a node holds |
+//! | `0x48` ended file | `48 file` | size, created, periods of a file whose paid periods all ran (`file_info` reports it `expired`; deleted if the root is stored again) |
 //!
 //! # Randomness
 //!
@@ -57,6 +58,7 @@ pub const TAG_PIECE: u8 = 0x44;
 pub const TAG_SCHED: u8 = 0x45;
 pub const TAG_DEADLINE: u8 = 0x46;
 pub const TAG_HOLD: u8 = 0x47;
+pub const TAG_ENDED: u8 = 0x48;
 
 /// Most pieces (`k + m`) of one file.
 pub const MAX_PIECES: usize = 128;
@@ -1116,6 +1118,7 @@ fn store(
         nodes.push(node);
     }
     debit(kv, sender, escrow)?;
+    kv.delete(&key1(TAG_ENDED, root))?;
     put_u64(kv, &key1(TAG_ESCROW, root), escrow)?;
     put_file(
         kv,
@@ -1333,6 +1336,12 @@ fn retire(kv: &mut impl KvStore, mut f: FileInfo, p: PieceInfo) -> Result<(), St
         put_u64(kv, &key1(TAG_ESCROW, &f.id), 0)?;
         credit(kv, &f.owner, left)?;
         kv.delete(&key1(TAG_FILE, &f.id))?;
+        // Remember that it ended, so contracts can tell "expired" from "never stored".
+        let mut t = Vec::new();
+        f.size.encode_to(&mut t);
+        f.created.encode_to(&mut t);
+        f.periods.encode_to(&mut t);
+        kv.put(&key1(TAG_ENDED, &f.id), &t)?;
     } else {
         put_file(kv, &f)?;
     }
@@ -1505,5 +1514,183 @@ impl<S: KvStore> ChainState<S> {
     /// The storage parameters of this chain.
     pub fn storage_config(&self) -> StorageConfig {
         self.config().storage
+    }
+}
+
+// ------------------------------------------------------------------ files from contracts
+
+/// Adapter so the generic storage code can run on the `&mut dyn KvStore` of a running contract.
+struct DynKv<'a>(&'a mut dyn KvStore);
+
+impl KvStore for DynKv<'_> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.0.get(key)
+    }
+    fn scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<btb_runtime::kv::Entry>, KvError> {
+        self.0.scan(start, end, reverse, limit)
+    }
+    fn commit(&mut self, batch: btb_runtime::kv::WriteBatch) -> Result<(), KvError> {
+        self.0.commit(batch)
+    }
+}
+
+/// `file_info` and `file_pin` of a contract, on the chain's storage state.
+pub struct ChainFiles {
+    pub cfg: StorageConfig,
+    /// `btb dev`: there are no storage nodes. A pin records the file (and takes the escrow from
+    /// the contract) without assigning pieces, and a file reads as expired once the height
+    /// passes its expiry, since no scheduler retires it.
+    pub nodeless: bool,
+}
+
+/// Record a file as stored without storage nodes (`btb dev`). With `charge` the escrow of a
+/// `Store` is taken from `owner`'s balance and kept in the file's escrow; without it the file is
+/// free (an upload to the dev server). `Ok(false)`: the root is already stored.
+pub fn record_nodeless(
+    kv: &mut dyn KvStore,
+    cfg: &StorageConfig,
+    owner: &Address,
+    height: u64,
+    op: &StorageOp,
+    charge: bool,
+) -> Result<bool, KvError> {
+    let StorageOp::Store {
+        root,
+        size,
+        k,
+        m,
+        periods,
+    } = op
+    else {
+        return Ok(false);
+    };
+    let mut kv = DynKv(kv);
+    if kv.get(&key1(TAG_FILE, root))?.is_some() {
+        return Ok(false);
+    }
+    let escrow = if charge {
+        cfg.escrow_for(*size, *k, *m, *periods).unwrap_or(0)
+    } else {
+        0
+    };
+    if escrow > 0 {
+        debit(&mut kv, owner, escrow).map_err(|e| KvError(e.0))?;
+        put_u64(&mut kv, &key1(TAG_ESCROW, root), escrow)?;
+    }
+    kv.delete(&key1(TAG_ENDED, root))?;
+    let piece_len = proof::piece_len(*size, usize::from(*k));
+    put_file(
+        &mut kv,
+        &FileInfo {
+            id: *root,
+            owner: *owner,
+            size: *size,
+            k: *k,
+            m: *m,
+            piece_len,
+            periods: *periods,
+            pay: cfg.pay_per_period(piece_len).unwrap_or(0),
+            created: height,
+            live: u32::from(*k) + u32::from(*m),
+            escrow,
+        },
+    )?;
+    Ok(true)
+}
+
+impl ChainFiles {
+    /// Block height by which a file stored at `created` for `periods` periods has paid out: every
+    /// piece's last round is at most `periods * epoch_blocks` after the store.
+    fn expiry(&self, created: u64, periods: u32) -> u64 {
+        created.saturating_add(u64::from(periods).saturating_mul(self.cfg.epoch_blocks))
+    }
+}
+
+impl btb_runtime::FileService for ChainFiles {
+    fn info(
+        &self,
+        kv: &dyn KvStore,
+        root: &[u8; 32],
+        height: u64,
+    ) -> Result<btb_vm::host::FileRecord, KvError> {
+        use btb_vm::host::{abi, FileRecord};
+        let bad = |e: DecodeError| KvError(format!("corrupt file record: {e:?}"));
+        if let Some(b) = kv.get(&key1(TAG_FILE, root))? {
+            let f = FileInfo::decode(*root, 0, &b).map_err(bad)?;
+            let expiry = self.expiry(f.created, f.periods);
+            return Ok(FileRecord {
+                size: f.size,
+                status: if self.nodeless && height >= expiry {
+                    abi::FILE_EXPIRED
+                } else {
+                    abi::FILE_STORED
+                },
+                expiry,
+            });
+        }
+        if let Some(b) = kv.get(&key1(TAG_ENDED, root))? {
+            let mut r = Reader::new(&b, 1 << 10);
+            let size = u64::decode_from(&mut r).map_err(bad)?;
+            let created = u64::decode_from(&mut r).map_err(bad)?;
+            let periods = u32::decode_from(&mut r).map_err(bad)?;
+            return Ok(FileRecord {
+                size,
+                status: abi::FILE_EXPIRED,
+                expiry: self.expiry(created, periods),
+            });
+        }
+        Ok(FileRecord::default())
+    }
+
+    fn pin(
+        &self,
+        kv: &mut dyn KvStore,
+        contract: &Address,
+        pin: &btb_vm::host::FilePin,
+        height: u64,
+    ) -> Result<u64, KvError> {
+        use btb_vm::host::abi;
+        let op = StorageOp::Store {
+            root: pin.root,
+            size: pin.size,
+            k: pin.k,
+            m: pin.m,
+            periods: pin.periods,
+        };
+        if op.check_static().is_err() {
+            return Ok(abi::FILE_PIN_INVALID);
+        }
+        let mut kv = DynKv(kv);
+        if kv.get(&key1(TAG_FILE, &pin.root))?.is_some() {
+            return Ok(abi::FILE_PIN_EXISTS);
+        }
+        let Some(escrow) = self.cfg.escrow_for(pin.size, pin.k, pin.m, pin.periods) else {
+            return Ok(abi::FILE_PIN_INVALID);
+        };
+        if balance(&kv, contract)? < escrow {
+            return Ok(abi::FILE_PIN_INSUFFICIENT);
+        }
+        if self.nodeless {
+            return Ok(
+                if record_nodeless(kv.0, &self.cfg, contract, height, &op, true)? {
+                    abi::FILE_PIN_OK
+                } else {
+                    abi::FILE_PIN_EXISTS
+                },
+            );
+        }
+        match apply(&mut kv, &self.cfg, contract, height, &op) {
+            Ok(_) => Ok(abi::FILE_PIN_OK),
+            Err(Fail::Tx(StorageError::AlreadyStored)) => Ok(abi::FILE_PIN_EXISTS),
+            Err(Fail::Tx(StorageError::NotEnoughNodes)) => Ok(abi::FILE_PIN_NO_NODES),
+            Err(Fail::Tx(_)) => Ok(abi::FILE_PIN_INVALID),
+            Err(Fail::State(e)) => Err(KvError(e.0)),
+        }
     }
 }

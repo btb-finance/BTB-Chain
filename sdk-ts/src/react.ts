@@ -2,6 +2,7 @@ import { createContext, createElement, useCallback, useContext, useEffect, useRe
 import { type ArgsParam, type MutationRef, type QueryRef, isFnRef } from "./api.js";
 import { type BtbClient, BtbError } from "./client.js";
 import { type Codec, encode, toHex } from "./codec.js";
+import type { Identity } from "./auth.js";
 
 const Ctx = createContext<BtbClient | null>(null);
 
@@ -124,4 +125,51 @@ export function useMutation(first: unknown, ...rest: unknown[]): [(...args: unkn
     [client, name],
   );
   return [mutate, state];
+}
+
+export interface AuthState {
+  /** The logged-in account and session key, or null. */
+  identity: Identity | null;
+  /** True while a login/restore is running. */
+  loading: boolean;
+  error: Error | undefined;
+  /** Create a session key and have the wallet sign its grant (once). */
+  login: () => Promise<Identity>;
+  /** Forget the session key; `revoke` also revokes the grant on chain. */
+  logout: (opts?: { revoke?: boolean }) => Promise<void>;
+}
+
+/** Session-key auth of the provider's client (`new BtbClient({ auth })`): identity, login, logout. */
+export function useAuth(): AuthState {
+  const auth = useBtbClient().auth;
+  if (!auth) throw new Error("useAuth needs a BtbClient created with an `auth` option");
+  const [identity, setIdentity] = useState(auth.identity);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | undefined>(undefined);
+  useEffect(() => {
+    const unsub = auth.subscribe(() => setIdentity(auth.identity));
+    auth
+      .restore()
+      .catch((e: unknown) => setError(e as Error))
+      .finally(() => setLoading(false));
+    return unsub;
+  }, [auth]);
+  const run = useCallback(
+    async <T,>(f: () => Promise<T>): Promise<T> => {
+      setLoading(true);
+      setError(undefined);
+      try {
+        return await f();
+      } catch (e) {
+        setError(e as Error);
+        throw e;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+  const login = useCallback(() => run(() => auth.login()), [auth, run]);
+  const logout = useCallback((opts?: { revoke?: boolean }) => run(() => auth.logout(opts)), [auth, run]);
+  return { identity, loading, error, login, logout };
 }

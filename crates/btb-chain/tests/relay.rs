@@ -278,6 +278,7 @@ fn ts_fixture_matches() {
                 chain_id: 7,
                 nonce: 3,
                 relayer,
+                session: None,
                 kind,
             },
             &key,

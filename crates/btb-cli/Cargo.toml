@@ -30,6 +30,7 @@ default = []
 rocksdb = ["btb-dev/rocksdb", "btb-runtime/rocksdb"]
 
 [dev-dependencies]
+btb-host = { path = "../btb-host" }
 btb-node = { path = "../btb-node" }
 btb-consensus = { path = "../btb-consensus" }
 btb-runtime = { path = "../btb-runtime" }
