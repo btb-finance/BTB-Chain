@@ -349,6 +349,11 @@ impl<S: KvStore + 'static> Driver<S> {
                 Ok(json!({
                     "assets": assets,
                     "next_withdrawal": next,
+                    "utxos": vault::utxos(kv, 100).map_err(app)?.iter().map(|u| json!({
+                        "txid": hex::encode(&u.txid),
+                        "vout": u.vout,
+                        "amount": u.amount.to_string(),
+                    })).collect::<Vec<_>>(),
                     "withdrawals": ws.iter().map(|w| json!({
                         "id": w.id,
                         "asset": w.asset.name(),
@@ -361,6 +366,7 @@ impl<S: KvStore + 'static> Driver<S> {
                             _ => "signed",
                         },
                         "requests": w.requests,
+                        "plan": hex::encode(&w.plan),
                     })).collect::<Vec<_>>(),
                 }))
             }

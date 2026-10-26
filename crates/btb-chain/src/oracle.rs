@@ -26,6 +26,9 @@
 //!   the on-chain DKG of `crate::dkg`. A block of an epoch that has no key yet (only the first
 //!   `dkg_window` blocks of a chain that runs the genesis DKG) carries no beacon and has no
 //!   seed: `random_bytes` traps with `RandomnessUnavailable`.
+//!   Whether the median is *published* is up to [`PriceRules`]: deviation or heartbeat, a
+//!   circuit breaker (`50 11 pair`, see [`Breaker`]) and TWAP checkpoints (`50 12`, see
+//!   `btb_runtime::twap`).
 //! * **Prices.** `end_block` (after the transactions, so a transaction sees the previous block's
 //!   prices) stores each accepted observation and, for every pair that got news, recomputes the
 //!   stake-weighted median over the current epoch's validators' fresh observations, if at least
@@ -39,7 +42,7 @@ use btb_codec::{Decode, DecodeError, Encode, Reader};
 use btb_oracle::price::weighted_median;
 use btb_oracle::{Beacon, GroupKey, SignedObservation};
 use btb_runtime::kv::KvStore;
-use btb_runtime::layout::{oracle_price_key, oracle_seed_key, TAG_ORACLE};
+use btb_runtime::layout::{oracle_breaker_key, oracle_price_key, oracle_seed_key, TAG_ORACLE};
 use std::collections::BTreeMap;
 
 pub const KEY_CONFIG: u8 = 0x01;
@@ -65,6 +68,99 @@ pub struct PairConfig {
     pub decimals: u8,
 }
 
+/// Most candidate aggregates the circuit breaker remembers per feed (also the cap of
+/// `breaker_window`).
+pub const MAX_BREAKER_WINDOW: u64 = 256;
+/// Largest `twap_max_window` (matches the VM's `MAX_TWAP_WINDOW`).
+pub const MAX_TWAP_WINDOW: u64 = btb_vm::host::abi::MAX_TWAP_WINDOW;
+const MAX_BPS: u32 = 1_000_000;
+
+/// When a feed publishes, when it pauses, how far back TWAPs reach (genesis, all feeds).
+///
+/// The **candidate** is the stake-weighted median of this block (see [`end_block`]). It becomes
+/// the published price when it deviates from the published price by more than
+/// `update_deviation_bps`, or `heartbeat_blocks` have passed since the last publication.
+///
+/// The **circuit breaker** (`breaker_bps > 0`) pauses the feed when a candidate lies more than
+/// `breaker_bps` away from any candidate of the last `breaker_window` blocks. A paused feed keeps
+/// its last price in state, `price` and `price_twap` answer `PRICE_PAUSED`, and nothing is
+/// published until `breaker_resume_blocks` consecutive blocks with a candidate each stayed
+/// within `breaker_bps` of the previous candidate and of the first candidate of that run. Then
+/// the latest candidate is published and the feed is live again. No governance involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceRules {
+    /// Publish when the candidate moves more than this many basis points (0: on any news).
+    pub update_deviation_bps: u32,
+    /// Publish at least every this many blocks when there is news (at least 1).
+    pub heartbeat_blocks: u64,
+    /// Breaker threshold in basis points; 0 disables the breaker.
+    pub breaker_bps: u32,
+    /// Breaker look-back in blocks, `1..=MAX_BREAKER_WINDOW`.
+    pub breaker_window: u64,
+    /// Consecutive in-band blocks that resume a paused feed (at least 1).
+    pub breaker_resume_blocks: u64,
+    /// How many blocks back `price_twap` can reach (0: TWAPs off), `<= MAX_TWAP_WINDOW`.
+    pub twap_max_window: u64,
+}
+
+impl Default for PriceRules {
+    /// Publish on every block with news, no breaker, TWAPs up to 1024 blocks.
+    fn default() -> Self {
+        PriceRules {
+            update_deviation_bps: 0,
+            heartbeat_blocks: 1,
+            breaker_bps: 0,
+            breaker_window: 64,
+            breaker_resume_blocks: 3,
+            twap_max_window: 1024,
+        }
+    }
+}
+
+impl Encode for PriceRules {
+    fn encode_to(&self, out: &mut Vec<u8>) {
+        self.update_deviation_bps.encode_to(out);
+        self.heartbeat_blocks.encode_to(out);
+        self.breaker_bps.encode_to(out);
+        self.breaker_window.encode_to(out);
+        self.breaker_resume_blocks.encode_to(out);
+        self.twap_max_window.encode_to(out);
+    }
+}
+impl Decode for PriceRules {
+    fn decode_from(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(PriceRules {
+            update_deviation_bps: u32::decode_from(r)?,
+            heartbeat_blocks: u64::decode_from(r)?,
+            breaker_bps: u32::decode_from(r)?,
+            breaker_window: u64::decode_from(r)?,
+            breaker_resume_blocks: u64::decode_from(r)?,
+            twap_max_window: u64::decode_from(r)?,
+        })
+    }
+}
+
+impl PriceRules {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.update_deviation_bps > MAX_BPS || self.breaker_bps > MAX_BPS {
+            return Err("basis points above 1,000,000".into());
+        }
+        if self.heartbeat_blocks == 0 || self.heartbeat_blocks > MAX_AGE_LIMIT {
+            return Err(format!("heartbeat_blocks must be 1..={MAX_AGE_LIMIT}"));
+        }
+        if !(1..=MAX_BREAKER_WINDOW).contains(&self.breaker_window) {
+            return Err(format!("breaker_window must be 1..={MAX_BREAKER_WINDOW}"));
+        }
+        if !(1..=MAX_AGE_LIMIT).contains(&self.breaker_resume_blocks) {
+            return Err("breaker_resume_blocks must be at least 1".into());
+        }
+        if self.twap_max_window > MAX_TWAP_WINDOW {
+            return Err(format!("twap_max_window above {MAX_TWAP_WINDOW}"));
+        }
+        Ok(())
+    }
+}
+
 /// The oracle section of the genesis: how the beacon key comes about, which feeds exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleGenesis {
@@ -82,6 +178,8 @@ pub struct OracleGenesis {
     /// Length `W` of the DKG window at the end of every epoch (and at the start of the chain
     /// when `group_key` is empty): `W >= 4` and `2 * W <= epoch_len`.
     pub dkg_window: u64,
+    /// Update rule, circuit breaker and TWAP depth of the price feeds.
+    pub rules: PriceRules,
 }
 
 impl Encode for PairConfig {
@@ -108,6 +206,7 @@ impl Encode for OracleGenesis {
         self.pairs.encode_to(out);
         self.max_age_blocks.encode_to(out);
         self.dkg_window.encode_to(out);
+        self.rules.encode_to(out);
     }
 }
 impl Decode for OracleGenesis {
@@ -118,6 +217,7 @@ impl Decode for OracleGenesis {
             pairs: Vec::decode_from(r)?,
             max_age_blocks: u64::decode_from(r)?,
             dkg_window: u64::decode_from(r)?,
+            rules: PriceRules::decode_from(r)?,
         })
     }
 }
@@ -164,6 +264,7 @@ impl OracleGenesis {
         if !(1..=MAX_AGE_LIMIT).contains(&self.max_age_blocks) {
             return Err(format!("max_age_blocks must be 1..={MAX_AGE_LIMIT}"));
         }
+        self.rules.validate()?;
         Ok(group)
     }
 
@@ -457,15 +558,170 @@ pub(crate) fn end_block(
         if total == 0 || reporting * 3 < total * 2 {
             continue;
         }
-        if let Some(price) = weighted_median(&items) {
-            let e = PriceEntry {
-                price,
-                height,
-                decimals: pair.decimals,
-                reporters: items.len() as u32,
-            };
-            kv.put(&oracle_price_key(id), &e.encode())?;
+        if let Some(candidate) = weighted_median(&items) {
+            apply_candidate(kv, &og.rules, pair, height, candidate, items.len() as u32)?;
         }
+    }
+    Ok(())
+}
+
+/// `|a - b| > bps / 10000 * b`, saturating (prices above 2^113 compare approximately).
+fn moved_more_than(a: u128, reference: u128, bps: u32) -> bool {
+    a.abs_diff(reference).saturating_mul(10_000) > reference.saturating_mul(u128::from(bps))
+}
+
+/// The circuit-breaker record of a feed (`50 11 pair`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Breaker {
+    pub paused: bool,
+    /// Consecutive in-band blocks while paused.
+    pub in_band: u64,
+    /// First candidate of the current in-band run (paused only).
+    pub anchor: u128,
+    /// The previous candidate.
+    pub prev: u128,
+    /// `(height, candidate)` of the last `breaker_window` blocks with news, oldest first.
+    pub history: Vec<(u64, u128)>,
+}
+
+impl Breaker {
+    fn encode(&self) -> Vec<u8> {
+        let mut o = vec![u8::from(self.paused)];
+        o.extend_from_slice(&self.in_band.to_le_bytes());
+        o.extend_from_slice(&self.anchor.to_le_bytes());
+        o.extend_from_slice(&self.prev.to_le_bytes());
+        o.extend_from_slice(&(self.history.len() as u32).to_le_bytes());
+        for (h, p) in &self.history {
+            o.extend_from_slice(&h.to_le_bytes());
+            o.extend_from_slice(&p.to_le_bytes());
+        }
+        o
+    }
+
+    fn decode(b: &[u8]) -> Option<Breaker> {
+        let n = u32::from_le_bytes(b.get(41..45)?.try_into().ok()?) as usize;
+        if b.len() != 45 + n * 24 || n > MAX_BREAKER_WINDOW as usize {
+            return None;
+        }
+        let history = (0..n)
+            .map(|i| {
+                let c = &b[45 + i * 24..45 + (i + 1) * 24];
+                (
+                    u64::from_le_bytes(c[..8].try_into().expect("8")),
+                    u128::from_le_bytes(c[8..].try_into().expect("16")),
+                )
+            })
+            .collect();
+        Some(Breaker {
+            paused: b[0] == 1,
+            in_band: u64::from_le_bytes(b[1..9].try_into().ok()?),
+            anchor: u128::from_le_bytes(b[9..25].try_into().ok()?),
+            prev: u128::from_le_bytes(b[25..41].try_into().ok()?),
+            history,
+        })
+    }
+}
+
+/// The breaker record of `pair` (default: live, no history).
+pub fn breaker(kv: &impl KvStore, pair: u32) -> Result<Breaker, StateError> {
+    Ok(kv
+        .get(&oracle_breaker_key(pair))?
+        .and_then(|b| Breaker::decode(&b))
+        .unwrap_or_default())
+}
+
+/// Is the feed of `pair` paused by its circuit breaker?
+pub fn paused(kv: &impl KvStore, pair: u32) -> Result<bool, StateError> {
+    Ok(breaker(kv, pair)?.paused)
+}
+
+fn publish(
+    kv: &mut impl KvStore,
+    rules: &PriceRules,
+    pair: &PairConfig,
+    height: u64,
+    price: u128,
+    reporters: u32,
+) -> Result<(), StateError> {
+    let e = PriceEntry {
+        price,
+        height,
+        decimals: pair.decimals,
+        reporters,
+    };
+    kv.put(&oracle_price_key(pair.id), &e.encode())?;
+    if rules.twap_max_window > 0 {
+        btb_runtime::twap::record(kv, pair.id, height, price, rules.twap_max_window)?;
+    }
+    Ok(())
+}
+
+/// A new aggregate (`candidate`) exists at `height`: run the breaker, then the update rule.
+fn apply_candidate(
+    kv: &mut impl KvStore,
+    rules: &PriceRules,
+    pair: &PairConfig,
+    height: u64,
+    candidate: u128,
+    reporters: u32,
+) -> Result<(), StateError> {
+    let cur = price(&*kv, pair.id)?;
+    let mut publish_now = false;
+    if rules.breaker_bps > 0 {
+        let mut br = breaker(&*kv, pair.id)?;
+        br.history
+            .retain(|(h, _)| height - *h < rules.breaker_window);
+        if br.paused {
+            let in_band = !moved_more_than(candidate, br.prev, rules.breaker_bps)
+                && !moved_more_than(candidate, br.anchor, rules.breaker_bps);
+            if in_band {
+                br.in_band += 1;
+            } else {
+                br.in_band = 0;
+                br.anchor = candidate;
+            }
+            br.prev = candidate;
+            br.history.push((height, candidate));
+            if br.in_band >= rules.breaker_resume_blocks {
+                br = Breaker {
+                    history: vec![(height, candidate)],
+                    prev: candidate,
+                    ..Breaker::default()
+                };
+                publish_now = true;
+            }
+        } else {
+            let lo = br.history.iter().map(|(_, p)| *p).min();
+            let hi = br.history.iter().map(|(_, p)| *p).max();
+            let jump = lo.is_some_and(|lo| {
+                candidate > lo && moved_more_than(candidate, lo, rules.breaker_bps)
+            }) || hi.is_some_and(|hi| {
+                candidate < hi && moved_more_than(candidate, hi, rules.breaker_bps)
+            });
+            br.history.push((height, candidate));
+            br.prev = candidate;
+            if jump {
+                br.paused = true;
+                br.in_band = 0;
+                br.anchor = candidate;
+            }
+        }
+        let paused_now = br.paused;
+        kv.put(&oracle_breaker_key(pair.id), &br.encode())?;
+        if paused_now {
+            return Ok(());
+        }
+    }
+    let due = match cur {
+        None => true,
+        Some(c) => {
+            publish_now
+                || height.saturating_sub(c.height) >= rules.heartbeat_blocks
+                || moved_more_than(candidate, c.price, rules.update_deviation_bps)
+        }
+    };
+    if due {
+        publish(kv, rules, pair, height, candidate, reporters)?;
     }
     Ok(())
 }

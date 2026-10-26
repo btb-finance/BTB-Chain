@@ -15,5 +15,5 @@ pub mod vm;
 pub use contract::{CallError, CallOutcome, Contract, ContractError, EntryPoint, FunctionKind};
 pub use decode::{decode, Instr, Trap};
 pub use elf::{ElfError, Loaded};
-pub use host::{run_with_host, Host, PriceRecord};
+pub use host::{run_with_host, Host, PriceRecord, TwapOutcome};
 pub use vm::{Exit, Vm};

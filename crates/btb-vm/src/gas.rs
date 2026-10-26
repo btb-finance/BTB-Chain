@@ -126,6 +126,12 @@ pub const HOST_PRICE_QUERY: u64 = 200;
 pub const PRICE_READ_FEE: u64 = 10_000;
 pub const HOST_PRICE_MUTATION: u64 = HOST_PRICE_QUERY + PRICE_READ_FEE;
 
+/// `price_twap(pair, window, out_ptr)`: two checkpoint reads plus arithmetic; in a query it is
+/// free to the caller, in a mutation or cron it adds a per-read fee (see `docs/ORACLES.md`).
+pub const HOST_TWAP_QUERY: u64 = 500;
+pub const TWAP_READ_FEE: u64 = 20_000;
+pub const HOST_TWAP_MUTATION: u64 = HOST_TWAP_QUERY + TWAP_READ_FEE;
+
 /// `report_request(data_ptr, len)`: base plus `REPORT_BYTE` per byte. The committee signs every
 /// report, which costs the validators a pairing-free partial signature each and a block's worth
 /// of gossip, so it is priced well above a storage write.

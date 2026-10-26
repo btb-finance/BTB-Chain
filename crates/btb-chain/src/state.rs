@@ -12,7 +12,7 @@
 //! | `0x25` meta | `25 01` / `25 02` | config / head `(height, hash, timestamp)` |
 //! | `0x32` site file | `32 C path` | `SHA-256(content) \|\| content` (`site.rs`) |
 //!
-//! Storage nodes add `0x40`..`0x47` (see `storage.rs`). Payment channels add `0x30`/`0x31` (see `channel.rs`), the DEX `0x34`..`0x38` (see `dex.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
+//! Hosting nodes add `0x60`..`0x62` (see `host.rs`). Storage nodes add `0x40`..`0x47` (see `storage.rs`). Payment channels add `0x30`/`0x31` (see `channel.rs`), the DEX `0x34`..`0x38` (see `dex.rs`). Staking adds `0x26`..`0x2C` (see `staking.rs`). Native balances are the runtime's `0x05`
 //! entries (accounts, contracts, the fee pools and the slash vault share them); storage
 //! deposits are its `0x09` entries; bonded stake is `0x26` and unbonding stake `0x27`.
 
@@ -90,6 +90,10 @@ pub struct ChainConfig {
     pub dex_fee_bps: u64,
     /// Storage nodes: challenge periods, prices, deposits (`storage.rs`).
     pub storage: crate::storage::StorageConfig,
+    /// BTB locked from a hosting node's balance while it is registered (`host.rs`).
+    pub host_bond: u64,
+    /// Blocks a host's bond stays locked (and counted as money) after `Unregister`.
+    pub host_unbonding_blocks: u64,
 }
 
 impl ChainConfig {
@@ -109,6 +113,8 @@ impl ChainConfig {
             dex_batch_blocks: 1,
             dex_fee_bps: 10,
             storage: crate::storage::StorageConfig::default(),
+            host_bond: 10_000 * crate::UNITS_PER_BTB,
+            host_unbonding_blocks: StakingConfig::default().unbonding_blocks,
         }
     }
 
@@ -138,6 +144,12 @@ impl ChainConfig {
             return Err("dex_fee_bps above the maximum".into());
         }
         self.storage.validate()?;
+        if self.host_bond > TOTAL_SUPPLY / 1_000 {
+            return Err("host_bond above 0.1% of the supply".into());
+        }
+        if self.host_unbonding_blocks == 0 {
+            return Err("host_unbonding_blocks must be at least 1".into());
+        }
         Ok(())
     }
 
@@ -159,6 +171,7 @@ impl ChainConfig {
         .chain(self.staking.fields())
         .chain([self.dex_batch_blocks, self.dex_fee_bps])
         .chain(self.storage.fields())
+        .chain([self.host_bond, self.host_unbonding_blocks])
         {
             v.encode_to(&mut o);
         }
@@ -191,6 +204,8 @@ impl ChainConfig {
                 n()?,
                 n()?,
             ]),
+            host_bond: n()?,
+            host_unbonding_blocks: n()?,
         };
         Ok(cfg)
     }
@@ -393,7 +408,9 @@ pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
         + sum_tag(kv, staking::TAG_UNBOND)?
         + sum_tag(kv, crate::channel::TAG_LOCKED)?
         + sum_tag(kv, crate::storage::TAG_NODE_DEPOSIT)?
-        + sum_tag(kv, crate::storage::TAG_ESCROW)?)
+        + sum_tag(kv, crate::storage::TAG_ESCROW)?
+        + sum_tag(kv, crate::host::TAG_HOST_BOND)?
+        + sum_tag(kv, crate::host::TAG_HOST_UNBOND)?)
 }
 
 /// Register a manifest's indexes into `tables` for `contract`.
@@ -625,6 +642,21 @@ impl<S: KvStore> ChainState<S> {
             None => Ok(None),
             Some(b) => Ok(Some(ContractRecord::decode(&b)?)),
         }
+    }
+
+    /// The bond locked by a registered hosting node (0 if none).
+    pub fn host_bond(&self, a: &Address) -> Result<u64, KvError> {
+        crate::host::bond(&self.kv, a)
+    }
+
+    /// The URL a hosting node registered, if it is registered.
+    pub fn host_url(&self, a: &Address) -> Result<Option<Vec<u8>>, KvError> {
+        crate::host::url(&self.kv, a)
+    }
+
+    /// A hosting node's unbonding bond: `(maturity height, amount)`.
+    pub fn host_unbonding(&self, a: &Address) -> Result<Vec<(u64, u64)>, KvError> {
+        crate::host::unbonding(&self.kv, a)
     }
 
     /// Balances plus storage deposits. Always equals `TOTAL_SUPPLY`.

@@ -110,6 +110,7 @@ impl Sim {
             pairs: vec![],
             max_age_blocks: 20,
             dkg_window: W,
+            rules: Default::default(),
         };
         let state = ChainState::from_genesis_full(MemKv::new(), &g, &vals, Some(&og)).unwrap();
         Sim {
@@ -343,6 +344,8 @@ fn claim(asset: Scheme, n: u8, amount: u64, to: Address) -> DepositClaim {
         index: 0,
         amount,
         recipient: to,
+        height: 100,
+        block_hash: [n; 32],
     }
 }
 
@@ -722,6 +725,157 @@ fn a_deposit_is_credited_only_when_two_thirds_of_the_stake_voted_for_the_same_cl
 }
 
 #[test]
+fn the_same_external_output_in_another_block_is_not_credited_twice() {
+    let mut s = vault_sim();
+    let me = s.user.addr();
+    let a = claim(Scheme::Taproot, 1, 50_000, me);
+    // the same output after a reorg: another block, another claim id
+    let mut b = a.clone();
+    b.height += 1;
+    b.block_hash = [0x77; 32];
+    assert_ne!(a.id(), b.id());
+    assert_eq!(a.outpoint_id(), b.outpoint_id());
+    for v in 0..3 {
+        let tx = s.cross(
+            v,
+            CrossOp::Attest {
+                claims: vec![a.clone()],
+            },
+        );
+        ok(&s.one(tx));
+    }
+    assert_eq!(
+        vault::balance_of(s.kv(), Scheme::Taproot, &me).unwrap(),
+        50_000
+    );
+    for v in 0..4 {
+        let tx = s.cross(
+            v,
+            CrossOp::Attest {
+                claims: vec![b.clone()],
+            },
+        );
+        ok(&s.one(tx));
+    }
+    assert_eq!(
+        vault::balance_of(s.kv(), Scheme::Taproot, &me).unwrap(),
+        50_000
+    );
+    // the credited output is a spendable vault UTXO, once
+    assert_eq!(vault::utxo(s.kv(), &a.txid, 0).unwrap(), Some(50_000));
+    assert_eq!(vault::utxos(s.kv(), 10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_bitcoin_withdrawal_plan_is_checked_by_the_chain_and_spends_each_utxo_once() {
+    use btb_chain::vault_plan::BtcTx;
+    use btb_oracle::frost::addr;
+    let mut s = vault_sim();
+    let me = s.user.addr();
+    let dep = claim(Scheme::Taproot, 1, 50_000, me);
+    for v in 0..3 {
+        let tx = s.cross(
+            v,
+            CrossOp::Attest {
+                claims: vec![dep.clone()],
+            },
+        );
+        ok(&s.one(tx));
+    }
+    let vkey = vault::output_key(s.kv(), Scheme::Taproot, 0)
+        .unwrap()
+        .unwrap();
+    let vscript = addr::taproot_script_pubkey(&vkey);
+    let mut dest = vec![0x51, 0x20];
+    dest.extend_from_slice(&[0xAB; 32]);
+    let tx = s.user.sign(TxKind::Cross(CrossOp::Withdraw {
+        asset: Scheme::Taproot,
+        amount: 20_000,
+        destination: dest.clone(),
+    }));
+    let r = s.one(tx);
+    ok(&r);
+    let wid = u64::from_le_bytes(r.output.clone().try_into().unwrap());
+    let mk = |txid: [u8; 32], pay: u64, to: &[u8], change: u64| BtcTx {
+        version: 2,
+        inputs: vec![(txid, 0, 0xFFFF_FFFD)],
+        outputs: vec![(pay, to.to_vec()), (change, vscript.clone())],
+        lock_time: 0,
+    };
+    let propose = |s: &mut Sim, v: usize, t: &BtcTx, sh: [u8; 32]| {
+        let tx = s.cross(
+            v,
+            CrossOp::Prepare {
+                withdrawal: wid,
+                digest: t.txid(),
+                sighashes: vec![sh],
+                plan: t.serialize(),
+            },
+        );
+        s.one(tx)
+    };
+    let sighash =
+        |t: &BtcTx, amount: u64| t.taproot_sighash(0, &[(amount, vscript.clone())]).unwrap();
+    // wrong destination, over-payment, wrong sighash: BadPlan
+    let bad_dest = mk(dep.txid, 19_000, &[0x51, 0x20, 1], 31_000);
+    assert_eq!(
+        xerr(&propose(&mut s, 0, &bad_dest, sighash(&bad_dest, 50_000))),
+        CrossError::Vault(VaultError::BadPlan)
+    );
+    let overpay = mk(dep.txid, 21_000, &dest, 29_000);
+    assert_eq!(
+        xerr(&propose(&mut s, 0, &overpay, sighash(&overpay, 50_000))),
+        CrossError::Vault(VaultError::BadPlan)
+    );
+    let good = mk(dep.txid, 19_000, &dest, 30_000);
+    assert_eq!(
+        xerr(&propose(&mut s, 0, &good, [9; 32])),
+        CrossError::Vault(VaultError::BadPlan)
+    );
+    // an input the vault does not hold
+    let ghost = mk([0xEE; 32], 19_000, &dest, 30_000);
+    assert_eq!(
+        xerr(&propose(&mut s, 0, &ghost, sighash(&ghost, 50_000))),
+        CrossError::Vault(VaultError::UtxoUnavailable)
+    );
+    // the good plan: three votes make it final, the input is spent and the change appears
+    let sh = sighash(&good, 50_000);
+    for v in 0..3 {
+        ok(&propose(&mut s, v, &good, sh));
+    }
+    let w = vault::withdrawal(s.kv(), wid).unwrap().unwrap();
+    assert_eq!(w.status, vault::STATUS_PREPARED);
+    assert_eq!(w.plan, good.serialize());
+    assert_eq!(vault::utxo(s.kv(), &dep.txid, 0).unwrap(), None);
+    assert_eq!(vault::utxo(s.kv(), &good.txid(), 1).unwrap(), Some(30_000));
+    let req = xsign::get(s.kv(), w.requests[0]).unwrap().unwrap();
+    assert_eq!(req.message, sh.to_vec());
+    // a second withdrawal cannot spend the consumed output
+    let tx = s.user.sign(TxKind::Cross(CrossOp::Withdraw {
+        asset: Scheme::Taproot,
+        amount: 10_000,
+        destination: dest.clone(),
+    }));
+    let r = s.one(tx);
+    ok(&r);
+    let wid2 = u64::from_le_bytes(r.output.try_into().unwrap());
+    let again = mk(dep.txid, 9_000, &dest, 40_000);
+    let tx = s.cross(
+        0,
+        CrossOp::Prepare {
+            withdrawal: wid2,
+            digest: again.txid(),
+            sighashes: vec![sighash(&again, 50_000)],
+            plan: again.serialize(),
+        },
+    );
+    assert_eq!(
+        xerr(&s.one(tx)),
+        CrossError::Vault(VaultError::UtxoUnavailable)
+    );
+}
+
+#[test]
 fn only_current_validators_can_attest_and_claims_are_validated() {
     let mut s = vault_sim();
     let me = s.user.addr();
@@ -849,6 +1003,7 @@ fn a_withdrawal_burns_first_is_prepared_once_and_signed_for_exactly_one_transact
                 withdrawal: wid,
                 digest,
                 sighashes,
+                plan: vec![],
             },
         );
         s.one(tx)
@@ -891,6 +1046,7 @@ fn a_withdrawal_burns_first_is_prepared_once_and_signed_for_exactly_one_transact
             withdrawal: wid,
             digest: [1; 32],
             sighashes: vec![evil],
+            plan: vec![],
         },
     );
     assert_eq!(
@@ -1054,6 +1210,7 @@ fn prepared_request(s: &mut Sim, scheme: Scheme) -> u64 {
                     withdrawal: wid,
                     digest: [wid as u8; 32],
                     sighashes: vec![sighash],
+                    plan: vec![],
                 },
             );
             ok(&s.one(tx));
@@ -1284,6 +1441,7 @@ fn cross_transactions_round_trip_through_the_wire_format() {
             withdrawal: 9,
             digest: [8; 32],
             sighashes: vec![[1; 32], [2; 32]],
+            plan: vec![],
         },
         CrossOp::Withdraw {
             asset: Scheme::Ed25519,

@@ -238,6 +238,10 @@ fn sdk_oracle_host_call_numbers_match_the_vm() {
     assert_eq!(num::RANDOM_BYTES, abi::RANDOM_BYTES);
     assert_eq!(num::PRICE, abi::PRICE);
     assert_eq!(num::REPORT_REQUEST, abi::REPORT_REQUEST);
+    assert_eq!(num::PRICE_TWAP, abi::PRICE_TWAP);
+    assert_eq!(num::PRICE_PAUSED, abi::PRICE_PAUSED);
+    assert_eq!(num::PRICE_BAD_WINDOW, abi::PRICE_BAD_WINDOW);
+    assert_eq!(btb_sdk::oracle::MAX_TWAP_WINDOW, abi::MAX_TWAP_WINDOW);
     assert_eq!(
         btb_sdk::oracle::MAX_REPORT_BYTES as u64,
         abi::MAX_REPORT_BYTES

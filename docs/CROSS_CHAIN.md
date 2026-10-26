@@ -22,14 +22,14 @@ NEAR (Chain Signatures) and the Internet Computer (Chain Fusion) already run thi
 | On-chain DKG per epoch and resharing that keeps the group key, so external addresses never change (`btb-chain::xdkg`, `xdkg_agent`) | built |
 | Signature requests, FROST rounds over the oracle side channel, preprocessed nonces, signature stored on chain and served over RPC (`xsign`, `btb-node::cross`) | built |
 | Misbehaviour evidence (bad share, nonce equivocation), exclusion from signer sets | built; **no slashing yet** |
-| Native vault: wrapped user tokens minted only against deposits two thirds of the stake observed; withdrawals burn first, then validators agree on the unsigned transaction and FROST signs its sighashes (`btb-chain::vault`) | built, with a **mock observer** |
-| Deposit/withdrawal watchers for Bitcoin and Solana (real nodes, confirmations, UTXO selection, fees, broadcast, execution confirmation) | planned |
-| Chain-side parsing of the external transaction (the chain checks that the prepared transaction pays the burned amount to the destination) | planned; today this rests on the two-thirds agreement |
+| Native vault: wrapped user tokens minted only against deposits two thirds of the stake observed; withdrawals burn first, then validators agree on the unsigned transaction and FROST signs its sighashes (`btb-chain::vault`) | built; real watchers below, the mock observer remains for tests |
+| Deposit/withdrawal watchers for Bitcoin and Solana: Esplora or bitcoind and Solana JSON-RPC, confirmations, reorgs, chain-state UTXO set, coin selection, fees, FROST-signed withdrawals, broadcast and confirmation tracking (`btb-node::watch`, [Chain watchers](#chain-watchers)) | built; tested against local mock servers only, **not yet against real networks** |
+| Chain-side parsing of the external transaction (the chain checks that the prepared transaction pays the burned amount to the destination) | built for Bitcoin (inputs, outputs, txid, BIP-341 sighashes) and Solana (one System transfer); a proposal with an empty plan (mock observer) is not checked |
 | Ethereum vault and threshold ECDSA | planned |
 | Refunds for withdrawals that can never execute; vault caps; per-contract derived keys (`eth.send_tx(...)` style host calls) | planned |
 | Light-client verification instead of validator-agreed observations | planned |
 
-The parent roadmap item stays open until Ethereum, Bitcoin and Solana vaults run with real chain watchers.
+The parent roadmap item stays open until Ethereum, Bitcoin and Solana vaults run with real chain watchers; Bitcoin and Solana are built (mock-tested), Ethereum is not.
 
 ## Keys
 
@@ -60,7 +60,53 @@ A native module queues a request (32-byte message, scheme) with `xsign::request`
 * **Wrapped assets are user tokens, never BTB.** They live in the native token ledger with the vault as sole mint authority (`wBTC`, 8 decimals; `wSOL`, 9). The fixed BTB supply is untouched; the vault code never reads or writes a BTB balance (every block still checks the supply invariant).
 * **Minted only against observed deposits.** Validators vote (`Attest`) for a deposit claim (`txid`, index, amount, recipient named in the deposit memo). A claim is credited once, when voters hold at least two thirds of the epoch's stake for the *identical* claim. Invariant tested: `supply == credited - burned`, and credited equals the quorum-confirmed deposits.
 * **Withdrawals burn before they sign.** `Withdraw` burns at once. Validators vote (`Prepare`) for the unsigned external transaction (digest and sighashes); at two thirds, one signing request per sighash is queued. A withdrawal is prepared at most once, so one burn cannot yield two signed transactions.
-* The observer is an interface (`vault::Observer`); the mock is the only implementation. The memo format for the recipient (Bitcoin `OP_RETURN`, Solana memo) is part of the planned watchers.
+* The observer is an interface (`vault::Observer`): `deposits`, `prepare_with` (unsigned transaction), `broadcast` and `execution`. The real implementation is `btb_node::watch::Watchers`; `MockObserver` is for tests.
+
+## Chain watchers
+
+Every validator runs its own watchers (`crates/btb-node/src/watch`) against **its own configured endpoints** and votes only for what it saw itself. Nothing a validator says is trusted: the chain mints at two thirds of the stake agreeing on the identical claim, so a wrong, lagging or malicious endpoint costs one vote. Network I/O runs on one background thread per chain; the consensus driver only reads the snapshot (`Observer::deposits`) and queues work (`broadcast`), so a slow RPC never stalls a block.
+
+### Claims
+
+A claim is `(asset, txid, index, amount, recipient, height, block_hash)`. Height and block hash are part of the claim's id, so validators that see the deposit in different blocks (a reorg inside the confirmation window) vote for different claims and nothing is minted until two thirds agree. A **second guard** is keyed by the output alone (`asset, txid, index`): the first claim to reach quorum credits, and the same output re-appearing in another block after a deeper reorg can never be credited again.
+
+### Bitcoin
+
+* **Backend, operator's choice.** An Esplora-compatible REST API (`esplora`), or bitcoind JSON-RPC (`rpc`: `getblockcount`, `getblockhash`, `getblock <hash> 0`). Parsing is strict: Esplora transactions are fetched as raw hex, decoded with the `bitcoin` crate, and the txid is **recomputed** (a mismatch aborts the observation); bitcoind blocks must hash to the requested hash and have a valid merkle root; malformed JSON, unconfirmed transactions, and anything unexpected produce no claim. The scan is re-checked against the block hash at the claimed height.
+* **Confirmations.** A deposit is claimed when its block has at least `confirmations` (default 6, config) confirmations, counting its own. Only then is it voted; the chain additionally requires two thirds of the stake.
+* **Memo / recipient: `OP_RETURN`.** A deposit is a transaction with an output to the vault's Taproot script and **exactly one** `OP_RETURN` output of the form `6a 20 <32-byte BTB address>`. No memo, a second `OP_RETURN` or any other payload: not claimed (the funds stay in the vault, unattributable, and are not credited). *Why not per-recipient derived deposit addresses:* they would need FROST signing under a tweaked key (each derived output has its own key), which `btb-oracle::frost` does not support yet; the single key-path key keeps signing and the UTXO set simple. Derived addresses remain the preferable end state because wallets cannot forget an `OP_RETURN`.
+* **UTXO set in chain state** (`70 56`): a credited deposit adds `(txid, vout) -> amount`; a prepared withdrawal removes its inputs and adds its change output. An output is therefore spendable once; two withdrawals can never be prepared on the same input (the second `Prepare` fails with `UtxoUnavailable` and validators re-propose with the updated set).
+* **Withdrawal transaction.** Deterministic: coin selection is largest-first, ties by outpoint, over the chain-state set, stopping when the inputs cover the burn (at most 16 inputs). Output 0 pays the destination `amount - fee`, output 1 (if at least 330 sats) returns change to the vault, so the vault's outflow equals the burn and the fee is paid by the withdrawing user. Version 2, RBF-signalling sequence, key-path spend. Fee = estimated vsize x fee rate. **Fee rate:** validators must propose the same transaction to reach quorum, so the rate is a config floor (`fee_rate`, sat/vB) and, optionally, an estimate (`fee_estimate_blocks`, Esplora `/fee-estimates` or `estimatesmartfee`) rounded **up to a multiple of 5**; operators should configure the same floor. Validators that disagree simply do not reach quorum and re-propose when their estimates converge.
+* **Binding.** `Prepare` carries the unsigned transaction (`plan`, the bytes that hash to the txid). The chain parses it, checks that every input is a vault UTXO, that output 0 pays the destination, that the optional change goes to the vault script, that the outflow equals the burn (a sub-dust remainder may go to miners), and **recomputes the BIP-341 sighashes** and the txid itself. A proposal that does not match is refused (`BadPlan`).
+* **After signing.** Every validator assembles the witness (`signature` as the single stack item, 64 bytes, `SIGHASH_DEFAULT`) from the plan and the stored signatures, broadcasts it (Esplora `POST /tx`, `sendrawtransaction`; "already known" is success), and tracks it until `confirmations`. Broadcasting is idempotent and repeated if the endpoint forgets the transaction.
+
+**Reorgs.** Claims exist only at depth >= N, and are re-checked against the current block hash. If a claimed transaction disappears before two thirds have voted, the claim never reaches quorum: validators that see it gone do not vote, and the claim ids differ if it comes back in another block. *Residual risk:* a reorg deeper than N that happens after a quorum minted. The wrapped tokens then exist without backing until the deposit re-confirms (it usually does) or is lost for good, which would be a vault deficit. Choose N for the vault's value (6 is the conventional default; large deposits may warrant more), and use vault caps (planned). Votes already sent cannot be retracted.
+
+### Solana
+
+* **Deposits** are read with `getSignaturesForAddress` (finalized) and `getTransaction` (finalized, `json`). Finalized is final: there is no confirmation count. A transaction counts if it succeeded, its first signature is the one asked for, it has no address-table lookups, it contains top-level System `Transfer` instructions into the vault and **exactly one** Memo instruction (v1 or v2) whose text is the recipient as 64 hex digits, and the vault's balance grew by at least the transferred sum. The claim's `txid` is the first 32 bytes of the signature, `index` the instruction index, `height` the slot and `block_hash` the block's blockhash (`getBlock`). One malformed answer costs that transaction (retried next poll), not the others.
+* **Withdrawals** are a legacy message with one System `Transfer` from the vault (the vault pays the 5000-lamport fee; keep it funded). FROST-Ed25519 signs the **message** itself (signing requests carry up to 1232 bytes). The chain re-derives and checks the message (`vault_plan::check_sol`).
+* **The recent blockhash is agreed before signing.** It is part of the signed message, so validators must propose the same one. Each takes `getSlot(finalized)`, rounds down to a multiple of `blockhash_window` (default 16 slots), walks down to the nearest non-skipped block and uses that block's hash. Validators whose finalized slots fall in the same window propose identical plans; the two-thirds vote on the plan is the agreement, and validators near a window boundary re-propose a window later. *Residual risk:* a blockhash is valid for about 150 slots (~1 minute) after its slot, and a finalized slot is already ~32 behind the tip. If signing plus broadcast takes longer, the transaction is rejected (`Failed` execution), the burn stands and the refund is planned. A durable-nonce account would remove the expiry (planned).
+* **Broadcast** is `sendTransaction` (base64), tracked with `getSignatureStatuses` until `finalized`; a dropped transaction is re-sent.
+
+### Config
+
+`node.json` gets a `watch` section (see [NODE.md](NODE.md#config-nodejson)); a validator without it votes for nothing. Endpoints are the operator's own (private addresses are fine); plain `http://` is accepted only for loopback or with `allow_http`. Run your own full node: `https://` to a third-party provider makes that provider your trust root. Operators should use **independent** endpoints; two thirds of the stake ending up on one provider makes that provider the bridge's trust root.
+
+```json
+"watch": {
+  "bitcoin": { "esplora": "https://esplora.example/api",
+               "network": "mainnet", "confirmations": 6, "fee_rate": 10,
+               "fee_estimate_blocks": 3, "poll_ms": 10000 },
+  "solana":  { "rpc": "https://solana-rpc.example", "blockhash_window": 16, "poll_ms": 5000 }
+}
+```
+
+Bitcoin alternatively: `"rpc": {"url": "http://127.0.0.1:8332", "user": "...", "password": "..."}` with `scan_blocks` (default 144: how many blocks ending at the deepest confirmed one are scanned per poll; deposits older than that are not seen). `network` is `mainnet`, `testnet`, `signet` or `regtest`.
+
+### Tests
+
+No external network: `crates/btb-node/tests/watch_common` serves mock Esplora, bitcoind and Solana endpoints. `watchers.rs` covers depth, reorgs (vanished and re-included transactions), unconfirmed/memo-less/ambiguous/wrong-script outputs, malformed JSON, a lying raw transaction, a bitcoind block that does not match its hash, fee bucketing, the builder against the chain's independent sighash checker, deterministic selection and the blockhash window. `watchers_cluster.rs` runs four validators with four independent mock chains: a deposit at depth 1 mints nothing, one validator's endpoint lies (no effect), a deposit seen by only two of four mints nothing until a third sees it; withdrawals are signed, broadcast to every endpoint, the raw transactions are parsed with the `bitcoin` crate and the Taproot signature verified, the second withdrawal spends the first one's change and not the spent deposit; Solana deposit, withdrawal with the agreed blockhash, `ed25519-dalek` verification, finalization. `btb-chain/tests/cross.rs` covers the plan checks, double spends and the outpoint replay guard.
 
 ## Threat model
 
@@ -70,8 +116,10 @@ A native module queues a request (32-byte message, scheme) with `xsign::request`
 | Nonce reuse leaking a share | single-use persisted nonces | disk failure that rolls back the file |
 | Fewer than `t` colluding holders | information-theoretic | none |
 | `t` or more validators collude | can sign anything for every vault | vault caps; stake must exceed vault value |
-| Validators lie about a deposit | two thirds of stake must agree | same collusion bound; real watchers, light clients planned |
-| Prepared transaction does not match the burn | two-thirds agreement only | chain-side parsing planned |
+| Validators lie about a deposit | two thirds of stake must agree, each from its own endpoint | same collusion bound; shared providers; light clients planned |
+| Reorg deeper than the confirmation depth after a mint | depth N, block hash in the claim, replay guard per output | wrapped tokens unbacked until the deposit re-confirms; vault caps planned |
+| Solana blockhash expires before broadcast | agreed recent anchor, re-broadcast | burn stands, refund planned |
+| Prepared transaction does not match the burn | Bitcoin and Solana: the chain re-derives the check; two-thirds agreement | mock (empty plan) proposals are unchecked |
 | Withdrawal burned but never executable | none yet | refunds planned |
 | Reshare fails and fewer than `t` old holders remain validators | key is stuck (funds frozen) | churn limits, caps; degraded-mode recovery of the beacon does not apply to vault keys |
 | A validator floods fake claims | each costs fees | per-validator claim quota planned |

@@ -63,7 +63,7 @@ pub mod prelude {
     pub use crate::host::{
         abort, block_height, caller, contract_address, token_balance, token_transfer, Key,
     };
-    pub use crate::oracle::{price, random, Price};
+    pub use crate::oracle::{price, price_checked, price_twap, random, Price, PriceError, Twap};
     pub use crate::table::Table;
     pub use crate::token::Token;
     pub use alloc::string::String;

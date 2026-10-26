@@ -55,6 +55,8 @@ pub enum CrossOp {
         withdrawal: u64,
         digest: [u8; 32],
         sighashes: Vec<[u8; 32]>,
+        /// The unsigned external transaction, checked by the chain (`vault_plan`); may be empty.
+        plan: Vec<u8>,
     },
     Withdraw {
         asset: Scheme,
@@ -179,11 +181,13 @@ impl CrossOp {
                 withdrawal,
                 digest,
                 sighashes,
+                plan,
             } => {
                 5u8.encode_to(out);
                 withdrawal.encode_to(out);
                 digest.encode_to(out);
                 sighashes.encode_to(out);
+                plan.encode_to(out);
             }
             CrossOp::Withdraw {
                 asset,
@@ -244,6 +248,7 @@ impl CrossOp {
                 withdrawal: u64::decode_from(r)?,
                 digest: <[u8; 32]>::decode_from(r)?,
                 sighashes: Vec::decode_from(r)?,
+                plan: Vec::decode_from(r)?,
             },
             6 => CrossOp::Withdraw {
                 asset: scheme(r)?,
@@ -354,14 +359,18 @@ pub(crate) fn apply(
             withdrawal,
             digest,
             sighashes,
+            plan,
         } => Ok(vault::apply_prepare(
             kv,
             epoch,
             height,
             sender_key,
-            *withdrawal,
-            digest,
-            sighashes,
+            vault::Proposal {
+                id: *withdrawal,
+                digest,
+                sighashes,
+                plan,
+            },
         )?),
         CrossOp::Withdraw {
             asset,

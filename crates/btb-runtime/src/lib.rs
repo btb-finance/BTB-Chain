@@ -15,6 +15,7 @@ pub mod readset;
 pub mod rocks;
 pub mod subscribe;
 pub mod tables;
+pub mod twap;
 
 pub use host::{Fault, RuntimeHost};
 pub use kv::{KvError, KvStore, MemKv, Overlay, WriteBatch};

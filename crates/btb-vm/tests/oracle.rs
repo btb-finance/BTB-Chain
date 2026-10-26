@@ -154,6 +154,7 @@ fn price_call_reads_gas_and_not_found() {
             price: 6_500_012_345_678,
             height: 77,
             decimals: 8,
+            paused: false,
         },
     );
     let mut vm = vm_with(abi::PRICE, [3, 512, 0, 0], false);
@@ -182,6 +183,65 @@ fn price_call_reads_gas_and_not_found() {
     const { assert!(gas::HOST_PRICE_MUTATION > gas::HOST_PRICE_QUERY) };
     // output window outside memory traps
     let mut vm = vm_with(abi::PRICE, [3, 4090, 0, 0], false);
+    assert!(matches!(
+        run_with_host(&mut vm, &mut h),
+        Err(Trap::MemoryOutOfBounds { .. })
+    ));
+}
+
+#[test]
+fn price_paused_and_twap_calls() {
+    use btb_vm::TwapOutcome;
+    let mut h = MemHost::default();
+    h.prices.insert(
+        1,
+        PriceRecord {
+            price: 5,
+            height: 9,
+            decimals: 2,
+            paused: true,
+        },
+    );
+    let mut vm = vm_with(abi::PRICE, [1, 512, 0, 0], false);
+    assert_eq!(run_with_host(&mut vm, &mut h), Ok(Exit::Halt));
+    assert_eq!(vm.reg(10), abi::PRICE_PAUSED);
+    assert_eq!(vm.read_mem(512, 32).unwrap(), vec![0u8; 32]);
+
+    h.twaps.insert(
+        (1, 10),
+        TwapOutcome::Ok {
+            twap: 123_456,
+            decimals: 2,
+        },
+    );
+    h.twaps.insert((2, 10), TwapOutcome::Paused);
+    h.twaps.insert((3, 10), TwapOutcome::BadWindow);
+    let mut vm = vm_with(abi::PRICE_TWAP, [1, 10, 512, 0], false);
+    assert_eq!(run_with_host(&mut vm, &mut h), Ok(Exit::Halt));
+    assert_eq!(vm.reg(10), 0);
+    assert_eq!(vm.gas_used(), 2 + gas::HOST_TWAP_MUTATION);
+    let out = vm.read_mem(512, 32).unwrap();
+    assert_eq!(u128::from_le_bytes(out[..16].try_into().unwrap()), 123_456);
+    assert_eq!(u32::from_le_bytes(out[16..20].try_into().unwrap()), 10);
+    assert_eq!(out[20], 2);
+    for (args, want) in [
+        ([2u64, 10, 512, 0], abi::PRICE_PAUSED),
+        ([3, 10, 512, 0], abi::PRICE_BAD_WINDOW),
+        ([4, 10, 512, 0], abi::NOT_FOUND),
+        ([1, 0, 512, 0], abi::PRICE_BAD_WINDOW),
+        ([1, abi::MAX_TWAP_WINDOW + 1, 512, 0], abi::PRICE_BAD_WINDOW),
+        ([1 << 40, 10, 512, 0], abi::NOT_FOUND),
+    ] {
+        let mut vm = vm_with(abi::PRICE_TWAP, args, false);
+        assert_eq!(run_with_host(&mut vm, &mut h), Ok(Exit::Halt));
+        assert_eq!(vm.reg(10), want, "{args:?}");
+    }
+    h.read_only = true;
+    let mut vm = vm_with(abi::PRICE_TWAP, [1, 10, 512, 0], false);
+    assert_eq!(run_with_host(&mut vm, &mut h), Ok(Exit::Halt));
+    assert_eq!(vm.gas_used(), 2 + gas::HOST_TWAP_QUERY);
+    const { assert!(gas::HOST_TWAP_MUTATION > gas::HOST_TWAP_QUERY) };
+    let mut vm = vm_with(abi::PRICE_TWAP, [1, 10, 4090, 0], false);
     assert!(matches!(
         run_with_host(&mut vm, &mut h),
         Err(Trap::MemoryOutOfBounds { .. })

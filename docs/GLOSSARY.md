@@ -10,6 +10,8 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 
 **Chain signatures.** Signatures produced jointly by validators with threshold keys, which control ordinary addresses on other chains such as Ethereum, Bitcoin and Solana. They let BTB contracts act on those chains without deploying contracts there. See [Cross-chain](CROSS_CHAIN.md#writing-chain-signatures).
 
+**Circuit breaker (price feed).** The rule that pauses a price feed whose aggregate moves more than a set percentage within a set number of blocks. While paused, `price` and `price_twap` return `PRICE_PAUSED`; the feed resumes by itself after a set number of consecutive stable blocks. See [Oracles](ORACLES.md#update-rule-circuit-breaker-and-twap-built).
+
 **Core validator.** A staked node that runs consensus, executes mutations and crons, keeps full state, and takes part in threshold signing and the randomness beacon. See [Architecture](ARCHITECTURE.md#core-validators).
 
 **Cron.** A function kind that is a mutation run on a schedule, by block height or block timestamp and never a local clock. It is paid from the contract's prepaid balance. See [Languages](LANGUAGE.md#four-function-kinds).
@@ -51,6 +53,8 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 **Storage node.** A node with spare disk that holds erasure-coded file pieces, proves it still has them, and earns per period. See [Architecture](ARCHITECTURE.md#storage-nodes-and-edge-nodes).
 
 **Subscription.** A live query: the node pushes a new result whenever a block changes the data the query read. See [Architecture](ARCHITECTURE.md#state-model).
+
+**TWAP (time-weighted average price).** The average of a feed's price over the last N blocks, read with the `price_twap` host call. Computed in integer math from cumulative checkpoints written at each publication. See [Oracles](ORACLES.md#update-rule-circuit-breaker-and-twap-built).
 
 **Table.** A contract-declared database table with a primary key and optional indexes, which is how BTB state is modeled. See [Architecture](ARCHITECTURE.md#state-model).
 

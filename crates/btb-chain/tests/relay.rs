@@ -5,7 +5,8 @@ use btb_chain::*;
 use btb_runtime::MemKv;
 use support::*;
 
-const RICH: u64 = 10 * UNITS_PER_BTB;
+const RICH: u64 = 20_000 * UNITS_PER_BTB;
+const BOND: u64 = 10_000 * UNITS_PER_BTB;
 
 fn net(wallets: &[&Wallet]) -> Net<MemKv> {
     Net::new(MemKv::new(), &genesis(wallets, RICH))
@@ -71,6 +72,73 @@ fn without_a_usable_relayer_the_validator_pool_gets_it_all() {
     assert_eq!(n.bal(&host.addr()), host_bal);
     assert_eq!(n.bal(&[0x77; 32]), 0);
     assert_eq!(n.state.relay_pool_balance().unwrap(), 0);
+    assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
+}
+
+#[test]
+fn bond_is_required_locked_and_counted() {
+    let (mut poor, mut host, other) = (Wallet::new(1), Wallet::new(2), Wallet::new(3));
+    let mut cfg = ChainConfig::new(CHAIN_ID);
+    cfg.host_unbonding_blocks = 5;
+    let mut g = genesis_with(&[&host, &other], RICH, cfg);
+    let t = g.allocations.len() - 1;
+    g.allocations[t].1 -= 5 * UNITS_PER_BTB;
+    g.allocations.push((poor.addr(), 5 * UNITS_PER_BTB));
+    let mut n = Net::new(MemKv::new(), &g);
+    // too poor for the bond: refused, not registered, nothing locked
+    let r = n.run(vec![register(&mut poor)]);
+    assert_eq!(
+        r[0].status,
+        Status::Reverted(Revert::Host(HostError::InsufficientBond))
+    );
+    assert!(!is_registered(&n, &poor));
+    // registering locks exactly the bond (plus the gas fee)
+    let before = n.bal(&host.addr());
+    let r = n.run(vec![register(&mut host)]);
+    ok(&r[0]);
+    assert_eq!(n.bal(&host.addr()), before - BOND - r[0].fee);
+    assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
+    // re-registering only changes the URL: no second bond
+    let before = n.bal(&host.addr());
+    let r = n.run(vec![register(&mut host)]);
+    ok(&r[0]);
+    assert_eq!(n.bal(&host.addr()), before - r[0].fee);
+    // unregistering stops the relay share at once; the bond stays locked until it matures
+    let r = n.run(vec![host.sign(TxKind::Host(HostOp::Unregister))]);
+    ok(&r[0]);
+    let locked = n.bal(&host.addr());
+    assert!(!is_registered(&n, &host));
+    assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
+    let unbonding = n.state.host_unbonding(&host.addr()).unwrap();
+    assert_eq!(unbonding.len(), 1);
+    assert_eq!(unbonding[0].1, BOND);
+    let mature = unbonding[0].0;
+    let head = n.state.head().unwrap().height;
+    assert_eq!(mature, head + 5);
+    n.empty_blocks(mature - head - 1);
+    assert_eq!(n.bal(&host.addr()), locked, "still locked before maturity");
+    assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
+    n.run(vec![]);
+    assert_eq!(n.bal(&host.addr()), locked + BOND, "released at maturity");
+    assert!(n.state.host_unbonding(&host.addr()).unwrap().is_empty());
+    assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
+}
+
+fn is_registered(n: &Net<MemKv>, w: &Wallet) -> bool {
+    n.state.host_url(&w.addr()).unwrap().is_some()
+}
+
+#[test]
+fn bonded_self_rebate_is_a_priced_discount() {
+    // A sender that bonds a second account and names it earns 20% back: documented, bounded
+    // by the locked bond, and supply neutral.
+    let (mut user, mut alt, other) = (Wallet::new(1), Wallet::new(2), Wallet::new(3));
+    let mut n = net(&[&user, &alt, &other]);
+    ok(&n.run(vec![register(&mut alt)])[0]);
+    let before = n.bal(&alt.addr());
+    let r = n.run(vec![user.sign_relayed(pay(other.addr()), Some(alt.addr()))]);
+    ok(&r[0]);
+    assert_eq!(n.bal(&alt.addr()), before + r[0].fee / 5);
     assert_eq!(n.state.total_supply().unwrap(), u128::from(TOTAL_SUPPLY));
 }
 

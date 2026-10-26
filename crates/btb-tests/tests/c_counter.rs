@@ -175,6 +175,9 @@ fn header_call_numbers_match_abi() {
         ("BTB_RANDOM_BYTES", abi::RANDOM_BYTES),
         ("BTB_PRICE", abi::PRICE),
         ("BTB_REPORT_REQUEST", abi::REPORT_REQUEST),
+        ("BTB_PRICE_TWAP", abi::PRICE_TWAP),
+        ("BTB_PRICE_PAUSED", abi::PRICE_PAUSED),
+        ("BTB_PRICE_BAD_WINDOW", abi::PRICE_BAD_WINDOW),
         ("BTB_TOKEN_OK", abi::TOKEN_OK),
         ("BTB_TOKEN_INVALID", abi::TOKEN_INVALID),
         ("BTB_TOKEN_INSUFFICIENT", abi::TOKEN_INSUFFICIENT),
@@ -191,6 +194,8 @@ fn header_call_numbers_match_abi() {
         .lines()
         .filter_map(|l| l.strip_prefix("#define "))
         .filter_map(|l| l.split_once(' '))
+        // Drop trailing `/* ... */` comments so only the value is parsed.
+        .map(|(n, v)| (n, v.split("/*").next().unwrap_or(v)))
         .collect();
     for (name, num) in want {
         let (_, v) = defines

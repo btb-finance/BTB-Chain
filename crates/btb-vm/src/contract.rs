@@ -464,6 +464,9 @@ impl<H: Host> Host for ReadOnly<'_, H> {
     fn price(&mut self, pair: u32) -> Option<crate::host::PriceRecord> {
         self.0.price(pair)
     }
+    fn price_twap(&mut self, pair: u32, window: u64) -> crate::host::TwapOutcome {
+        self.0.price_twap(pair, window)
+    }
     fn report_request(&mut self, data: &[u8]) -> Option<u64> {
         self.0.report_request(data)
     }

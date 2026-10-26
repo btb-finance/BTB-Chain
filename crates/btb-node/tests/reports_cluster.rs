@@ -106,6 +106,7 @@ impl Cluster {
                 group_key: group.encode(),
                 holders: keys.iter().map(|k| k.verifying_key().to_bytes()).collect(),
                 dkg_window: 20,
+                rules: Default::default(),
                 pairs: vec![],
                 max_age_blocks: 200,
             }),

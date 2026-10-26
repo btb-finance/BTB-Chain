@@ -16,11 +16,14 @@ pub mod hex;
 pub mod net;
 pub mod oracle;
 pub mod oracle_rpc;
+pub mod price_sources;
 pub mod reports;
 pub mod rpc;
 pub mod storage;
 pub mod storage_rpc;
 pub mod sync;
+#[cfg(feature = "https")]
+pub mod watch;
 pub mod wire;
 
 use btb_chain::{ChainState, GenesisConfig};

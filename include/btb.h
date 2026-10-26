@@ -39,9 +39,12 @@
 #define BTB_RANDOM_BYTES 40
 #define BTB_PRICE 41
 #define BTB_REPORT_REQUEST 42
+#define BTB_PRICE_TWAP 43
 
 /* Results. */
 #define BTB_NOT_FOUND UINT64_MAX
+#define BTB_PRICE_PAUSED 1       /* price / price_twap: circuit breaker open */
+#define BTB_PRICE_BAD_WINDOW 2   /* price_twap: unusable window */
 #define BTB_TRANSFER_OK 0
 #define BTB_TRANSFER_INSUFFICIENT 1
 #define BTB_TABLE_OK 0
@@ -171,10 +174,19 @@ static inline void btb_random_bytes(uint8_t *out, uint64_t len) {
   btb_ecall5(BTB_RANDOM_BYTES, BTB_P(out), len, 0, 0, 0);
 }
 /* Latest agreed price of feed `pair`. Returns 0 and fills out (price u128 LE, height u64 LE,
- * decimals u8, 7 zero bytes) or BTB_NOT_FOUND. Free in queries; mutations and crons pay a
+ * decimals u8, 7 zero bytes), BTB_NOT_FOUND, or BTB_PRICE_PAUSED while the feed's circuit breaker
+ * is open (out is then untouched; handle it). Free in queries; mutations and crons pay a
  * per-read fee in gas. */
 static inline uint64_t btb_price(uint32_t pair, uint8_t out[32]) {
   return btb_ecall5(BTB_PRICE, pair, BTB_P(out), 0, 0, 0);
+}
+
+/* Time-weighted average price of feed `pair` over the last `window` blocks (1..=10000). Returns 0
+ * and fills out (twap u128 LE, window u32 LE, decimals u8, 11 zero bytes), BTB_NOT_FOUND,
+ * BTB_PRICE_PAUSED, or BTB_PRICE_BAD_WINDOW (0, too large, or longer than the feed's history).
+ * Free in queries; mutations and crons pay a per-read fee in gas. */
+static inline uint64_t btb_price_twap(uint32_t pair, uint64_t window, uint8_t out[32]) {
+  return btb_ecall5(BTB_PRICE_TWAP, pair, window, BTB_P(out), 0, 0);
 }
 
 /* Mutations and crons only. Asks the beacon committee to threshold-sign data (at most 1024 bytes)

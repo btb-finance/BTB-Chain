@@ -37,6 +37,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+/// Longest message a signing request may carry (a Solana transaction message fits in 1232).
+pub const MAX_MESSAGE: usize = 1232;
 pub const KEY_NEXT: u8 = 0x20;
 pub const KEY_REQ: u8 = 0x21;
 pub const KEY_PENDING: u8 = 0x22;
@@ -96,7 +98,8 @@ impl RequestTag {
 pub struct SignRequest {
     pub id: u64,
     pub scheme: Scheme,
-    pub message: [u8; 32],
+    /// What is signed: a 32-byte hash, or (Solana) the whole message, at most [`MAX_MESSAGE`].
+    pub message: Vec<u8>,
     /// Height of the block that queued it.
     pub height: u64,
     pub tag: RequestTag,
@@ -124,7 +127,7 @@ impl SignRequest {
         let q = SignRequest {
             id,
             scheme,
-            message: <[u8; 32]>::decode_from(&mut r)?,
+            message: Vec::<u8>::decode_from(&mut r)?,
             height: u64::decode_from(&mut r)?,
             tag: RequestTag::decode_from(&mut r)?,
             signature: Option::<Vec<u8>>::decode_from(&mut r)?,
@@ -360,7 +363,7 @@ pub fn request(
     kv: &mut impl KvStore,
     height: u64,
     scheme: Scheme,
-    message: [u8; 32],
+    message: Vec<u8>,
     tag: RequestTag,
 ) -> Result<u64, StateError> {
     let id = next_id(&*kv)?;

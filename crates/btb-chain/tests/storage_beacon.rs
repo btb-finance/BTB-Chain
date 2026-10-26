@@ -94,6 +94,7 @@ fn world(key_seed: u8) -> World {
         pairs: vec![],
         max_age_blocks: 20,
         dkg_window: 20,
+        rules: Default::default(),
     };
     let state = ChainState::from_genesis_full(MemKv::new(), &g, &vals, Some(&og)).unwrap();
     let mut w = World {

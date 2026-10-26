@@ -119,6 +119,14 @@ impl GenesisFile {
                 "holders": o.holders.iter().map(|h| hex::encode(h)).collect::<Vec<_>>(),
                 "max_age_blocks": o.max_age_blocks,
                 "dkg_window": o.dkg_window,
+                "rules": {
+                    "update_deviation_bps": o.rules.update_deviation_bps,
+                    "heartbeat_blocks": o.rules.heartbeat_blocks,
+                    "breaker_bps": o.rules.breaker_bps,
+                    "breaker_window": o.rules.breaker_window,
+                    "breaker_resume_blocks": o.rules.breaker_resume_blocks,
+                    "twap_max_window": o.rules.twap_max_window,
+                },
                 "pairs": o.pairs.iter()
                     .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
                     .collect::<Vec<_>>(),
@@ -247,9 +255,41 @@ fn oracle_from_json(o: &Value) -> Result<btb_chain::OracleGenesis, String> {
             .get("dkg_window")
             .and_then(Value::as_u64)
             .unwrap_or(btb_chain::oracle::DEFAULT_DKG_WINDOW),
+        rules: price_rules(o.get("rules"))?,
     };
     og.validate().map_err(|e| format!("genesis oracle: {e}"))?;
     Ok(og)
+}
+
+/// The optional `rules` object of the genesis oracle section; absent fields keep the defaults
+/// (`PriceRules::default`): `update_deviation_bps`, `heartbeat_blocks`, `breaker_bps`,
+/// `breaker_window`, `breaker_resume_blocks`, `twap_max_window`.
+fn price_rules(v: Option<&Value>) -> Result<btb_chain::oracle::PriceRules, String> {
+    let mut r = btb_chain::oracle::PriceRules::default();
+    let Some(v) = v else {
+        return Ok(r);
+    };
+    let get = |k: &str| -> Result<Option<u64>, String> {
+        match v.get(k) {
+            None => Ok(None),
+            Some(x) => x
+                .as_u64()
+                .map(Some)
+                .ok_or(format!("genesis oracle rules: `{k}` must be a number")),
+        }
+    };
+    let bps = |k: &str, d: u32| -> Result<u32, String> {
+        get(k)?.map_or(Ok(d), |x| {
+            u32::try_from(x).map_err(|_| format!("genesis oracle rules: `{k}` too large"))
+        })
+    };
+    r.update_deviation_bps = bps("update_deviation_bps", r.update_deviation_bps)?;
+    r.breaker_bps = bps("breaker_bps", r.breaker_bps)?;
+    r.heartbeat_blocks = get("heartbeat_blocks")?.unwrap_or(r.heartbeat_blocks);
+    r.breaker_window = get("breaker_window")?.unwrap_or(r.breaker_window);
+    r.breaker_resume_blocks = get("breaker_resume_blocks")?.unwrap_or(r.breaker_resume_blocks);
+    r.twap_max_window = get("twap_max_window")?.unwrap_or(r.twap_max_window);
+    Ok(r)
 }
 
 /// Key file: `{"secret": "<64 hex digits>"}`. The same Ed25519 key signs consensus messages and
@@ -364,6 +404,11 @@ pub struct NodeParams {
     /// Where this validator's price observations come from (a mock in tests; real exchange
     /// fetching is future work). `None`: the node reports no prices.
     pub price_source: Option<crate::oracle::PriceSource>,
+    /// Exchange endpoints per pair (`crate::price_sources`), used when `price_source` is `None`.
+    /// Fetched in the background with `fetch_policy`; empty: the node reports no prices.
+    pub price_sources: Vec<crate::price_sources::PairSources>,
+    /// How often the background thread refetches every source, milliseconds.
+    pub price_fetch_interval_ms: u64,
     /// How often the validator observes and signs prices, milliseconds.
     pub price_interval_ms: u64,
     /// Where the validator keeps its beacon key shares (`dkg_dir` in the node config; default
@@ -379,7 +424,7 @@ pub struct NodeParams {
     pub fetch_policy: crate::actions::FetchPolicy,
     /// What this validator sees of Bitcoin and Solana (deposits, withdrawal transactions) for
     /// the vault duties (`btb_chain::vault::Observer`). `None`: it votes for nothing. The real
-    /// chain watchers are future work; tests use `vault::MockObserver`.
+    /// real watchers are `crate::watch::Watchers` (config section `watch`); tests may use `vault::MockObserver`.
     pub observer: Option<std::sync::Arc<dyn btb_chain::vault::Observer>>,
     /// Cross-chain signing knobs (`crate::cross`).
     pub cross: crate::cross::CrossParams,
@@ -404,6 +449,8 @@ impl NodeParams {
             sync_poll_ms: None,
             oracle_share: None,
             price_source: None,
+            price_sources: Vec::new(),
+            price_fetch_interval_ms: 2_000,
             price_interval_ms: 1_000,
             dkg_dir: None,
             key_passphrase: None,
@@ -472,9 +519,30 @@ impl NodeParams {
         p.key_passphrase = std::env::var("BTB_KEY_PASSPHRASE")
             .ok()
             .filter(|s| !s.is_empty());
+        if let Some(w) = v.get("watch") {
+            #[cfg(feature = "https")]
+            {
+                let o: std::sync::Arc<dyn btb_chain::vault::Observer> =
+                    crate::watch::Watchers::from_json(w)?;
+                p.observer = Some(o);
+            }
+            #[cfg(not(feature = "https"))]
+            {
+                let _ = w;
+                return Err("`watch` needs a build with the `https` feature".into());
+            }
+        }
         if let Some(f) = path_of("oracle_share_file") {
             p.oracle_share = Some(load_oracle_share(&f)?);
         }
+        if let Some(ps) = v.get("price_sources") {
+            p.price_sources = crate::price_sources::from_json_list(ps)?;
+        }
+        p.price_fetch_interval_ms = v
+            .get("price_fetch_interval_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(p.price_fetch_interval_ms)
+            .max(100);
         p.price_interval_ms = v
             .get("price_interval_ms")
             .and_then(Value::as_u64)
@@ -596,6 +664,7 @@ pub fn init_testnet_with(
             group_key,
             holders,
             dkg_window: btb_chain::oracle::DEFAULT_DKG_WINDOW,
+            rules: Default::default(),
             pairs: vec![
                 btb_chain::PairConfig {
                     id: 0,

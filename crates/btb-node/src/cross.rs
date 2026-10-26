@@ -676,6 +676,7 @@ pub struct CrossNode {
     pub outbox: Vec<(Option<[u8; 32]>, XMsg)>,
     sent: BTreeMap<[u8; 32], u64>,
     first_open_withdrawal: u64,
+    first_unfinished: u64,
     pub stats: CrossStats,
     /// A new share appeared (the driver may want to report it).
     pub changed: bool,
@@ -732,6 +733,7 @@ impl CrossNode {
             outbox: Vec::new(),
             sent: BTreeMap::new(),
             first_open_withdrawal: 0,
+            first_unfinished: 0,
             stats: CrossStats::default(),
             changed: any,
             last_error: None,
@@ -1199,7 +1201,7 @@ impl CrossNode {
                 _ => return, // not all shares in yet (or one is for another package)
             }
         }
-        let message = rs.req.message;
+        let message = rs.req.message.clone();
         let scheme = rs.req.scheme;
         match frost::aggregate(&key.group, &pkg, &shares) {
             Ok(sig) if frost::verify(&key.group, &message, &sig) => {
@@ -1688,6 +1690,7 @@ impl CrossNode {
                 claims: chunk.to_vec(),
             });
         }
+        let utxos = vault::utxos(kv, 4096).map_err(|e| e.to_string())?;
         // withdrawals: propose the unsigned transaction for burned ones
         let mut first_open = None;
         for w in vault::withdrawals_from(kv, self.first_open_withdrawal, 64)
@@ -1703,10 +1706,10 @@ impl CrossNode {
             let Some(vkey) = keys.get(&w.asset) else {
                 continue;
             };
-            let Some(p) = obs.prepare(&w, vkey) else {
+            let Some(p) = obs.prepare_with(&w, vkey, &utxos) else {
                 continue;
             };
-            let proposal = vault::proposal_id(w.id, &p.digest, &p.sighashes);
+            let proposal = vault::proposal_id(w.id, &p.digest, &p.sighashes, &p.plan);
             if vault::prepare_votes(kv, w.id, &proposal)
                 .map_err(|e| e.to_string())?
                 .contains(&me)
@@ -1719,7 +1722,48 @@ impl CrossNode {
                 withdrawal: w.id,
                 digest: p.digest,
                 sighashes: p.sighashes,
+                plan: p.plan,
             });
+        }
+        // signed withdrawals: assemble the external transaction and broadcast it (the observer
+        // queues the work and tracks it until it is final)
+        let mut all_final = true;
+        for w in
+            vault::withdrawals_from(kv, self.first_unfinished, 64).map_err(|e| e.to_string())?
+        {
+            if w.status != vault::STATUS_SIGNED {
+                all_final = false;
+                continue;
+            }
+            let mut sigs = Vec::new();
+            for rid in &w.requests {
+                match xsign::get(kv, *rid)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|r| r.signature)
+                {
+                    Some(s) => sigs.push(s),
+                    None => break,
+                }
+            }
+            if sigs.len() != w.requests.len() {
+                all_final = false;
+                continue;
+            }
+            let Some(vkey) = keys.get(&w.asset) else {
+                all_final = false;
+                continue;
+            };
+            match obs.execution(&w) {
+                vault::Execution::Confirmed | vault::Execution::Failed => {
+                    if all_final {
+                        self.first_unfinished = w.id + 1;
+                    }
+                }
+                _ => {
+                    all_final = false;
+                    obs.broadcast(&w, vkey, &sigs);
+                }
+            }
         }
         Ok(ops)
     }
@@ -1832,7 +1876,7 @@ mod tests {
             self.pending.push(SignRequest {
                 id,
                 scheme,
-                message,
+                message: message.to_vec(),
                 height: 1,
                 tag: btb_chain::xsign::RequestTag::Raw,
                 signature: None,

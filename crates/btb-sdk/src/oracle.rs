@@ -44,7 +44,15 @@ pub mod num {
     pub const RANDOM_BYTES: u64 = 40;
     pub const PRICE: u64 = 41;
     pub const REPORT_REQUEST: u64 = 42;
+    pub const PRICE_TWAP: u64 = 43;
+    /// Status codes of `price` and `price_twap`.
+    pub const PRICE_PAUSED: u64 = 1;
+    pub const PRICE_BAD_WINDOW: u64 = 2;
+    pub const NOT_FOUND: u64 = u64::MAX;
 }
+
+/// Largest TWAP window `price_twap` accepts, in blocks.
+pub const MAX_TWAP_WINDOW: u64 = 10_000;
 
 /// Largest report `report::request` accepts.
 pub const MAX_REPORT_BYTES: usize = 1024;
@@ -201,10 +209,74 @@ impl Price {
     }
 }
 
+/// Why a price could not be given. Contracts that move money on prices must handle `Paused`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceError {
+    /// The feed does not exist or has no price yet.
+    NotFound,
+    /// The feed's circuit breaker is open: the price moved too fast and has not settled.
+    Paused,
+    /// (`price_twap` only) the window is 0, above `MAX_TWAP_WINDOW`, or longer than the feed's
+    /// history.
+    BadWindow,
+}
+
+fn status(r: u64) -> PriceError {
+    match r {
+        num::PRICE_PAUSED => PriceError::Paused,
+        num::PRICE_BAD_WINDOW => PriceError::BadWindow,
+        _ => PriceError::NotFound,
+    }
+}
+
+/// A time-weighted average price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Twap {
+    /// Average over the window, an integer with `decimals` decimal places (floor division).
+    pub price: u128,
+    /// The window in blocks.
+    pub window: u32,
+    pub decimals: u8,
+}
+
+/// The average price of feed `pair` over the last `window` blocks (`1..=MAX_TWAP_WINDOW`,
+/// not longer than the feed's history). A price published at block `h` counts from block
+/// `h + 1`. Free in queries; a mutation or cron pays a per-read fee (extra gas).
+pub fn price_twap(pair: u32, window: u64) -> Result<Twap, PriceError> {
+    let mut out = [0u8; 32];
+    let r = ecall(
+        num::PRICE_TWAP,
+        u64::from(pair),
+        window,
+        out.as_mut_ptr() as u64,
+        0,
+        0,
+    );
+    if r != 0 {
+        return Err(status(r));
+    }
+    let mut p = [0u8; 16];
+    p.copy_from_slice(&out[..16]);
+    let mut w = [0u8; 4];
+    w.copy_from_slice(&out[16..20]);
+    Ok(Twap {
+        price: u128::from_le_bytes(p),
+        window: u32::from_le_bytes(w),
+        decimals: out[20],
+    })
+}
+
 /// The latest agreed price of feed `pair` (an id from the chain's genesis config), or `None`
-/// if the feed does not exist or has no price yet. Free of fees in queries; a mutation or cron
+/// if the feed does not exist, has no price yet, or is paused by its circuit breaker (use
+/// [`price_checked`] to tell them apart). Free of fees in queries; a mutation or cron
 /// pays a per-read fee (extra gas).
 pub fn price(pair: u32) -> Option<Price> {
+    price_checked(pair).ok()
+}
+
+/// Like [`price`], but says why there is none: `NotFound`, or `Paused` while the feed's circuit
+/// breaker is open (`docs/ORACLES.md`). Same fees as `price`.
+pub fn price_checked(pair: u32) -> Result<Price, PriceError> {
     let mut out = [0u8; 32];
     let r = ecall(
         num::PRICE,
@@ -215,13 +287,13 @@ pub fn price(pair: u32) -> Option<Price> {
         0,
     );
     if r != 0 {
-        return None;
+        return Err(status(r));
     }
     let mut p = [0u8; 16];
     p.copy_from_slice(&out[..16]);
     let mut h = [0u8; 8];
     h.copy_from_slice(&out[16..24]);
-    Some(Price {
+    Ok(Price {
         price: u128::from_le_bytes(p),
         height: u64::from_le_bytes(h),
         decimals: out[24],

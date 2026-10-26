@@ -88,6 +88,14 @@ pub fn oracle_price_key(pair: u32) -> Vec<u8> {
     k
 }
 
+/// `50 11 pair:u32be`: the circuit-breaker record of a feed; its first byte is 1 while the feed
+/// is paused (the rest is the chain's business, see `btb_chain::oracle`).
+pub fn oracle_breaker_key(pair: u32) -> Vec<u8> {
+    let mut k = vec![TAG_ORACLE, 0x11];
+    k.extend_from_slice(&pair.to_be_bytes());
+    k
+}
+
 /// `50 01`: the oracle config; its presence means the chain has a beacon committee.
 pub fn oracle_config_key() -> Vec<u8> {
     vec![TAG_ORACLE, 0x01]

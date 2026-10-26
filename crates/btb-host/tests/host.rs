@@ -1023,7 +1023,8 @@ fn relay_endpoint_forwards_client_signed_tx_and_pays_the_host() {
     let mut hostw = Wallet::new(50);
     let mut user = Wallet::new(51);
     let other = Wallet::new(52).addr();
-    let fund_host = c.faucet.transfer(hostw.addr(), 1_000_000);
+    // the registry bond (10,000 BTB by default) plus gas
+    let fund_host = c.faucet.transfer(hostw.addr(), 10_001 * 1_000_000_000);
     c.run(&fund_host);
     let fund_user = c.faucet.transfer(user.addr(), 1_000_000);
     c.run(&fund_user);

@@ -109,6 +109,19 @@ pub mod abi {
     /// `HOST_PRICE_MUTATION` gas (a read plus a per-read fee that goes to the validators); in
     /// queries `HOST_PRICE_QUERY`, and queries are not billed.
     pub const PRICE: u64 = 41;
+    /// `price_twap(pair_id, window, out_ptr) -> 0 ok | NOT_FOUND | PRICE_PAUSED | PRICE_BAD_WINDOW`.
+    /// Read-only. Time-weighted average price over the last `window` blocks (1..=`MAX_TWAP_WINDOW`),
+    /// integer math, floor division. On success writes 32 bytes: `twap: u128 LE`, `window: u32 LE`,
+    /// `decimals: u8`, 11 zero bytes. `PRICE_PAUSED`: the feed's circuit breaker is open.
+    /// `PRICE_BAD_WINDOW`: window is 0, above the maximum, or longer than the feed's history.
+    /// Gas: `HOST_TWAP_QUERY` in queries, `HOST_TWAP_MUTATION` (read plus per-read fee) otherwise.
+    pub const PRICE_TWAP: u64 = 43;
+    /// Largest `window` accepted by `price_twap`.
+    pub const MAX_TWAP_WINDOW: u64 = 10_000;
+    /// `price` / `price_twap` status: the feed is paused by its circuit breaker; handle it.
+    pub const PRICE_PAUSED: u64 = 1;
+    /// `price_twap` status: unusable window.
+    pub const PRICE_BAD_WINDOW: u64 = 2;
     /// `report_request(data_ptr, data_len) -> report id | NOT_FOUND`. Mutations and crons only
     /// (a read-only host, so queries, actions and transforms, traps with `WriteInQuery`).
     /// Asks the chain's beacon committee to threshold-sign `data` (at most `MAX_REPORT_BYTES`)
@@ -275,6 +288,17 @@ pub struct PriceRecord {
     /// Block height of the update.
     pub height: u64,
     pub decimals: u8,
+    /// The circuit breaker is open: `price` answers `PRICE_PAUSED` instead of the value.
+    pub paused: bool,
+}
+
+/// Answer of [`Host::price_twap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwapOutcome {
+    Ok { twap: u128, decimals: u8 },
+    NotFound,
+    Paused,
+    BadWindow,
 }
 
 /// What the embedder (node runtime) provides to a running contract.
@@ -324,6 +348,10 @@ pub trait Host {
     /// The agreed price of `pair`, if any.
     fn price(&mut self, _pair: u32) -> Option<PriceRecord> {
         None
+    }
+    /// Time-weighted average price of `pair` over the last `window` blocks.
+    fn price_twap(&mut self, _pair: u32, _window: u64) -> TwapOutcome {
+        TwapOutcome::NotFound
     }
     /// Queue `data` to be threshold-signed as a report for other chains; returns its id. `None`:
     /// the host has no report queue.
@@ -675,12 +703,40 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                 buf(vm, a1, 32)?;
                 match u32::try_from(a0).ok().and_then(|pair| host.price(pair)) {
                     None => abi::NOT_FOUND,
+                    Some(p) if p.paused => abi::PRICE_PAUSED,
                     Some(p) => {
                         let mut out = [0u8; 32];
                         out[..16].copy_from_slice(&p.price.to_le_bytes());
                         out[16..24].copy_from_slice(&p.height.to_le_bytes());
                         out[24] = p.decimals;
                         vm.write_mem(a1, &out)?;
+                        0
+                    }
+                }
+            }
+            abi::PRICE_TWAP => {
+                vm.charge_gas(if host.read_only() {
+                    gas::HOST_TWAP_QUERY
+                } else {
+                    gas::HOST_TWAP_MUTATION
+                })?;
+                buf(vm, a2, 32)?;
+                let pair = u32::try_from(a0).ok();
+                let outcome = if a1 == 0 || a1 > abi::MAX_TWAP_WINDOW {
+                    Some(TwapOutcome::BadWindow)
+                } else {
+                    pair.map(|p| host.price_twap(p, a1))
+                };
+                match outcome {
+                    None | Some(TwapOutcome::NotFound) => abi::NOT_FOUND,
+                    Some(TwapOutcome::Paused) => abi::PRICE_PAUSED,
+                    Some(TwapOutcome::BadWindow) => abi::PRICE_BAD_WINDOW,
+                    Some(TwapOutcome::Ok { twap, decimals }) => {
+                        let mut out = [0u8; 32];
+                        out[..16].copy_from_slice(&twap.to_le_bytes());
+                        out[16..20].copy_from_slice(&(a1 as u32).to_le_bytes());
+                        out[20] = decimals;
+                        vm.write_mem(a2, &out)?;
                         0
                     }
                 }

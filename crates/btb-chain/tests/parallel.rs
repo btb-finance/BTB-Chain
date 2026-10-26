@@ -32,6 +32,14 @@ impl Lcg {
 static RELAYED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CHANNEL_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const RICH: u64 = 10 * UNITS_PER_BTB;
+
+/// Small bond and short unbonding so the random blocks register, unregister and release hosts.
+fn host_cfg() -> ChainConfig {
+    let mut c = ChainConfig::new(CHAIN_ID);
+    c.host_bond = UNITS_PER_BTB;
+    c.host_unbonding_blocks = 3;
+    c
+}
 const WALLETS: usize = 14;
 
 #[derive(Default, Debug)]
@@ -353,7 +361,7 @@ fn resync(rigs: &[Rig], w: &mut [Wallet]) {
 fn run_seed(seed: u64, blocks: usize) -> Vec<Rig> {
     let mut w: Vec<Wallet> = (1..=WALLETS as u8).map(Wallet::new).collect();
     let refs: Vec<&Wallet> = w.iter().collect();
-    let g = genesis(&refs, RICH);
+    let g = genesis_with(&refs, RICH, host_cfg());
     let mut rigs = rigs(&g);
     let c = setup(&mut rigs, &mut w);
     let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -420,7 +428,7 @@ fn parallel_equals_sequential_on_random_blocks() {
 fn fully_conflicting_block_matches_sequential() {
     let mut w: Vec<Wallet> = (1..=WALLETS as u8).map(Wallet::new).collect();
     let refs: Vec<&Wallet> = w.iter().collect();
-    let g = genesis(&refs, RICH);
+    let g = genesis_with(&refs, RICH, host_cfg());
     let mut rigs = rigs(&g);
     let c = setup(&mut rigs, &mut w);
     resync(&rigs, &mut w);
@@ -455,7 +463,7 @@ fn parallel_run_is_repeatable() {
 fn block_errors_match() {
     let mut w: Vec<Wallet> = (1..=3u8).map(Wallet::new).collect();
     let refs: Vec<&Wallet> = w.iter().collect();
-    let g = genesis(&refs, RICH);
+    let g = genesis_with(&refs, RICH, host_cfg());
     let mut rigs = rigs(&g);
     let (a1, a2) = (w[1].addr(), w[2].addr());
     let t1 = w[0].transfer(a1, 5);

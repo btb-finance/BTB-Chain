@@ -1090,7 +1090,7 @@ impl<S: KvStore> Ctx<'_, S> {
             TxKind::Action(op) => self.exec_action(&sender, op, &id, tx.intrinsic_gas())?,
             TxKind::Host(op) => {
                 let gas_used = tx.intrinsic_gas();
-                match crate::host::apply(&mut self.overlay, &sender, op) {
+                match crate::host::apply(&mut self.overlay, &self.cfg, self.height, &sender, op) {
                     Ok(()) => Done {
                         gas_used,
                         output: Vec::new(),
@@ -1407,6 +1407,7 @@ impl Executor {
         };
         let mut receipts = Vec::with_capacity(block.txs.len());
         staking::begin_block(&mut ctx.overlay, h.height)?;
+        crate::host::begin_block(&mut ctx.overlay, h.height)?;
         crate::oracle::begin_block(
             &mut ctx.overlay,
             cfg.chain_id,

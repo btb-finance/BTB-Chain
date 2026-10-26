@@ -101,6 +101,7 @@ impl Cluster {
                 group_key: Vec::new(),
                 holders: Vec::new(),
                 dkg_window: WINDOW,
+                rules: Default::default(),
                 pairs: vec![],
                 max_age_blocks: 200,
             }),
@@ -291,6 +292,8 @@ fn deposit_and_withdraw(
         index: 0,
         amount,
         recipient: me,
+        height: 100,
+        block_hash: [txid; 32],
     });
     let (cr0, bu0) = already;
     c.wait_until(
@@ -336,6 +339,7 @@ fn deposit_and_withdraw(
         status: 0,
         digest: [0; 32],
         requests: vec![],
+        plan: vec![],
     });
     (wid, sighash)
 }

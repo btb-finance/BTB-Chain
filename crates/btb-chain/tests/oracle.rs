@@ -49,13 +49,14 @@ struct Env {
     parallel_blocks: usize,
 }
 
-fn oracle_genesis(group: &GroupKey, n: usize) -> OracleGenesis {
+fn oracle_genesis(group: &GroupKey, n: usize, rules: PriceRules) -> OracleGenesis {
     OracleGenesis {
         group_key: group.encode(),
         holders: (0..n).map(ckey_bytes).collect(),
         pairs: pairs(),
         max_age_blocks: 20,
         dkg_window: 20,
+        rules,
     }
 }
 
@@ -76,6 +77,16 @@ fn env_with(stakes: &[u64], seed: u8, users: usize) -> Env {
 }
 
 fn env_keyed(stakes: &[u64], group: GroupKey, shares: Vec<KeyShare>, users: usize) -> Env {
+    env_rules(stakes, group, shares, users, PriceRules::default())
+}
+
+fn env_rules(
+    stakes: &[u64],
+    group: GroupKey,
+    shares: Vec<KeyShare>,
+    users: usize,
+    rules: PriceRules,
+) -> Env {
     let n = stakes.len();
     let ops: Vec<Wallet> = (0..n).map(|i| Wallet::new(10 + i as u8)).collect();
     let users: Vec<Wallet> = (0..users).map(|i| Wallet::new(50 + i as u8)).collect();
@@ -94,7 +105,7 @@ fn env_keyed(stakes: &[u64], group: GroupKey, shares: Vec<KeyShare>, users: usiz
             stake: *s,
         })
         .collect();
-    let og = oracle_genesis(&group, n);
+    let og = oracle_genesis(&group, n, rules);
     let state = ChainState::from_genesis_full(MemKv::new(), &g, &vals, Some(&og)).unwrap();
     Env {
         net: Net {
@@ -106,6 +117,11 @@ fn env_keyed(stakes: &[u64], group: GroupKey, shares: Vec<KeyShare>, users: usiz
         users,
         parallel_blocks: 0,
     }
+}
+
+fn env_with_rules(rules: PriceRules) -> Env {
+    let (group, shares) = trusted_deal(Params::standard(4), &[1; 32]).unwrap();
+    env_rules(&STAKES, group, shares, 3, rules)
 }
 
 fn env() -> Env {
@@ -302,7 +318,7 @@ fn beacon_input_on_a_chain_without_oracles_is_refused() {
 #[test]
 fn oracle_genesis_is_validated() {
     let (group, _) = trusted_deal(Params::standard(4), &[1; 32]).unwrap();
-    let base = oracle_genesis(&group, 4);
+    let base = oracle_genesis(&group, 4, PriceRules::default());
     let build = |og: &OracleGenesis| {
         let w = Wallet::new(1);
         let g = genesis(&[&w], EACH);
@@ -873,4 +889,295 @@ fn a_dkg_generated_key_and_a_resharing_work_as_the_chain_beacon_key() {
     let mut e2 = env_keyed(&stakes7, out2.group, shares2, 2);
     e2.run(vec![]);
     e2.run(vec![]);
+}
+
+// ------------------------------------------------------------- update rule, breaker, TWAP
+
+impl Env {
+    /// One block in which all four validators report `price` for pair 0.
+    fn feed(&mut self, price: u128) {
+        let h = self.height() + 1;
+        self.run_obs((0..4).map(|v| obs(v, 0, price, h)).collect());
+    }
+
+    fn paused(&self, pair: u32) -> bool {
+        oracle::paused(self.net.state.store(), pair).unwrap()
+    }
+
+    fn query_status(&mut self, c: &Address, who: &Address) -> u8 {
+        u8::decode(&self.net.query(c, "quote_status", &0u32, who)).unwrap()
+    }
+}
+
+const P: u128 = 1_000_000;
+
+#[test]
+fn price_rules_are_validated_and_round_trip() {
+    let ok = PriceRules::default();
+    assert!(ok.validate().is_ok());
+    let bad = [
+        PriceRules {
+            heartbeat_blocks: 0,
+            ..ok
+        },
+        PriceRules {
+            breaker_window: 0,
+            ..ok
+        },
+        PriceRules {
+            breaker_window: 257,
+            ..ok
+        },
+        PriceRules {
+            breaker_resume_blocks: 0,
+            ..ok
+        },
+        PriceRules {
+            twap_max_window: 10_001,
+            ..ok
+        },
+        PriceRules {
+            update_deviation_bps: 2_000_000,
+            ..ok
+        },
+    ];
+    for r in bad {
+        assert!(r.validate().is_err(), "{r:?}");
+    }
+    let (group, _) = trusted_deal(Params::standard(4), &[1; 32]).unwrap();
+    let mut og = oracle_genesis(
+        &group,
+        4,
+        PriceRules {
+            update_deviation_bps: 50,
+            ..ok
+        },
+    );
+    let back = OracleGenesis::decode(&btb_codec::Encode::encode(&og)).unwrap();
+    assert_eq!(back, og);
+    og.rules.heartbeat_blocks = 0;
+    assert!(og.validate().is_err());
+}
+
+#[test]
+fn publishes_on_deviation_or_heartbeat() {
+    let mut e = env_with_rules(PriceRules {
+        update_deviation_bps: 100, // 1%
+        heartbeat_blocks: 10,
+        ..PriceRules::default()
+    });
+    e.feed(P);
+    let first = e.height();
+    assert_eq!(e.price(0).unwrap().0, P);
+    // 0.5% and 1.0% (not more than 1%): no new price
+    e.feed(P + 5_000);
+    e.feed(P + 10_000);
+    assert_eq!(e.price(0), Some((P, first, 8, 4)));
+    // 1.0001%: published
+    e.feed(P + 10_100);
+    assert_eq!(e.price(0).unwrap(), (P + 10_100, e.height(), 8, 4));
+    // downward moves count too
+    let h = e.height();
+    e.feed(P + 10_100 - 11_000);
+    assert_eq!(e.price(0).unwrap().1, e.height());
+    assert!(e.height() > h);
+    // tiny wiggles: nothing until the heartbeat, then the next news publishes
+    let anchor = e.price(0).unwrap();
+    for i in 1..10 {
+        e.feed(anchor.0 + i % 3);
+        assert_eq!(e.price(0).unwrap().1, anchor.1, "block {i}");
+    }
+    e.feed(anchor.0 + 1);
+    let now = e.price(0).unwrap();
+    assert_eq!(now.1, anchor.1 + 10, "heartbeat after exactly 10 blocks");
+    assert_eq!(now.0, anchor.0 + 1);
+}
+
+#[test]
+fn default_rules_publish_on_every_block_with_news() {
+    let mut e = env();
+    e.feed(P);
+    let h = e.height();
+    e.feed(P);
+    assert_eq!(e.price(0).unwrap().1, h + 1);
+}
+
+fn breaker_rules() -> PriceRules {
+    PriceRules {
+        breaker_bps: 1_000, // 10%
+        breaker_window: 10,
+        breaker_resume_blocks: 3,
+        ..PriceRules::default()
+    }
+}
+
+#[test]
+fn circuit_breaker_trips_on_a_jump_and_resumes_after_k_stable_blocks() {
+    let mut e = env_with_rules(breaker_rules());
+    let c = e.deploy_oracle_contract(vec![]);
+    let mut w = e.users.remove(1);
+    for _ in 0..3 {
+        e.feed(P);
+    }
+    assert!(!e.paused(0));
+    assert_eq!(e.query_status(&c, &w.addr()), 0);
+    let before = e.price(0).unwrap();
+    // +20% in one block: the feed pauses and keeps the last price
+    e.feed(P * 12 / 10);
+    assert!(e.paused(0));
+    assert_eq!(e.price(0).unwrap().0, before.0);
+    assert_eq!(e.query_status(&c, &w.addr()), 2);
+    let q = e.net.query(&c, "quote", &0u32, &w.addr());
+    assert_eq!(Option::<(u128, u64, u8)>::decode(&q).unwrap(), None);
+    let (st, _) = <(u8, u128)>::decode(&e.net.query(&c, "twap", &(0u32, 2u64), &w.addr())).unwrap();
+    assert_eq!(st, 2, "twap is paused too");
+    // contracts that need a price are refused while paused
+    let r = e.run_one(w.call(c, "use_twap", &(0u32, 2u64)));
+    assert!(matches!(r.status, Status::Reverted(Revert::Abort(ref m)) if m == "feed paused"));
+    let r = e.run_one(w.call(c, "use_price", &(0u32, 50u64)));
+    assert!(matches!(r.status, Status::Reverted(Revert::Abort(ref m)) if m == "no price"));
+    // still moving: no resume, however long
+    for p in [P * 15 / 10, P * 12 / 10, P * 15 / 10, P * 12 / 10] {
+        e.feed(p);
+        assert!(e.paused(0));
+    }
+    // two stable blocks, then a wobble beyond the band resets the count
+    e.feed(P * 12 / 10);
+    e.feed(P * 12 / 10);
+    e.feed(P * 15 / 10);
+    assert!(e.paused(0));
+    // three in a row within the band: resumes, and publishes the latest candidate
+    e.feed(P * 15 / 10);
+    e.feed(P * 15 / 10);
+    assert!(e.paused(0));
+    e.feed(P * 15 / 10);
+    assert!(!e.paused(0));
+    assert_eq!(e.price(0).unwrap(), (P * 15 / 10, e.height(), 8, 4));
+    assert_eq!(e.query_status(&c, &w.addr()), 0);
+    // the new level is the baseline: a 5% move afterwards does not trip
+    e.feed(P * 15 / 10 * 105 / 100);
+    assert!(!e.paused(0));
+}
+
+#[test]
+fn circuit_breaker_sees_gradual_moves_inside_its_window_and_not_older_ones() {
+    let mut e = env_with_rules(breaker_rules());
+    e.feed(P);
+    // +4% per block: 4%, 8% fine, the third step is 12.5% above the start: trip
+    e.feed(P * 104 / 100);
+    e.feed(P * 108 / 100);
+    assert!(!e.paused(0));
+    e.feed(P * 1125 / 1000);
+    assert!(e.paused(0));
+    // a slow drift outside the window never trips: one step of 5% every 12 blocks
+    let mut e = env_with_rules(breaker_rules());
+    let mut p = P;
+    e.feed(p);
+    for _ in 0..4 {
+        p = p * 105 / 100;
+        e.feed(p);
+        for _ in 0..11 {
+            e.run(vec![]); // no news: nothing is compared
+        }
+        assert!(!e.paused(0));
+    }
+    // and drift while paused does not resume (anchored to the first candidate of the run)
+    let mut e = env_with_rules(breaker_rules());
+    e.feed(P);
+    e.feed(P * 2);
+    assert!(e.paused(0));
+    for i in 0..8u128 {
+        e.feed(P * 2 + i * 50_000); // 2.5% steps, 17.5% in total
+    }
+    assert!(e.paused(0), "a drifting price has not stabilised");
+}
+
+#[test]
+fn breaker_off_never_pauses() {
+    let mut e = env();
+    e.feed(P);
+    e.feed(P * 100);
+    assert!(!e.paused(0));
+    assert_eq!(e.price(0).unwrap().0, P * 100);
+}
+
+#[test]
+fn twap_is_integer_exact_and_matches_the_contract_call() {
+    let mut e = env_with_rules(PriceRules {
+        twap_max_window: 50,
+        ..PriceRules::default()
+    });
+    let c = e.deploy_oracle_contract(vec![]);
+    let mut w = e.users.remove(1);
+    let prices = [100u128, 200, 300, 250, 400, 400, 150, 90, 91, 92];
+    let mut published = Vec::new();
+    for p in prices {
+        e.feed(p);
+        published.push((e.height(), p));
+    }
+    for _ in 0..3 {
+        e.run(vec![]);
+    }
+    let now = e.height();
+    // reference: price in force at block b is the last one published at a height below b
+    let in_force = |b: u64| {
+        published
+            .iter()
+            .rev()
+            .find(|(h, _)| *h < b)
+            .map(|(_, p)| *p)
+    };
+    for window in 1..=8u64 {
+        let sum: u128 = (now - window + 1..=now).map(|b| in_force(b).unwrap()).sum();
+        let want = sum / u128::from(window);
+        let st = e.net.state.store();
+        assert_eq!(
+            btb_runtime::twap::twap(st, 0, now, window),
+            Ok(want),
+            "w={window}"
+        );
+        let q = e.net.query(&c, "twap", &(0u32, window), &w.addr());
+        let (status, got) = <(u8, u128)>::decode(&q).unwrap();
+        assert_eq!((status, got), (0, want), "contract w={window}");
+    }
+    // a window longer than the history, or zero, or above the cap
+    for window in [0u64, 10_001, now + 1] {
+        let (status, _) =
+            <(u8, u128)>::decode(&e.net.query(&c, "twap", &(0u32, window), &w.addr())).unwrap();
+        assert_eq!(status, 3, "window {window}");
+    }
+    let (status, _) =
+        <(u8, u128)>::decode(&e.net.query(&c, "twap", &(5u32, 2u64), &w.addr())).unwrap();
+    assert_eq!(status, 1, "unknown feed");
+    // mutations pay the per-read fee
+    let r = e.run_one(w.call(c, "use_twap", &(0u32, 3u64)));
+    ok(&r);
+    assert!(
+        r.gas_used >= btb_vm::gas::TWAP_READ_FEE,
+        "gas {}",
+        r.gas_used
+    );
+    // history beyond twap_max_window is pruned
+    for p in 0..80u128 {
+        e.feed(1000 + p);
+    }
+    let now = e.height();
+    let st = e.net.state.store();
+    assert!(btb_runtime::twap::twap(st, 0, now, 50).is_ok());
+    assert!(btb_runtime::twap::twap(st, 0, now, 60).is_err());
+}
+
+#[test]
+fn twap_off_when_the_window_is_zero() {
+    let mut e = env_with_rules(PriceRules {
+        twap_max_window: 0,
+        ..PriceRules::default()
+    });
+    let c = e.deploy_oracle_contract(vec![]);
+    let w = e.users.remove(1);
+    e.feed(P);
+    e.feed(P);
+    let (status, _) =
+        <(u8, u128)>::decode(&e.net.query(&c, "twap", &(0u32, 1u64), &w.addr())).unwrap();
+    assert_eq!(status, 1);
 }

@@ -32,8 +32,13 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # MIT OR Apache-2.0. Blocking HTTP client for HTTPS actions (feature `https`); rustls with the ring
 # provider, webpki-roots (CDLA-Permissive-2.0) for the trust anchors, no OpenSSL.
 ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
+# CC0-1.0. Bitcoin transaction and block types for the vault watchers (`crate::watch`): building
+# the withdrawal transaction, BIP-341 signature hashes, strict parsing of raw transactions/blocks.
+bitcoin = { version = "0.32", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+# CC0-1.0. Tests parse the broadcast Bitcoin transaction and verify its Taproot signature.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 tempfile = "3"
 btb-vm = { path = "../btb-vm" }
 # MIT OR Apache-2.0. An independent BIP-340 verifier for the cross-chain cluster test.
@@ -43,6 +48,6 @@ k256 = { version = "0.13", default-features = false, features = ["schnorr", "std
 # `https`: validators can fetch HTTPS actions (docs/ORACLES.md). Without it they answer every
 # action request with an agreed-upon failure ("fetch failed") and the chain still works.
 default = ["https"]
-https = ["dep:ureq"]
+https = ["dep:ureq", "dep:bitcoin"]
 # Keep chain state in RocksDB (--data <dir>) instead of memory. Needs clang/libclang to build.
 rocksdb = ["btb-runtime/rocksdb"]

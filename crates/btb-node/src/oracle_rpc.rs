@@ -6,7 +6,8 @@
 //! | `btb_oracleDkg` | `[]` | the key generations on the board: `[{target, from, status, window_start, window_end, deal_end, committee, deals, disqualified}]` |
 //! | `btb_oracleKeyChanges` | `[]` | every change of the group key: `[{epoch, height, degraded_epoch, degraded_height, old_group_key, new_group_key}]`; external consumers of reports must re-trust the new key |
 //! | `btb_oracleBeacon` | `[]` or `[height]` | `{epoch, height, signature, seed}`; no height: the last executed block's |
-//! | `btb_oraclePrice` | `[pair_id]` | `null` or `{pair, name, price, decimals, height, reporters}` |
+//! | `btb_oraclePrice` | `[pair_id]` | `null` or `{pair, name, price, decimals, height, reporters, paused}`; `paused`: the circuit breaker is open and `price` is the last good value |
+//! | `btb_oracleTwap` | `[pair_id, window]` | `null` (no price) or `{pair, name, window, twap, decimals, height}`; an error while paused or for a bad window |
 //!
 //! The beacon signature verifies under `group_key` against the message
 //! `"btb.beacon.v1" || chain_id:u64be || epoch:u64be || height:u64be` (`btb_oracle::beacon_message`),
@@ -66,6 +67,14 @@ pub fn handle<S: KvStore>(
                 "interim_dealer": !og.group_key.is_empty(),
                 "dkg_window": og.dkg_window,
                 "max_age_blocks": og.max_age_blocks,
+                "rules": {
+                    "update_deviation_bps": og.rules.update_deviation_bps,
+                    "heartbeat_blocks": og.rules.heartbeat_blocks,
+                    "breaker_bps": og.rules.breaker_bps,
+                    "breaker_window": og.rules.breaker_window,
+                    "breaker_resume_blocks": og.rules.breaker_resume_blocks,
+                    "twap_max_window": og.rules.twap_max_window,
+                },
                 "pairs": og.pairs.iter()
                     .map(|p| json!({"id": p.id, "name": p.name, "decimals": p.decimals}))
                     .collect::<Vec<_>>(),
@@ -144,8 +153,43 @@ pub fn handle<S: KvStore>(
                     "decimals": p.decimals,
                     "height": p.height,
                     "reporters": p.reporters,
+                    "paused": oracle::paused(st.store(), pair).map_err(app)?,
                 }),
             })
+        }
+        "btb_oracleTwap" => {
+            let pair = params
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|x| u32::try_from(x).ok())
+                .ok_or_else(|| RpcError::invalid_params("pair id must be a number"))?;
+            let window = params
+                .get(1)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| RpcError::invalid_params("window must be a number"))?;
+            let Some(cfg) = og.pairs.iter().find(|p| p.id == pair) else {
+                return Ok(Value::Null);
+            };
+            if oracle::paused(st.store(), pair).map_err(app)? {
+                return Err(RpcError::app(
+                    "feed paused by its circuit breaker".to_string(),
+                ));
+            }
+            let now = st.head().map_err(app)?.height;
+            match btb_runtime::twap::twap(st.store(), pair, now, window) {
+                Ok(t) => Ok(json!({
+                    "pair": pair,
+                    "name": cfg.name,
+                    "window": window,
+                    "twap": t.to_string(),
+                    "decimals": cfg.decimals,
+                    "height": now,
+                })),
+                Err(btb_runtime::twap::TwapError::NoPrice) => Ok(Value::Null),
+                Err(btb_runtime::twap::TwapError::BadWindow) => Err(RpcError::invalid_params(
+                    "window is 0 or longer than the history",
+                )),
+            }
         }
         _ => Err(RpcError {
             code: -32601,

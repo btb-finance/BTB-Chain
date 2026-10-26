@@ -104,6 +104,7 @@ impl Sim {
             pairs: vec![],
             max_age_blocks: 20,
             dkg_window: window,
+            rules: Default::default(),
         };
         let state = ChainState::from_genesis_full(MemKv::new(), &g, &vals, Some(&og)).unwrap();
         Sim {
@@ -1013,6 +1014,7 @@ fn key_records_serve_the_trusted_dealer_interim_and_reshare_from_it() {
         pairs: vec![],
         max_age_blocks: 20,
         dkg_window: W,
+        rules: Default::default(),
     };
     s.net.state = ChainState::from_genesis_full(MemKv::new(), &g, &vals, Some(&og)).unwrap();
     for (i, sh) in shares.iter().enumerate() {

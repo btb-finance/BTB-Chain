@@ -389,8 +389,8 @@ impl Beacons {
     }
 }
 
-/// Where a node gets prices from. Real exchange fetching (HTTPS actions) is future work; tests
-/// and local testnets plug in a function.
+/// Where a node gets prices from: a function (tests, local testnets) or the exchange fetcher of
+/// `crate::price_sources`.
 #[derive(Clone)]
 pub struct PriceSource(Arc<dyn Fn(u32) -> Option<u128> + Send + Sync>);
 
@@ -565,7 +565,21 @@ impl OracleNode {
             }
         }
         let pairs: Vec<u32> = og.pairs.iter().map(|p| p.id).collect();
-        let source = p.price_source.clone();
+        let source = match (&p.price_source, p.price_sources.is_empty()) {
+            (Some(s), _) => Some(s.clone()),
+            (None, true) => None,
+            (None, false) => {
+                let pairs = crate::price_sources::resolve(&p.price_sources, &og.pairs)?;
+                Some(
+                    crate::price_sources::PriceFetcher::spawn(
+                        pairs,
+                        Duration::from_millis(p.price_fetch_interval_ms.max(100)),
+                        p.fetch_policy.clone(),
+                    )
+                    .into_source(),
+                )
+            }
+        };
         let store = crate::dkg::ShareStore::new(p.dkg_dir.clone(), p.key_passphrase.clone());
         let dkg =
             crate::dkg::DkgNode::new(cfg.chain_id, p.key.clone(), store, p.oracle_share.clone())?;

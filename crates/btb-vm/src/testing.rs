@@ -1,6 +1,6 @@
 //! In-memory `Host` for tests and tooling.
 
-use crate::host::{Address, Host, PriceRecord};
+use crate::host::{Address, Host, PriceRecord, TwapOutcome};
 use crate::rand::RandomSource;
 use crate::token::{TokenId, TokenInfo, TokenStore};
 use std::collections::BTreeMap;
@@ -30,6 +30,8 @@ pub struct MemHost {
     pub random: Option<RandomSource>,
     /// Agreed prices by pair id.
     pub prices: BTreeMap<u32, PriceRecord>,
+    /// TWAP answers by `(pair, window)`; anything else is `NotFound`.
+    pub twaps: BTreeMap<(u32, u64), TwapOutcome>,
     /// Reports queued by `report_request`, in order (the id is the index).
     pub reports: Vec<Vec<u8>>,
 }
@@ -150,6 +152,12 @@ impl Host for MemHost {
     }
     fn price(&mut self, pair: u32) -> Option<PriceRecord> {
         self.prices.get(&pair).copied()
+    }
+    fn price_twap(&mut self, pair: u32, window: u64) -> TwapOutcome {
+        self.twaps
+            .get(&(pair, window))
+            .copied()
+            .unwrap_or(TwapOutcome::NotFound)
     }
     fn report_request(&mut self, data: &[u8]) -> Option<u64> {
         self.reports.push(data.to_vec());

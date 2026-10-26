@@ -23,10 +23,14 @@
 //!   (`crate::xsign`). A withdrawal is prepared at most once, so a burn can never produce two
 //!   different signed external transactions.
 //!
-//! What the chain does **not** check: that the prepared external transaction really pays the
-//! burned amount to the destination. That binding is the validators' two-thirds agreement; a
-//! chain-side parser per external chain, and watchers that confirm execution, are the next steps
-//! (`docs/CROSS_CHAIN.md`, "Implemented and planned").
+//! **Withdrawal plans.** A `Prepare` may carry the unsigned external transaction (`plan`). The
+//! chain then re-derives what it can ([`crate::vault_plan`]): for Bitcoin it parses the
+//! transaction, checks that the inputs are vault UTXOs (each spendable once, tracked under key
+//! `0x56`), that it pays the destination and returns change to the vault, that the outflow equals
+//! the burn, and recomputes the BIP-341 signature hashes; for Solana it checks the message is one
+//! System transfer of the burned amount. An empty plan (the mock observer) is accepted unchecked.
+//! The chain cannot know that the external transaction is later broadcast and confirms; that is
+//! the validators' watchers (`docs/CROSS_CHAIN.md`, "Chain watchers").
 //!
 //! # State (tag `0x70`)
 //!
@@ -38,10 +42,13 @@
 //! | `70 53` | next withdrawal id (`u64` LE) |
 //! | `70 54 id:u64be` | [`Withdrawal`] |
 //! | `70 55 id:u64be digest[32]` | [`ClaimVotes`] for a prepare proposal |
+//! | `70 56 txid[32] vout:u32be` | a spendable Bitcoin vault UTXO: amount `u64` LE |
+//! | `70 57 outpoint[32]` | empty: this external output was credited (first quorum wins) |
 
 use crate::staking;
 use crate::state::StateError;
 use crate::tx::Address;
+use crate::vault_plan;
 use crate::xdkg::{self, TAG_CROSS};
 use crate::xsign::{self, RequestTag, SignRequest};
 use btb_codec::{Decode, DecodeError, Encode, Reader};
@@ -57,6 +64,8 @@ pub const KEY_CREDITED: u8 = 0x52;
 pub const KEY_WNEXT: u8 = 0x53;
 pub const KEY_WITHDRAWAL: u8 = 0x54;
 pub const KEY_PREPARE: u8 = 0x55;
+pub const KEY_UTXO: u8 = 0x56;
+pub const KEY_OUTPOINT: u8 = 0x57;
 
 /// Most claims in one attestation, most sighashes in one withdrawal, longest destination.
 pub const MAX_CLAIMS: usize = 32;
@@ -104,6 +113,11 @@ pub struct DepositClaim {
     pub amount: u64,
     /// The BTB account the deposit's memo names.
     pub recipient: Address,
+    /// Height (Bitcoin) or slot (Solana) of the block that holds the deposit.
+    pub height: u64,
+    /// Hash of that block. Validators that see the deposit in different blocks (a reorg inside
+    /// the confirmation window) vote for different claims and nothing is minted.
+    pub block_hash: [u8; 32],
 }
 
 impl DepositClaim {
@@ -115,6 +129,19 @@ impl DepositClaim {
             &self.index.to_le_bytes(),
             &self.amount.to_le_bytes(),
             &self.recipient,
+            &self.height.to_le_bytes(),
+            &self.block_hash,
+        ])
+    }
+
+    /// Identifies the external output regardless of the block it sits in: a deposit is credited
+    /// at most once even if a reorg moves it to another block.
+    pub fn outpoint_id(&self) -> [u8; 32] {
+        crate::sha256(&[
+            b"btb.vault.outpoint.v1",
+            &[self.asset.byte()],
+            &self.txid,
+            &self.index.to_le_bytes(),
         ])
     }
 
@@ -124,6 +151,8 @@ impl DepositClaim {
         self.index.encode_to(o);
         self.amount.encode_to(o);
         self.recipient.encode_to(o);
+        self.height.encode_to(o);
+        self.block_hash.encode_to(o);
     }
 
     pub(crate) fn decode_from(r: &mut Reader<'_>) -> Result<DepositClaim, DecodeError> {
@@ -133,6 +162,8 @@ impl DepositClaim {
             index: u32::decode_from(r)?,
             amount: u64::decode_from(r)?,
             recipient: <[u8; 32]>::decode_from(r)?,
+            height: u64::decode_from(r)?,
+            block_hash: <[u8; 32]>::decode_from(r)?,
         })
     }
 }
@@ -165,6 +196,9 @@ pub struct Withdrawal {
     pub digest: [u8; 32],
     /// The signing requests of its sighashes.
     pub requests: Vec<u64>,
+    /// The agreed unsigned external transaction (Bitcoin: witness-free tx; Solana: message).
+    /// Empty for plan-less (mock) proposals.
+    pub plan: Vec<u8>,
 }
 
 impl Withdrawal {
@@ -178,11 +212,12 @@ impl Withdrawal {
         self.status.encode_to(&mut o);
         self.digest.encode_to(&mut o);
         self.requests.encode_to(&mut o);
+        self.plan.encode_to(&mut o);
         o
     }
 
     fn decode(id: u64, b: &[u8]) -> Result<Withdrawal, DecodeError> {
-        let mut r = Reader::new(b, 1 << 12);
+        let mut r = Reader::new(b, 1 << 14);
         let w = Withdrawal {
             id,
             asset: Scheme::from_byte(u8::decode_from(&mut r)?).ok_or(DecodeError::TrailingBytes)?,
@@ -193,6 +228,7 @@ impl Withdrawal {
             status: u8::decode_from(&mut r)?,
             digest: <[u8; 32]>::decode_from(&mut r)?,
             requests: Vec::decode_from(&mut r)?,
+            plan: Vec::decode_from(&mut r)?,
         };
         if r.remaining() != 0 {
             return Err(DecodeError::TrailingBytes);
@@ -216,6 +252,10 @@ pub enum VaultError {
     /// The withdrawal was already prepared: a burn is signed for exactly one transaction.
     AlreadyPrepared,
     Overflow,
+    /// The proposed external transaction is malformed or does not pay what was burned.
+    BadPlan,
+    /// The plan spends a UTXO the vault does not hold (or already spent).
+    UtxoUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +349,83 @@ pub fn next_withdrawal_id(kv: &impl KvStore) -> Result<u64, StateError> {
         .get(&key1(KEY_WNEXT, &[]))?
         .and_then(|b| <[u8; 8]>::try_from(b).ok())
         .map_or(0, u64::from_le_bytes))
+}
+
+fn utxo_key(txid: &[u8; 32], vout: u32) -> Vec<u8> {
+    let mut t = txid.to_vec();
+    t.extend_from_slice(&vout.to_be_bytes());
+    key1(KEY_UTXO, &t)
+}
+
+fn put_utxo(
+    kv: &mut impl KvStore,
+    txid: &[u8; 32],
+    vout: u32,
+    amount: u64,
+) -> Result<(), StateError> {
+    Ok(kv.put(&utxo_key(txid, vout), &amount.to_le_bytes())?)
+}
+
+/// Value of the spendable vault UTXO `(txid, vout)`, if the vault holds it.
+pub fn utxo(kv: &impl KvStore, txid: &[u8; 32], vout: u32) -> Result<Option<u64>, StateError> {
+    Ok(kv
+        .get(&utxo_key(txid, vout))?
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(u64::from_le_bytes))
+}
+
+/// A spendable Bitcoin vault output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VaultUtxo {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub amount: u64,
+}
+
+/// The vault's spendable UTXOs, ascending by `(txid, vout)`, at most `limit`.
+pub fn utxos(kv: &impl KvStore, limit: usize) -> Result<Vec<VaultUtxo>, StateError> {
+    let start = key1(KEY_UTXO, &[]);
+    let end = key1(KEY_UTXO + 1, &[]);
+    let mut out = Vec::new();
+    for (k, v) in kv.scan(&start, Some(&end), false, limit)? {
+        let bad = || StateError("bad utxo".into());
+        out.push(VaultUtxo {
+            txid: k
+                .get(2..34)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(bad)?,
+            vout: u32::from_be_bytes(
+                k.get(34..38)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(bad)?,
+            ),
+            amount: u64::from_le_bytes(v.as_slice().try_into().map_err(|_| bad())?),
+        });
+    }
+    Ok(out)
+}
+
+/// The deterministic coin selection every honest validator uses: largest first (ties by
+/// outpoint), stopping as soon as the inputs cover `amount`. `None` if the vault cannot cover it
+/// or more than [`vault_plan::MAX_INPUTS`] inputs would be needed.
+pub fn select_coins(utxos: &[VaultUtxo], amount: u64) -> Option<Vec<VaultUtxo>> {
+    let mut all = utxos.to_vec();
+    all.sort_by(|a, b| {
+        b.amount
+            .cmp(&a.amount)
+            .then(a.txid.cmp(&b.txid))
+            .then(a.vout.cmp(&b.vout))
+    });
+    let mut sum = 0u64;
+    let mut picked = Vec::new();
+    for u in all {
+        sum = sum.checked_add(u.amount)?;
+        picked.push(u);
+        if sum >= amount {
+            return (picked.len() <= vault_plan::MAX_INPUTS).then_some(picked);
+        }
+    }
+    None
 }
 
 /// Up to `limit` withdrawals with id >= `from`, ascending.
@@ -473,8 +590,8 @@ pub(crate) fn apply_attest(
     let mut credited = 0u8;
     for c in claims {
         let id = c.id();
-        if is_credited(kv, &id)? {
-            continue; // replay of a credited deposit: nothing to do
+        if is_credited(kv, &id)? || kv.get(&key1(KEY_OUTPOINT, &c.outpoint_id()))?.is_some() {
+            continue; // replay of a credited deposit (in any block): nothing to do
         }
         let key = key1(KEY_CLAIM, &id);
         let mut v = votes(kv, &key)?;
@@ -484,6 +601,10 @@ pub(crate) fn apply_attest(
         if has_quorum(kv, epoch, &v.voters)? {
             credit(kv, c)?;
             kv.put(&key1(KEY_CREDITED, &id), &[])?;
+            kv.put(&key1(KEY_OUTPOINT, &c.outpoint_id()), &[])?;
+            if c.asset == Scheme::Taproot {
+                put_utxo(kv, &c.txid, c.index, c.amount)?;
+            }
             kv.delete(&key)?;
             credited = credited.saturating_add(1);
         } else {
@@ -544,6 +665,7 @@ pub(crate) fn apply_withdraw(
             status: STATUS_BURNED,
             digest: [0; 32],
             requests: Vec::new(),
+            plan: Vec::new(),
         },
     )?;
     kv.put(&key1(KEY_WNEXT, &[]), &(id + 1).to_le_bytes())?;
@@ -552,7 +674,12 @@ pub(crate) fn apply_withdraw(
 
 /// The id of a prepare proposal: the same bytes from every validator vote for the same
 /// transaction.
-pub fn proposal_id(withdrawal: u64, digest: &[u8; 32], sighashes: &[[u8; 32]]) -> [u8; 32] {
+pub fn proposal_id(
+    withdrawal: u64,
+    digest: &[u8; 32],
+    sighashes: &[[u8; 32]],
+    plan: &[u8],
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"btb.vault.prepare.v1");
     h.update(withdrawal.to_le_bytes());
@@ -561,19 +688,35 @@ pub fn proposal_id(withdrawal: u64, digest: &[u8; 32], sighashes: &[[u8; 32]]) -
     for s in sighashes {
         h.update(s);
     }
+    h.update(Sha256::digest(plan));
     h.finalize().into()
 }
 
 /// `Prepare`: a validator votes for the unsigned external transaction of a withdrawal.
+/// A validator's proposal for the unsigned external transaction of a withdrawal.
+pub(crate) struct Proposal<'a> {
+    pub id: u64,
+    pub digest: &'a [u8; 32],
+    pub sighashes: &'a [[u8; 32]],
+    pub plan: &'a [u8],
+}
+
 pub(crate) fn apply_prepare(
     kv: &mut impl KvStore,
     epoch: u64,
     height: u64,
     sender_key: &[u8; 32],
-    id: u64,
-    digest: &[u8; 32],
-    sighashes: &[[u8; 32]],
+    p: Proposal<'_>,
 ) -> Result<Vec<u8>, VaultFail> {
+    let Proposal {
+        id,
+        digest,
+        sighashes,
+        plan,
+    } = p;
+    if plan.len() > vault_plan::MAX_PLAN {
+        return Err(VaultError::BadShape.into());
+    }
     if sighashes.is_empty() || sighashes.len() > MAX_SIGHASHES {
         return Err(VaultError::BadShape.into());
     }
@@ -584,7 +727,8 @@ pub(crate) fn apply_prepare(
     if w.status != STATUS_BURNED {
         return Err(VaultError::AlreadyPrepared.into());
     }
-    let proposal = proposal_id(id, digest, sighashes);
+    let effect = check_plan(kv, epoch, &w, digest, sighashes, plan)?;
+    let proposal = proposal_id(id, digest, sighashes, plan);
     let mut tail = id.to_be_bytes().to_vec();
     tail.extend_from_slice(&proposal);
     let key = key1(KEY_PREPARE, &tail);
@@ -599,12 +743,26 @@ pub(crate) fn apply_prepare(
     // quorum: fix the transaction and queue its signatures (exactly once: the status changes)
     w.status = STATUS_PREPARED;
     w.digest = *digest;
+    w.plan = plan.to_vec();
+    if let Some(e) = &effect {
+        // the inputs are spent exactly once: removed now, whatever happens to the signing
+        for (t, v) in &e.spend {
+            kv.delete(&utxo_key(t, *v))?;
+        }
+        if let Some((t, v, a)) = e.change {
+            put_utxo(kv, &t, v, a)?;
+        }
+    }
     for (i, sighash) in sighashes.iter().enumerate() {
+        let message = match &effect {
+            Some(e) if w.asset == Scheme::Ed25519 => e.sol_message.clone(),
+            _ => sighash.to_vec(),
+        };
         let r = xsign::request(
             kv,
             height,
             w.asset,
-            *sighash,
+            message,
             RequestTag::Withdrawal {
                 id,
                 index: i as u32,
@@ -615,6 +773,75 @@ pub(crate) fn apply_prepare(
     put_withdrawal(kv, &w)?;
     kv.delete(&key)?;
     Ok(vec![1])
+}
+
+/// What an accepted plan does to the vault's UTXO set.
+struct PlanEffect {
+    spend: Vec<([u8; 32], u32)>,
+    change: Option<([u8; 32], u32, u64)>,
+    sol_message: Vec<u8>,
+}
+
+/// Check a proposal's plan against the burn and the vault's state. An empty plan is accepted
+/// without checks (mock observers); real watchers always send one.
+fn check_plan(
+    kv: &impl KvStore,
+    epoch: u64,
+    w: &Withdrawal,
+    digest: &[u8; 32],
+    sighashes: &[[u8; 32]],
+    plan: &[u8],
+) -> Result<Option<PlanEffect>, VaultFail> {
+    if plan.is_empty() {
+        return Ok(None);
+    }
+    let vkey = output_key(kv, w.asset, epoch)?.ok_or(VaultError::NoKey)?;
+    match w.asset {
+        Scheme::Taproot => {
+            let script = addr::taproot_script_pubkey(&vkey);
+            let missing = std::cell::Cell::new(false);
+            let lookup = |t: &[u8; 32], v: u32| match utxo(kv, t, v) {
+                Ok(Some(a)) => Some(a),
+                _ => {
+                    missing.set(true);
+                    None
+                }
+            };
+            let checked = vault_plan::check_btc(plan, &w.destination, w.amount, &script, &lookup);
+            let (p, amounts) = match checked {
+                Ok(x) => x,
+                Err(_) if missing.get() => return Err(VaultError::UtxoUnavailable.into()),
+                Err(_) => return Err(VaultError::BadPlan.into()),
+            };
+            let prevouts: Vec<(u64, Vec<u8>)> =
+                amounts.iter().map(|a| (*a, script.clone())).collect();
+            let txid = p.tx.txid();
+            let expect: Option<Vec<[u8; 32]>> = (0..p.tx.inputs.len())
+                .map(|i| p.tx.taproot_sighash(i, &prevouts))
+                .collect();
+            if digest != &txid || expect.as_deref() != Some(sighashes) {
+                return Err(VaultError::BadPlan.into());
+            }
+            Ok(Some(PlanEffect {
+                spend: p.tx.inputs.iter().map(|(t, v, _)| (*t, *v)).collect(),
+                change: p.change.map(|(i, a)| (txid, i, a)),
+                sol_message: Vec::new(),
+            }))
+        }
+        Scheme::Ed25519 => {
+            vault_plan::check_sol(plan, &vkey, &w.destination, w.amount)
+                .map_err(|_| VaultError::BadPlan)?;
+            let h: [u8; 32] = Sha256::digest(plan).into();
+            if digest != &h || sighashes != [h] {
+                return Err(VaultError::BadPlan.into());
+            }
+            Ok(Some(PlanEffect {
+                spend: Vec::new(),
+                change: None,
+                sol_message: plan.to_vec(),
+            }))
+        }
+    }
 }
 
 /// A signing request finished: a withdrawal whose requests are all done becomes `Signed`.
@@ -671,10 +898,26 @@ pub fn deposit_address(scheme: Scheme, output_key: &[u8; 32], hrp: &str) -> Stri
 pub struct Prepared {
     pub digest: [u8; 32],
     pub sighashes: Vec<[u8; 32]>,
+    /// The unsigned external transaction (see [`Withdrawal::plan`]); empty for the mock.
+    pub plan: Vec<u8>,
 }
 
-/// What a validator knows about the external chains. The real implementations (Bitcoin and
-/// Solana chain watchers, `docs/CROSS_CHAIN.md`) read their own full nodes or several providers;
+/// How far a broadcast withdrawal got on the external chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Execution {
+    /// Not broadcast yet, or the endpoint does not know it.
+    Unknown,
+    /// Accepted by the network, not yet final.
+    Pending,
+    /// Final (Bitcoin: at least the configured confirmations; Solana: finalized).
+    Confirmed,
+    /// The external chain refused or dropped it (error status, expired blockhash). The burn
+    /// stays; refunds are planned (`docs/CROSS_CHAIN.md`).
+    Failed,
+}
+
+/// What a validator knows about the external chains. The real implementation
+/// (`btb_node::watch::Watchers`, `docs/CROSS_CHAIN.md`) reads the validator's own endpoints;
 /// the chain never trusts one validator's answer, only two thirds of the stake agreeing.
 pub trait Observer: Send + Sync + std::fmt::Debug {
     /// Deposits to the vault `vault_key` that are final on the external chain.
@@ -683,6 +926,27 @@ pub trait Observer: Send + Sync + std::fmt::Debug {
     /// The unsigned external transaction paying a withdrawal (UTXO selection, fees, recent
     /// blockhash...), or `None` if it cannot be built yet.
     fn prepare(&self, w: &Withdrawal, vault_key: &[u8; 32]) -> Option<Prepared>;
+
+    /// Like [`Observer::prepare`] for observers that build real transactions and need the
+    /// vault's spendable UTXOs (chain state, so identical on every validator).
+    fn prepare_with(
+        &self,
+        w: &Withdrawal,
+        vault_key: &[u8; 32],
+        _utxos: &[VaultUtxo],
+    ) -> Option<Prepared> {
+        self.prepare(w, vault_key)
+    }
+
+    /// A withdrawal whose signatures are on chain: assemble the external transaction and
+    /// broadcast it. Must not block (queue the work); called again until [`Observer::execution`]
+    /// says `Confirmed`, so it must be idempotent.
+    fn broadcast(&self, _w: &Withdrawal, _vault_key: &[u8; 32], _signatures: &[Vec<u8>]) {}
+
+    /// Has the withdrawal's transaction been confirmed on the external chain?
+    fn execution(&self, _w: &Withdrawal) -> Execution {
+        Execution::Confirmed
+    }
 }
 
 /// A scriptable observer for tests and local testnets: deposits are injected by hand and every
@@ -730,6 +994,7 @@ impl Observer for MockObserver {
         Some(Prepared {
             digest: crate::sha256(&[b"btb.mock.unsigned.v1", &sighash]),
             sighashes: vec![sighash],
+            plan: Vec::new(),
         })
     }
 }

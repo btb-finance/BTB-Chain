@@ -3,14 +3,17 @@
 
 #[path = "../../btb-tests/tests/common/mod.rs"]
 mod common;
+mod mock_exchange;
 
 use btb_chain::{
     account_address, contract_address, Address, Hash, Manifest, OracleGenesis, PairConfig,
-    SigningKey, Transaction, TxBody, TxKind, TOTAL_SUPPLY, UNITS_PER_BTB,
+    PriceRules, SigningKey, Transaction, TxBody, TxKind, TOTAL_SUPPLY, UNITS_PER_BTB,
 };
 use btb_codec::{Decode, Encode};
+use btb_node::actions::FetchPolicy;
 use btb_node::config::{GenesisFile, NodeParams, Timing};
 use btb_node::oracle::PriceSource;
+use btb_node::price_sources::{PairSources, SourceConfig};
 use btb_node::{hex, net, open_chain, Node};
 use btb_oracle::{beacon_message, trusted_deal, Beacon, GroupKey, KeyShare, Params};
 use btb_runtime::{KvError, KvStore, MemKv, WriteBatch};
@@ -110,6 +113,8 @@ struct Cluster {
     kvs: Vec<SharedKv>,
     nodes: Vec<Option<Node>>,
     prices: PriceFn,
+    /// Per validator: exchange sources instead of the mock price function.
+    sources: Option<SourcesFn>,
     wallet: Wallet,
     _dir: tempfile::TempDir,
 }
@@ -140,6 +145,17 @@ impl Cluster {
 
     /// `dkg`: `(epoch_len, dkg_window)` -> no trusted dealer; the validators generate the key.
     fn build(total: usize, running: usize, prices: PriceFn, dkg: Option<(u64, u64)>) -> Cluster {
+        Self::build_full(total, running, prices, dkg, None, PriceRules::default())
+    }
+
+    fn build_full(
+        total: usize,
+        running: usize,
+        prices: PriceFn,
+        dkg: Option<(u64, u64)>,
+        sources: Option<SourcesFn>,
+        rules: PriceRules,
+    ) -> Cluster {
         let keys: Vec<SigningKey> = (0..total).map(|i| key(10 + i as u8)).collect();
         let faucet = Wallet {
             key: key(99),
@@ -185,6 +201,7 @@ impl Cluster {
                     },
                 ],
                 max_age_blocks: 200,
+                rules,
             }),
             validators: keys
                 .iter()
@@ -203,6 +220,7 @@ impl Cluster {
             group,
             dkg: dkg.is_some(),
             prices,
+            sources,
             wallet: faucet,
             _dir: tempfile::tempdir().unwrap(),
         };
@@ -233,8 +251,15 @@ impl Cluster {
         p.oracle_share = self.shares.get(i).cloned();
         p.dkg_dir = Some(self._dir.path().join(format!("dkg{i}")));
         p.price_interval_ms = 150;
-        let f = self.prices.clone();
-        p.price_source = Some(PriceSource::new(move |pair| f(i, pair)));
+        if let Some(src) = &self.sources {
+            // real fetching against local mock exchanges, with the relaxed test policy
+            p.price_sources = src(i);
+            p.price_fetch_interval_ms = 100;
+            p.fetch_policy = FetchPolicy::test_mode();
+        } else {
+            let f = self.prices.clone();
+            p.price_source = Some(PriceSource::new(move |pair| f(i, pair)));
+        }
         let state = open_chain(self.kvs[i].clone(), &self.genesis).unwrap();
         self.nodes[i] = Some(Node::start(p, state).unwrap());
     }
@@ -569,6 +594,79 @@ fn a_validator_reporting_garbage_prices_cannot_move_the_median() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+type SourcesFn = Arc<dyn Fn(usize) -> Vec<PairSources> + Send + Sync>;
+
+#[test]
+fn validators_fetch_exchange_sources_and_lying_sources_cannot_move_the_price() {
+    use mock_exchange::{MockExchange, MockResp};
+    let _g = serial();
+    let body = |s: String| move |_: &str| MockResp::json(&s);
+    // three honest exchanges in three answer shapes, and one that lies by a factor of ten
+    let ex_a = MockExchange::start(body(r#"{"price":"65000.10"}"#.into()));
+    let ex_b = MockExchange::start(body(r#"{"data":{"amount":"65000.30"}}"#.into()));
+    let ex_c = MockExchange::start(body(r#"{"data":[{"last":"65000.20"}]}"#.into()));
+    let ex_l = MockExchange::start(body(r#"{"price":"650000.00"}"#.into()));
+    let (pa, pb, pc, pl) = (ex_a.port, ex_b.port, ex_c.port, ex_l.port);
+    let sources: SourcesFn = Arc::new(move |i| {
+        let mk = |sources: Vec<SourceConfig>| {
+            vec![PairSources {
+                pair: "BTC/USD".into(),
+                sources,
+                min_sources: 2,
+                max_age_ms: 5_000,
+                outlier_bps: 100,
+            }]
+        };
+        let u = |p: u16| format!("http://127.0.0.1:{p}/");
+        match i {
+            // validator 3: every source lies
+            3 => mk(vec![
+                SourceConfig::new("l1", &u(pl), "/price"),
+                SourceConfig::new("l2", &format!("{}?x=2", u(pl)), "/price"),
+                SourceConfig::new("l3", &format!("{}?x=3", u(pl)), "/price"),
+            ]),
+            // validator 2: one of three lies, outlier rejection must drop it
+            2 => mk(vec![
+                SourceConfig::new("a", &u(pa), "/price"),
+                SourceConfig::new("b", &u(pb), "/data/amount"),
+                SourceConfig::new("l", &u(pl), "/price"),
+            ]),
+            _ => mk(vec![
+                SourceConfig::new("a", &u(pa), "/price"),
+                SourceConfig::new("b", &u(pb), "/data/amount"),
+                SourceConfig::new("c", &u(pc), "/data/0/last"),
+            ]),
+        }
+    });
+    let rules = PriceRules {
+        update_deviation_bps: 5,
+        heartbeat_blocks: 10,
+        breaker_bps: 500,
+        breaker_window: 32,
+        breaker_resume_blocks: 3,
+        twap_max_window: 64,
+    };
+    let none: PriceFn = Arc::new(|_, _| None);
+    let c = Cluster::build_full(4, 4, none, None, Some(sources), rules);
+    c.wait_connected();
+    c.wait_until("a fetched BTC/USD price", 60, || c.price(0, 0).is_some());
+    // honest validators report 65000.20 (v2 after dropping its liar), v3 reports 650000:
+    // the stake-weighted median ignores the minority
+    let want = 6_500_020_000_000u128;
+    for _ in 0..10 {
+        for i in 0..4 {
+            if let Some(p) = c.price(i, 0) {
+                let v: u128 = p["price"].as_str().unwrap().parse().unwrap();
+                assert_eq!(v, want, "node {i} saw a moved price");
+                assert!(p["paused"] == json!(false) || p["paused"].is_null(), "{p}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    assert!(c.price(0, 1).is_none(), "no sources, no price for ETH/USD");
+    assert!(ex_l.hits() > 0 && ex_a.hits() > 0 && ex_b.hits() > 0 && ex_c.hits() > 0);
 }
 
 #[test]

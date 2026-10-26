@@ -209,6 +209,12 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
         })
     }
 
+    /// Is the circuit breaker of `pair`'s feed open?
+    fn price_paused(&mut self, pair: u32) -> bool {
+        let r = self.kv.get(&layout::oracle_breaker_key(pair));
+        self.kv(r).is_some_and(|b| b.first() == Some(&1))
+    }
+
     fn tbl<T: Default>(&mut self, r: Result<T, TableError>) -> T {
         r.unwrap_or_else(|e| {
             self.note(Fault::Table(e));
@@ -348,7 +354,31 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
             price: u128::from_le_bytes(b[..16].try_into().ok()?),
             height: u64::from_le_bytes(b[16..24].try_into().ok()?),
             decimals: b[24],
+            paused: self.price_paused(pair),
         })
+    }
+
+    fn price_twap(&mut self, pair: u32, window: u64) -> btb_vm::host::TwapOutcome {
+        use btb_vm::host::TwapOutcome;
+        let r = self.kv.get(&layout::oracle_price_key(pair));
+        let Some(b) = self.kv(r) else {
+            return TwapOutcome::NotFound;
+        };
+        if b.len() != 29 {
+            return TwapOutcome::NotFound;
+        }
+        if self.price_paused(pair) {
+            return TwapOutcome::Paused;
+        }
+        let now = self.height;
+        match crate::twap::twap(&self.kv, pair, now, window) {
+            Ok(twap) => TwapOutcome::Ok {
+                twap,
+                decimals: b[24],
+            },
+            Err(crate::twap::TwapError::NoPrice) => TwapOutcome::NotFound,
+            Err(crate::twap::TwapError::BadWindow) => TwapOutcome::BadWindow,
+        }
     }
 
     fn tokens(&mut self) -> Option<&mut dyn TokenStore> {

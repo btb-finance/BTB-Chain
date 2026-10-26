@@ -10,7 +10,7 @@
 
 use btb_sdk::btb;
 use btb_sdk::host;
-use btb_sdk::oracle::{price, random};
+use btb_sdk::oracle::{price, price_checked, price_twap, random, PriceError};
 use btb_sdk::prelude::Vec;
 
 const ROLLS: &[u8] = b"rolls";
@@ -94,4 +94,35 @@ pub fn use_price(pair: u32, max_age: u64) -> u128 {
     }
     host::storage_set(PRICE_SEEN, &p.price.to_le_bytes());
     p.price
+}
+
+/// Why a price is not available: 0 = fine, 1 = no such feed or no price yet, 2 = paused.
+#[btb::query]
+pub fn quote_status(pair: u32) -> u8 {
+    match price_checked(pair) {
+        Ok(_) => 0,
+        Err(PriceError::Paused) => 2,
+        Err(_) => 1,
+    }
+}
+
+/// TWAP over `window` blocks as `(status, price)`: status 0 ok, 1 not found, 2 paused, 3 bad window.
+#[btb::query]
+pub fn twap(pair: u32, window: u64) -> (u8, u128) {
+    match price_twap(pair, window) {
+        Ok(t) => (0, t.price),
+        Err(PriceError::NotFound) => (1, 0),
+        Err(PriceError::Paused) => (2, 0),
+        Err(PriceError::BadWindow) => (3, 0),
+    }
+}
+
+/// TWAP inside a mutation (pays the per-read fee); aborts if the feed is paused.
+#[btb::mutation]
+pub fn use_twap(pair: u32, window: u64) -> u128 {
+    match price_twap(pair, window) {
+        Ok(t) => t.price,
+        Err(PriceError::Paused) => host::abort("feed paused"),
+        Err(_) => host::abort("no twap"),
+    }
 }

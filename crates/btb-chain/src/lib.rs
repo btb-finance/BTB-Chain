@@ -25,6 +25,7 @@ pub mod state;
 pub mod storage;
 pub mod tx;
 pub mod vault;
+pub mod vault_plan;
 pub mod xdkg;
 pub mod xdkg_agent;
 pub mod xsign;
@@ -38,7 +39,7 @@ pub use dkg::{DkgError, DkgOp};
 pub use exec::{BlockError, ExecMode, Executor, Invalid, Origin, Receipt, Revert, Status};
 pub use host::{HostError, HostOp};
 pub use mempool::{Mempool, MempoolConfig, MempoolError};
-pub use oracle::{OracleGenesis, OracleInput, PairConfig};
+pub use oracle::{OracleGenesis, OracleInput, PairConfig, PriceRules};
 pub use parallel::ParStats;
 pub use staking::{
     ActiveValidator, EpochRecord, GenesisValidator, SlashOutcome, StakeError, StakingConfig,
