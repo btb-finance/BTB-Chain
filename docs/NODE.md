@@ -94,7 +94,7 @@ A node whose key is not in the validator set ("observing only") follows the chai
 
 - A follower is any peer with an ed25519 identity. Up to `max_peers` stay connected; further ones are disconnected (counted in `net.dropped_follower`).
 - A follower may send **block sync requests and nothing else**. Any other frame is dropped and counts as a strike (a peer with 20 strikes in 10 s is banned for 30 s). Followers are never sent consensus traffic, are not in the broadcast set, and cannot submit transactions.
-- Each follower has its own token bucket (`rate_per_sec` sustained, `rate_burst` burst; a request costs 1), stricter than the validators' (2,000/s). A sync answer is at most a few MiB built from the block store, so the limit bounds the work a follower can ask for.
+- Each follower has its own token bucket (`rate_per_sec` sustained, `rate_burst` burst; a request costs 1), stricter than the validators' (2,000/s). A sync answer is built from the block store (up to about 25 MiB of payload plus proof blocks), so the limit bounds the work a follower can ask for.
 - The answers are verified by the follower itself (`sync::verify`), so serving it needs no trust in either direction. `btb_status` shows `net.followers` and `net.dropped_follower`; `sync.served` counts answers to validators and followers alike.
 - `sync_poll_ms` (node.json, library `NodeParams::sync_poll_ms`) shortens the "no commit for 1 s" wait before a node asks for blocks and the 300 ms request gap; hosting nodes set it to 100.
 

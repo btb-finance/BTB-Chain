@@ -15,6 +15,7 @@ The project is in its **design phase**, heading into **Phase 1 (VM + Rust SDK)**
 | `IDEA.md` | The problem BTB solves and why (the page to share) |
 | `README.md` | Overview and quick summary |
 | `ROADMAP.md` | Six phases, deliverables as checkboxes, gates between phases |
+| `docs/WHY_BTB.md` | Comparison with Ethereum and Solana: services an app needs, who earns, speed, honest gaps |
 | `docs/QUICKSTART.md` | Run a local network, deploy and call the example token, add a cron; measured throughput |
 | `docs/ARCHITECTURE.md` | Network, consensus, state model, tech stack |
 | `docs/DEV_SERVER.md` | `btb-dev`: single-node dev server (HTTP, live queries over SSE), the Phase 2 gate demo |

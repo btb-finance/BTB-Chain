@@ -104,6 +104,7 @@ Full details: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation
 
+- [Why BTB](docs/WHY_BTB.md) — compared with Ethereum and Solana: what an app needs, who earns, speed, and where BTB is not ahead yet
 - [Architecture](docs/ARCHITECTURE.md) — state model, network, consensus, hosting
 - [Languages](docs/LANGUAGE.md) — Rust SDK, any language via RISC-V, Convex-style project layout
 - [Tokenomics](docs/TOKENOMICS.md) — fixed supply, fees, payment channels
