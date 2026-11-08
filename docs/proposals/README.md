@@ -16,3 +16,4 @@ Design changes go through a Design Proposal before code (see [AGENTS.md](../../A
 | # | Title | Status |
 | --- | --- | --- |
 | [0001](0001-consensus-fast-path.md) | Consensus-level fast path for owner-only transactions | Draft |
+| [0002](0002-accounts.md) | Named accounts with hidden, rotating keys (names, passkeys, recovery, post-quantum path) | Draft |

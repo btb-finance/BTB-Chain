@@ -67,7 +67,26 @@ btb-faucet --key faucet.key --rpc 127.0.0.1:8545 --rpc 127.0.0.1:8546 --bind 127
 **Keys**
 
 - Each validator key (`validator.key`) lives on its validator host only, mode `0600`, never shared. The same key is the libp2p identity.
-- `btb-node init-testnet` writes every key to one machine, which is right for a local run and wrong for a public one. For a public net each operator generates their own key, sends only the **public key** (and a funded account address) to the coordinator, and the coordinator assembles the genesis. Today that assembly is by hand: write `genesis.json` with the operators' public keys, stakes and allocations (see the format `init-testnet` writes), check `validate` accepts it (the node refuses a genesis whose allocations do not add up to exactly 1,000,000,000 BTB), and note that **every validator must start from byte-identical semantic content**: the genesis hash covers the validator set, balances and parameters.
+- `btb-node init-testnet` writes every key to one machine, which is right for a local run and wrong for a public one. For a public net each operator generates their own key and sends only **public** information to a coordinator, who assembles the genesis. Three commands do this (`crates/btb-node/src/operators.rs`); no secret leaves the machine it was made on:
+
+  ```
+  # 1. each operator, on their validator host
+  btb-node operator-key --dir ~/btb --name alice --ip <public ip> [--port 9000]
+  #    -> ~/btb/validator.key (secret, 0600, never overwritten) and ~/btb/operator.json (public: send it)
+
+  # 2. the coordinator, with every operator.json
+  btb-node assemble-genesis --operators alice.json,bob.json,carol.json,dave.json \
+           --treasury <account address> --out published [--chain-id 77] [--name btb-testnet] \
+           [--stake 100000] [--validator-balance 1000000] [--epoch-len 600]
+  #    -> published/genesis.json, published/peers.json and the genesis hash to publish
+
+  # 3. each operator, with the published files and hash
+  btb-node node-config --dir ~/btb --genesis genesis.json --peers peers.json --genesis-hash <hash> \
+           [--port 9000] [--rpc-port 8545] [--data-dir true]
+  btb-node run --config ~/btb/node.json
+  ```
+
+  `operator.json` holds the name, public key, account and peer address; its peer address must name the key's own peer id, so a key cannot be paired with someone else's address. `assemble-genesis` refuses duplicate keys or names, a treasury that is a validator account, and balances above the supply; each validator account gets `--validator-balance` BTB with `--stake` bonded, the **treasury** account (a faucet or a multisig; make its key with `btb keygen`) gets the rest of the 1,000,000,000 BTB, and `validate` must pass. `node-config` refuses a genesis whose SHA-256 differs from the published hash and a key that is not a validator in it, listens on all interfaces at `--port`, keeps RPC on loopback and lists every other operator as a peer. **Every validator must start from the byte-identical file**: the genesis covers the validator set, balances and parameters. Oracles are off in an assembled genesis (enable them by hand before publishing if needed).
 - Each operator needs the other validators' `peers` entries: `/ip4/<public ip>/udp/<port>/quic-v1/p2p/<peer id>`, where `btb-node peer-id --key validator.key` prints the peer id.
 
 **Genesis distribution**
@@ -89,7 +108,7 @@ btb-faucet --key faucet.key --rpc 127.0.0.1:8545 --rpc 127.0.0.1:8546 --bind 127
 
 ## Not done
 
-- No public deployment, no domain, no TLS, no hosted genesis, no operator onboarding.
+- No public deployment, no domain, no TLS, no hosted genesis. Operator onboarding is the three commands above; peer addresses are still exchanged by hand.
 - The explorer polls (once a second) instead of streaming, shows what the node it is served from knows (an in-memory node keeps the newest 4096 heights), and has no contract table browser yet. Blocks cannot be looked up by hash.
 - The faucet limits are in memory and per instance; there is no captcha and no account-based quota.
 - Joining a running network as a non-validator follower and state sync are not built ([NODE.md](NODE.md#limits)), so a public testnet today means a fixed set of validators from genesis.

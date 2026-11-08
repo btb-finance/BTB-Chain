@@ -14,6 +14,7 @@ pub mod driver;
 pub mod explorer;
 pub mod hex;
 pub mod net;
+pub mod operators;
 pub mod oracle;
 pub mod oracle_rpc;
 pub mod price_sources;
