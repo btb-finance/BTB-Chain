@@ -29,12 +29,16 @@ pub const KIND_ORACLE: u8 = 5;
 /// Most consensus blocks in one sync response (committed blocks plus the blocks that prove them).
 pub const MAX_SYNC_CHAIN: usize = 24;
 
-/// Largest frame accepted from a peer. A sync response carries up to 64 blocks of at most
-/// `MAX_PAYLOAD` bytes each.
-pub const MAX_FRAME: usize = 20 << 20;
 /// Largest block payload (also the consensus `max_payload_bytes`). Transactions bigger than
 /// this are never included in a block.
-pub const MAX_PAYLOAD: usize = 256 << 10;
+pub const MAX_PAYLOAD: usize = 25 << 20;
+/// Payload bytes a sync answer packs before it stops adding blocks (it always carries at least
+/// one block, so one full block still syncs).
+pub const SYNC_PAYLOAD_BUDGET: usize = MAX_PAYLOAD;
+/// Largest frame accepted from a peer. The biggest is a sync response: blocks up to
+/// `SYNC_PAYLOAD_BUDGET` plus one more block, two blocks proving the commit and up to three
+/// blocks of an epoch proof, so six full payloads, plus headers, votes and certificates.
+pub const MAX_FRAME: usize = 6 * MAX_PAYLOAD + (4 << 20);
 
 pub fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(body.len() + 1);
