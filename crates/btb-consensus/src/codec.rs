@@ -3,7 +3,7 @@
 
 use crate::types::*;
 
-const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
 
 struct W(Vec<u8>);
 impl W {

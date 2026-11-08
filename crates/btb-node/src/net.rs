@@ -246,7 +246,7 @@ pub fn start(
                     FrameCodec,
                     [(PROTOCOL, ProtocolSupport::Full)],
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(5))
+                        .with_request_timeout(Duration::from_secs(60))
                         .with_max_concurrent_streams(MAX_INFLIGHT_PER_PEER),
                 )
             })
@@ -591,7 +591,9 @@ impl NetTask {
         });
         b.tokens = (b.tokens + now.duration_since(b.last).as_secs_f64() * rate).min(burst);
         b.last = now;
-        let cost = 1.0 + (data.len() / 4096) as f64;
+        // One token per message plus one per 64 KiB, so a full 25 MiB block (about 400 tokens)
+        // fits in a validator's burst.
+        let cost = 1.0 + (data.len() / 65536) as f64;
         if b.tokens < cost {
             self.handle
                 .stats

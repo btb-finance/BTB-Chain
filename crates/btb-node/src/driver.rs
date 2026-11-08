@@ -33,7 +33,7 @@ use crate::storage::{ExecLog, ExecMeta, FileSafety};
 use crate::sync::{self, Expect, SyncError};
 use crate::wire::{
     consensus_frame, payload_ok, sync_request_frame, sync_response_frame, tx_frame, Batch, Inbound,
-    SyncResponse, MAX_PAYLOAD,
+    SyncResponse, MAX_PAYLOAD, SYNC_PAYLOAD_BUDGET,
 };
 use btb_chain::{
     account_address, Address, Block as ChainBlock, ChainConfig, ChainState, Executor, Mempool,
@@ -1184,10 +1184,16 @@ impl<S: KvStore + 'static> Driver<S> {
     fn answer_block_request(&mut self, epoch: u64, to: u32, block_id: Hash) {
         let mut blocks = Vec::new();
         let mut cur = block_id;
+        let mut bytes = 0usize;
         while blocks.len() < 64 {
             let Some(b) = self.store.block_by_id(&cur) else {
                 break;
             };
+            // Stay within one frame: at most about five full payloads.
+            if !blocks.is_empty() && bytes + b.payload.len() > 4 * SYNC_PAYLOAD_BUDGET {
+                break;
+            }
+            bytes += b.payload.len();
             cur = b.parent;
             blocks.push(b);
         }
@@ -1356,8 +1362,13 @@ impl<S: KvStore + 'static> Driver<S> {
         let end = cfg.epoch_end(epoch);
         let mut blocks = Vec::new();
         let mut h = from;
+        let mut bytes = 0usize;
         while h <= end && blocks.len() < SYNC_RANGE {
             let Some(b) = self.store.get(h) else { break };
+            if !blocks.is_empty() && bytes + b.consensus.payload.len() > SYNC_PAYLOAD_BUDGET {
+                break;
+            }
+            bytes += b.consensus.payload.len();
             blocks.push(b.consensus);
             h += 1;
         }
