@@ -44,6 +44,25 @@ Payment channels keep this cheap: an app locks BTB once, signs tiny vouchers off
 
 The supply is fixed at 1,000,000,000 BTB with no minting. Validators earn only from fees, with a proposed reserve from the genesis supply for the early years.
 
+## Accounts and names (planned)
+
+Ethereum and Solana tie an account to one key forever: lose the key or the seed phrase and the funds are gone, and once an account has sent a transaction its public key is public, so a future quantum computer could derive the private key and empty it. BTB plans a different model ([proposal 0002](proposals/0002-accounts.md), Draft, not built yet):
+
+| | Ethereum / Solana | BTB (planned) |
+| --- | --- | --- |
+| What you send to | `0x71C7…` / `7xKX…` | **`alice.btb`** (and `btb1…` with a typo checksum for machines) |
+| Account and key | The address *is* the key; it can never change | The account is permanent; its keys can be added, replaced or removed |
+| Public keys on chain | Visible after the first transaction, forever | **Never stored**: the chain keeps only a hash of each key |
+| Using a key | Same key every time | **One-time keys**: the transaction that reveals a key also switches the account to a new hidden key, so a revealed key never controls funds again |
+| Quantum computers | Every account that ever sent a transaction is exposed | Hashes cannot be broken by quantum computers; only a ~1 s window while a transaction is pending remains, closed by post-quantum signatures in the last phase |
+| Logging in | Seed phrase, browser wallet | **Passkeys** (Face ID, fingerprint) for everyday spending with a daily limit; no seed phrase |
+| Losing a device | Funds lost | Other devices keep working; **guardian recovery** with a 48-hour wait the owner can veto |
+| Savings | One key guards everything | A **vault account** behind your name with hidden one-time keys, and an everyday account you top up from it |
+| Names | ENS / SNS: separate contracts and fees | **Built into the chain**; a refundable deposit, nothing minted |
+| Selling a name | Through a marketplace contract | **Native atomic swap**: list a price, the buyer pays and receives the name in one transaction, no middleman |
+
+Build order: hidden rotating keys, then names (including selling), then passkeys, then recovery, then post-quantum signatures. Existing accounts keep working and can move to the new model.
+
 ## Speed and capacity
 
 | | Ethereum | Solana | BTB (measured on one machine) |
@@ -74,6 +93,7 @@ Being honest about this is part of the design:
 - **Small validator set.** Votes are all-to-all, fine for tens of validators, not thousands. Ethereum has far more independent validators.
 - **Fixed validator set and manual peering.** Validators are fixed at genesis, peers' addresses are configured by hand, and there is no snapshot sync for new nodes yet ([NODE.md](NODE.md#limits)).
 - **Speed numbers are local.** Finality and throughput above were measured on one machine; a network across continents will be slower.
+- **Accounts are still one key each.** Names, hidden rotating keys, passkeys and recovery are a design proposal, not code yet (see [Accounts and names](#accounts-and-names-planned)).
 - **Transfers are public**, like on Ethereum and Solana; there is no privacy layer.
 - **Raw write speed is below a single server.** Every write must be agreed by validators, so a centralized backend like Convex will always write faster; BTB trades that for no single owner.
 
