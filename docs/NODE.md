@@ -4,6 +4,8 @@
 
 Status: a working multi-validator testnet node with persistent storage, evidence-to-slashing and block sync. Also built: an embedded block explorer and a faucet ([TESTNET.md](TESTNET.md)). Not done: a public deployment, state sync from snapshots (see [Limits](#limits)).
 
+For a network where each operator runs a validator on their own machine, see `operator-key`, `assemble-genesis` and `node-config` in [TESTNET.md](TESTNET.md#running-a-public-testnet-plan-not-done).
+
 ## Run a local 4-validator testnet
 
 ```
