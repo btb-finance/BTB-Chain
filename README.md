@@ -9,6 +9,8 @@
 
 > **Status: design phase.** This repository holds the BTB Chain specification and roadmap. Phase 1 (RISC-V VM + Rust SDK) is the next milestone. The earlier Arbitrum Orbit L3 design has been retired; it remains available on the `orbit-legacy` branch.
 
+> **Run the chain:** start a local 4-validator network, deploy a token and schedule a transfer in a few commands, see [docs/QUICKSTART.md](docs/QUICKSTART.md).
+>
 > **Try it:** the Phase 2 demo (`examples/todo` with a live page) runs on the single-node dev server, see [docs/DEV_SERVER.md](docs/DEV_SERVER.md).
 
 ## Why BTB Chain
