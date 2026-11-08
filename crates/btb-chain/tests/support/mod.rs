@@ -57,6 +57,7 @@ impl Wallet {
             TxBody {
                 relayer,
                 session: None,
+                account: None,
                 chain_id: self.chain_id,
                 nonce: self.nonce,
                 kind,

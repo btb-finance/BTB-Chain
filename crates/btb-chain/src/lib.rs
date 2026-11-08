@@ -6,6 +6,7 @@
 //! nothing uses floats or hash-map iteration order. Queries and actions are never
 //! transactions. See `docs/CHAIN.md`.
 
+pub mod account;
 pub mod actions;
 pub mod block;
 pub mod channel;
@@ -16,6 +17,7 @@ pub mod dkg_agent;
 pub mod exec;
 pub mod host;
 pub mod mempool;
+pub mod names;
 pub mod oracle;
 pub(crate) mod parallel;
 pub mod reports;

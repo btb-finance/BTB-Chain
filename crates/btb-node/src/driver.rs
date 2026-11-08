@@ -1122,6 +1122,7 @@ impl<S: KvStore + 'static> Driver<S> {
                 TxBody {
                     relayer: None,
                     session: None,
+                    account: None,
                     chain_id: self.chain_id,
                     nonce,
                     kind: TxKind::Dkg(op),
@@ -1637,6 +1638,7 @@ impl<S: KvStore + 'static> Driver<S> {
             TxBody {
                 relayer: None,
                 session: None,
+                account: None,
                 chain_id: self.chain_id,
                 nonce,
                 kind: TxKind::SubmitEvidence {
@@ -1687,6 +1689,12 @@ impl<S: KvStore + 'static> Driver<S> {
             // The mempool is stateless; a session grant lives in state (`btb-chain::session`).
             self.state
                 .check_session(&tx)
+                .map_err(|e| format!("Invalid({e:?})"))?;
+        }
+        if tx.body.account.is_some() {
+            // Key slots live in state too (`btb-chain::account`).
+            self.state
+                .check_account(&tx)
                 .map_err(|e| format!("Invalid({e:?})"))?;
         }
         let sender = tx.sender();
@@ -1772,6 +1780,59 @@ impl<S: KvStore + 'static> Driver<S> {
                     .map_err(|e| RpcError::app(e.to_string()))?;
                 // Strings: u64 balances exceed what JSON numbers carry safely in many clients.
                 Ok(json!({"balance": bal.to_string(), "nonce": nonce}))
+            }
+            "btb_getName" => {
+                // `alice` or `alice.btb` -> owner, listing, deposit; `null` if unregistered.
+                let raw = arg(0)?
+                    .as_str()
+                    .ok_or_else(|| RpcError::invalid_params("name must be a string"))?;
+                let name = btb_chain::names::strip_suffix(raw);
+                let rec = self
+                    .state
+                    .name(name)
+                    .map_err(|e| RpcError::app(e.to_string()))?;
+                let Some(rec) = rec else {
+                    return Ok(Value::Null);
+                };
+                let deposit = self
+                    .state
+                    .name_deposit(name)
+                    .map_err(|e| RpcError::app(e.to_string()))?;
+                Ok(json!({
+                    "name": format!("{name}.btb"),
+                    "owner": hex::encode(&rec.owner),
+                    "deposit": deposit.to_string(),
+                    "listing": rec.listing.map(|l| json!({
+                        "price": l.price.to_string(),
+                        "buyer": l.buyer.map(|b| hex::encode(&b)),
+                        "expires_height": l.expires_height,
+                    })),
+                }))
+            }
+            "btb_getNameOf" => {
+                let a = h32(0)?;
+                let n = self
+                    .state
+                    .name_of(&a)
+                    .map_err(|e| RpcError::app(e.to_string()))?;
+                Ok(json!(n.map(|n| format!("{n}.btb"))))
+            }
+            "btb_getAccountSlots" => {
+                // Only commitments exist on chain; public keys are never stored.
+                let a = h32(0)?;
+                let rec = self
+                    .state
+                    .account(&a)
+                    .map_err(|e| RpcError::app(e.to_string()))?;
+                Ok(json!(rec.map(|r| r
+                    .slots
+                    .iter()
+                    .map(|s| json!({
+                        "commitment": hex::encode(&s.commitment),
+                        "admin": s.admin,
+                        "rotate": s.rotate,
+                    }))
+                    .collect::<Vec<_>>())))
             }
             "btb_query" => {
                 let contract = h32(0)?;
@@ -2156,6 +2217,7 @@ mod tests {
                     TxBody {
                         relayer: None,
                         session: None,
+                        account: None,
                         chain_id: CHAIN_ID,
                         nonce,
                         kind: TxKind::Transfer {

@@ -16,6 +16,8 @@
 //! Dkg               (tag 14): sub:u8 || fields (`dkg.rs`: 0 deal, 1 complain), sent by a consensus key
 //! Cross             (tag 21): sub:u8 || fields (`cross.rs`: 0 deal, 1 complain, 2 signature, 3 evidence, 4 attest, 5 prepare, 6 withdraw)
 //! Upgrade           (tag 23): contract[32] || code:bytes || manifest || budget_gas:u64 (`upgrade.rs`)
+//! Account           (tag 24): sub:u8 || fields (`account.rs`: 0 create, 1 set slots)
+//! Name              (tag 25): sub:u8 || name:string || fields (`names.rs`: 0 register .. 6 pay)
 //! Session           (tag 22): sub:u8 || fields (`session.rs`: 0 grant, 1 revoke), signed by the account
 //! Host              (tag 20): sub:u8 || fields (`host.rs`: 0 register url:bytes, 1 unregister)
 //! Action            (tag 13): sub:u8 || fields (`actions.rs`: 0 request an HTTPS action, 1 set the contract's hosts)
@@ -39,6 +41,10 @@
 //! transaction's `public_key` is then the session key, the sender (nonce, fee payer, `caller()`)
 //! is the account, and the chain checks the account's grant. The field is inside the signed body.
 //! A body without a session is byte-for-byte what it was before.
+//!
+//! A body may also act as an **account with key slots** (`account.rs`): the tag's bit `0x20` is
+//! set and `account[32] || slot:u8 || next:Option<[32]>` follows the session (if any). The
+//! transaction's `public_key` must hash to that slot's commitment; the sender is the account.
 //!
 //! `kind` is the entry-point kind (0 query, 1 mutation, 2 cron, 3 action). All four decode so
 //! the error is a clear "kind not allowed", but only mutation is valid in a `Call`: queries never
@@ -71,6 +77,8 @@ const RELAYER_FLAG: u8 = 0x80;
 /// Second-highest bit of the tag byte: a 32-byte account address follows (after the relayer, if
 /// any): the transaction is signed by a session key of that account (tx encoding v3).
 const SESSION_FLAG: u8 = 0x40;
+/// Third bit of the tag byte: an [`crate::account::AccountAuth`] follows (tx encoding v4).
+const ACCOUNT_FLAG: u8 = 0x20;
 
 const SIG_DOMAIN: &[u8] = b"btb.tx.sig.v1";
 const ID_DOMAIN: &[u8] = b"btb.tx.id.v1";
@@ -313,6 +321,10 @@ pub enum TxKind {
     },
     /// Grant or revoke a session key (`crate::session`), signed by the account itself.
     Session(crate::session::SessionOp),
+    /// Create an account with key slots, or change the sender account's slots (`crate::account`).
+    Account(crate::account::AccountOp),
+    /// Register, sell, give or pay a name (`crate::names`).
+    Name(crate::names::NameOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -393,6 +405,9 @@ pub struct TxBody {
     /// `Some(account)`: signed by a session key of `account` and acting as it (`session.rs`).
     /// `None` encodes exactly as before this field existed.
     pub session: Option<Address>,
+    /// `Some`: acting as an account with key slots (`account.rs`). `None` encodes exactly as
+    /// before this field existed.
+    pub account: Option<crate::account::AccountAuth>,
     pub kind: TxKind,
 }
 
@@ -498,6 +513,14 @@ impl Encode for TxBody {
                 22u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Account(op) => {
+                24u8.encode_to(out);
+                op.encode_to(out);
+            }
+            TxKind::Name(op) => {
+                25u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
         // v2: a relayer sets the tag's high bit and follows it as 32 bytes; v3: a session
         // account sets bit 0x40 and follows the relayer.
@@ -509,6 +532,10 @@ impl Encode for TxBody {
         if let Some(account) = &self.session {
             out[tag_pos] |= SESSION_FLAG;
             extra.extend_from_slice(account);
+        }
+        if let Some(auth) = &self.account {
+            out[tag_pos] |= ACCOUNT_FLAG;
+            auth.encode_to(&mut extra);
         }
         out.splice(tag_pos + 1..tag_pos + 1, extra);
     }
@@ -529,7 +556,12 @@ impl TxBody {
         } else {
             None
         };
-        let kind = match tag & !(RELAYER_FLAG | SESSION_FLAG) {
+        let account = if tag & ACCOUNT_FLAG != 0 {
+            Some(crate::account::AccountAuth::decode_from(r)?)
+        } else {
+            None
+        };
+        let kind = match tag & !(RELAYER_FLAG | SESSION_FLAG | ACCOUNT_FLAG) {
             0 => TxKind::Deploy {
                 code: Vec::decode_from(r)?,
                 manifest: Manifest::decode_from(r)?,
@@ -603,6 +635,14 @@ impl TxBody {
                 Ok(op) => TxKind::Session(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
+            24 => match crate::account::AccountOp::decode_from(r)? {
+                Ok(op) => TxKind::Account(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            25 => match crate::names::NameOp::decode_from(r)? {
+                Ok(op) => TxKind::Name(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
             t => return Err(TxError::BadTag(t)),
         };
         Ok(TxBody {
@@ -610,6 +650,7 @@ impl TxBody {
             nonce,
             relayer,
             session,
+            account,
             kind,
         })
     }
@@ -651,6 +692,9 @@ impl Transaction {
     /// The account the transaction acts as: the session's account if a session key signed it,
     /// else the address of the signing key. Nonce, fee and `caller()` are this account's.
     pub fn sender(&self) -> Address {
+        if let Some(a) = &self.body.account {
+            return a.account;
+        }
         self.body.session.unwrap_or_else(|| self.signer())
     }
 
@@ -722,6 +766,8 @@ impl Transaction {
             TxKind::Action(op) => op.gas(),
             TxKind::Host(op) => op.gas(),
             TxKind::Session(op) => op.gas(),
+            TxKind::Account(op) => op.gas(),
+            TxKind::Name(op) => op.gas(),
             TxKind::Upgrade { code, .. } => crate::upgrade::UPGRADE_BASE_GAS
                 .saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64)),
             TxKind::Deploy { code, .. } => {

@@ -9,6 +9,9 @@
 //! | `btb_getReceipt` | `[tx_id_hex]` | receipt or `null` |
 //! | `btb_getBlock` | `[height or "latest"]` | block summary or `null` |
 //! | `btb_getBalance` | `[address_hex]` | `{balance, nonce}` |
+//! | `btb_getName` | `[name]` (`alice` or `alice.btb`) | `{name, owner, deposit, listing}` or `null` |
+//! | `btb_getNameOf` | `[address_hex]` | `"alice.btb"` or `null` |
+//! | `btb_getAccountSlots` | `[account_hex]` | `[{commitment, admin, rotate}]` or `null` (public keys are never stored) |
 //! | `btb_query` | `[contract_hex, function, args_hex?, caller_hex?]` | `{output, gas_used}` |
 //! | `btb_getBlocks` | `[before?, limit?]` | newest-first block summaries |
 //! | `btb_getTransaction` | `[tx_id_hex]` | transaction fields plus receipt, or `null` |

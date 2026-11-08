@@ -1316,6 +1316,7 @@ fn edge_relays_only_transactions_that_name_it() {
                 nonce: 0,
                 relayer,
                 session: None,
+                account: None,
                 kind: TxKind::Transfer {
                     to: [9; 32],
                     amount: 1,

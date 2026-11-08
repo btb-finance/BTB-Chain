@@ -582,6 +582,7 @@ fn classify(txs: &[Transaction]) -> (Vec<Vec<usize>>, Vec<usize>) {
         if !matches!(tx.body.kind, TxKind::Transfer { .. })
             || tx.body.relayer.is_some()
             || tx.body.session.is_some()
+            || tx.body.account.is_some()
         {
             let r = find(&mut parent, tx_acct[i]);
             dynamic[r] = true;

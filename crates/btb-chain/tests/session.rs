@@ -49,6 +49,7 @@ fn session_call(
             nonce,
             relayer: None,
             session: Some(account),
+            account: None,
             kind: TxKind::Call {
                 contract,
                 kind: FunctionKind::Mutation,
@@ -428,6 +429,7 @@ fn a_session_cannot_do_anything_but_call() {
         nonce: n,
         relayer: None,
         session: Some(me),
+        account: None,
         kind,
     };
     let kinds = vec![
@@ -558,6 +560,7 @@ fn old_encoding_is_unchanged_and_session_round_trips() {
                 nonce: 1,
                 relayer: Some([5; 32]),
                 session,
+                account: None,
                 kind: TxKind::Transfer {
                     to: [9; 32],
                     amount: 1,
@@ -666,6 +669,7 @@ fn ts_fixture_matches() {
                 nonce,
                 relayer,
                 session,
+                account: None,
                 kind,
             },
             k,

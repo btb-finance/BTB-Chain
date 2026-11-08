@@ -97,6 +97,23 @@ Builds the project (like `btb deploy`) and sends an `Upgrade` transaction that r
 
 Writes a new account key (`{"secret", "public"}` JSON, mode 0600, the same format `btb-node init-testnet` writes for `faucet.key`) and prints the account address. It refuses to overwrite a file. Any `init-testnet` key file works for `--key`.
 
+## `btb name`
+
+Names on chain (`alice.btb`, [CHAIN.md](CHAIN.md#accounts)). Amounts are in BTB with up to 9 decimals (`2.5`). Every command but `show` takes `--rpc URL --key FILE` and signs with that key.
+
+```
+btb name show alice --rpc URL                         owner, deposit, listing (or "not registered")
+btb name register alice.btb                           locks the deposit (100 BTB for 5+ characters)
+btb name pay alice.btb 2.5                            sends to whoever owns the name now; prints the address paid
+btb name list alice.btb 300 [--buyer ADDR] [--blocks N]   offer for sale (default 100,000 blocks)
+btb name unlist alice.btb
+btb name buy alice.btb 300                            pays at most 300 plus the deposit; atomic
+btb name give alice.btb <address>                     hands over the name and its deposit
+btb name release alice.btb                            gives up the name, returns the deposit
+```
+
+Key-slot accounts (`account.rs`) have no CLI yet: a wallet has to track the next key of a rotating slot.
+
 ## `btb call` and `btb query`
 
 `btb call --rpc URL --key FILE [--gas-limit N] <contract> <fn> [args]` signs and sends a `mutation` (default gas limit 2,000,000), waits for the receipt and prints `output` (hex), `gas_used` and `height`. `btb query --rpc URL <contract> <fn> [args]` runs a read-only `btb_query` and prints `output` and `gas_used`; it needs no key.

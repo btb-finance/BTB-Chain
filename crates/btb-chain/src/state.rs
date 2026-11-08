@@ -411,7 +411,8 @@ pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
         + sum_tag(kv, crate::storage::TAG_NODE_DEPOSIT)?
         + sum_tag(kv, crate::storage::TAG_ESCROW)?
         + sum_tag(kv, crate::host::TAG_HOST_BOND)?
-        + sum_tag(kv, crate::host::TAG_HOST_UNBOND)?)
+        + sum_tag(kv, crate::host::TAG_HOST_UNBOND)?
+        + sum_tag(kv, crate::names::TAG_NAME_DEPOSIT)?)
 }
 
 /// Register the indexes of a contract into `tables`: the ones its code declares with
@@ -668,6 +669,34 @@ impl<S: KvStore> ChainState<S> {
     pub fn check_session(&self, tx: &crate::tx::Transaction) -> Result<(), crate::exec::Invalid> {
         let next = self.head().map_or(1, |h| h.height + 1);
         crate::session::check_admission(&self.kv, tx, next, &self.config)
+    }
+
+    /// The key slots of an account (`crate::account`), if `id` is one.
+    pub fn account(
+        &self,
+        id: &Address,
+    ) -> Result<Option<crate::account::AccountRecord>, StateError> {
+        crate::account::get(&self.kv, id)
+    }
+
+    /// Whether a transaction acting as an account would pass its slot checks now.
+    pub fn check_account(&self, tx: &crate::tx::Transaction) -> Result<(), crate::exec::Invalid> {
+        crate::account::check_admission(&self.kv, tx)
+    }
+
+    /// The record of a name (without `.btb`).
+    pub fn name(&self, name: &str) -> Result<Option<crate::names::NameRecord>, StateError> {
+        crate::names::get(&self.kv, name)
+    }
+
+    /// The name an address owns.
+    pub fn name_of(&self, owner: &Address) -> Result<Option<String>, StateError> {
+        crate::names::name_of(&self.kv, owner)
+    }
+
+    /// The deposit locked under a name.
+    pub fn name_deposit(&self, name: &str) -> Result<u64, KvError> {
+        crate::names::deposit(&self.kv, name)
     }
 
     pub fn host_bond(&self, a: &Address) -> Result<u64, KvError> {

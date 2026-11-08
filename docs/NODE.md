@@ -153,6 +153,9 @@ Every validator also works for the oracle features that need the outside world (
 | `btb_getReceipt` | `[tx_id]` | receipt (`status`, `gas_used`, `fee`, `output`, `height`) or `null` |
 | `btb_getBlock` | `[height or "latest"]` | header fields, state roots, execution digest and receipts root, the height its claim attests, transaction ids |
 | `btb_getBalance` | `[address]` | `{balance, nonce}` (balance as a string) |
+| `btb_getName` | `[name]` (`alice` or `alice.btb`) | `{name, owner, deposit, listing}` or `null` |
+| `btb_getNameOf` | `[address]` | `"alice.btb"` or `null` |
+| `btb_getAccountSlots` | `[account]` | `[{commitment, admin, rotate}]` or `null`; public keys are never stored |
 | `btb_query` | `[contract, function, args_hex?, caller?]` | `{output, gas_used}`, read-only via `Executor::query` on the head state |
 | `btb_getEpoch` | `[epoch?]` | validator set in consensus order (operator, key, stake at epoch start, `jailed` now), start height, anchor |
 | `btb_getBlocks` | `[before?, limit?]` | newest-first block summaries (height, hash, time, tx count, proposer, gas, fees); `limit` at most 100 |
