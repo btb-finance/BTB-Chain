@@ -526,6 +526,7 @@ fn nonce_conflicts_with_other_users_of_the_key_are_retried() {
         TxBody {
             relayer: None,
             session: None,
+            account: None,
             chain_id: CHAIN_ID,
             nonce,
             kind: TxKind::Transfer {

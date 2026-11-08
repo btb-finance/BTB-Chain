@@ -202,6 +202,7 @@ impl<S: KvStore + 'static> Driver<S> {
                 TxBody {
                     relayer: None,
                     session: None,
+                    account: None,
                     chain_id: self.chain_id,
                     nonce,
                     kind: TxKind::Cross(op),

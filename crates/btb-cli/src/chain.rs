@@ -222,6 +222,7 @@ impl Session {
             TxBody {
                 relayer: self.relay.as_ref().map(|r| r.relayer),
                 session: None,
+                account: None,
                 chain_id: self.chain_id,
                 nonce,
                 kind,
@@ -282,6 +283,7 @@ impl Session {
                 TxBody {
                     relayer: None,
                     session: None,
+                    account: None,
                     chain_id: self.chain_id,
                     nonce: 0,
                     kind: kind.clone(),
@@ -425,6 +427,28 @@ pub fn parse_policy(s: &str) -> Result<UpgradePolicy, String> {
         "none" => Ok(UpgradePolicy::Immutable),
         hex => Ok(UpgradePolicy::Authority(parse_address(hex)?)),
     }
+}
+
+/// `"1.5"` BTB -> base units (9 decimals). Whole numbers and up to 9 decimals.
+pub fn parse_btb(s: &str) -> Result<u64, String> {
+    let bad = || format!("{s:?} is not an amount of BTB (up to 9 decimals)");
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if whole.is_empty() && frac.is_empty() || frac.len() > 9 {
+        return Err(bad());
+    }
+    let digits = |t: &str| t.chars().all(|c| c.is_ascii_digit());
+    if !digits(whole) || !digits(frac) {
+        return Err(bad());
+    }
+    let w: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| bad())?
+    };
+    let f: u64 = format!("{frac:0<9}").parse().map_err(|_| bad())?;
+    w.checked_mul(btb_chain::UNITS_PER_BTB)
+        .and_then(|v| v.checked_add(f))
+        .ok_or_else(bad)
 }
 
 pub fn parse_address(s: &str) -> Result<[u8; 32], String> {

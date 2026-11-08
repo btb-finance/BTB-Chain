@@ -1,6 +1,6 @@
 # 0002: Named accounts with hidden, rotating keys
 
-Status: **Draft**. Issue: to be opened by a maintainer as a Design Proposal. Touches cryptography, transactions and state: needs the Safety section below and an external review before any phase ships to a public network.
+Status: **Draft; phases A and B built** (`crates/btb-chain/src/account.rs`, `names.rs`, tests in `crates/btb-chain/tests/accounts.rs`; see [CHAIN.md](../CHAIN.md#accounts)). Issue: to be opened by a maintainer as a Design Proposal. Touches cryptography, transactions and state: needs the Safety section below and an external review before any phase ships to a public network.
 
 ## Summary
 
@@ -117,6 +117,11 @@ Transaction size is charged per byte as today; the 25 MiB block payload leaves r
 ### Migration
 
 Existing accounts are unchanged: an Ed25519 account is an account whose id is its old address and which has one implicit `Ed25519, Admin, rotate = false` slot. Its owner can add slots and then remove the implicit one; from then on the old public key (already visible) controls nothing. Wallets should prompt for this before a public mainnet.
+
+## What was built (phases A and B) and how it differs
+
+- **A:** accounts with Ed25519 slots stored as commitments, rotation on use (also on revert), admin and spending roles, `Create` (with funding) and `SetSlots`. **Not yet:** several signatures per transaction (`threshold`) and migrating an existing key address in place; an existing account moves by creating a slot account and transferring.
+- **B:** names with deposits by length, `Register`, `Release`, `List`/`Unlist`, `Buy`, `Give`, `Pay`; `btb name` in the CLI and `btb_getName`, `btb_getNameOf`, `btb_getAccountSlots` RPC views. Differences from the text above: the deposit **travels with the name** (a buyer pays the seller price plus deposit; a gift hands the deposit over), `Release` refunds at once (no delay), payment to a name is the `Pay` operation rather than a name inside `Transfer`, and `btb1…` addresses are not built yet.
 
 ## Phases
 

@@ -15,6 +15,10 @@ const USAGE: &str = "usage: btb <command>\n\
   btb call --rpc URL --key FILE [--gas-limit N] [--relayer HOST_URL] <contract> <fn> [args]   send a mutation (--relayer: submit via a hosting node, which earns 20% of the fee)\n\
   btb query --rpc URL <contract> <fn> [args]         run a read-only query\n\
   btb keygen <FILE>                                  write a new account key file\n\
+  btb name show <name>  --rpc URL                    owner, deposit and listing of alice.btb\n\
+  btb name register|release|unlist <name> --rpc URL --key FILE\n\
+  btb name pay <name> <BTB> | buy <name> <max BTB> | give <name> <address> --rpc URL --key FILE\n\
+  btb name list <name> <price BTB> [--buyer ADDR] [--blocks N] --rpc URL --key FILE   offer a name for sale\n\
   btb store <file> --rpc URL --key FILE [--k N --m N --periods N]   erasure-code a file onto storage nodes\n\
   btb fetch <root> --rpc URL [--out FILE]            fetch and verify a stored file\n\
   btb storage-node run --rpc URL --key FILE --dir DIR [--listen ADDR] [--endpoint URL] [--deposit UNITS]\n\
@@ -162,6 +166,7 @@ fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        "name" => name_cmd(Flags::parse(rest)?),
         "keygen" => {
             let f = Flags::parse(rest)?;
             let [path] = f.positional.as_slice() else {
@@ -277,6 +282,9 @@ struct Flags {
     /// `btb deploy`: nobody can upgrade the contract / this account can.
     immutable: bool,
     authority: Option<String>,
+    /// `btb name list`: the only address allowed to buy, and how many blocks the offer lasts.
+    buyer: Option<String>,
+    blocks: Option<u64>,
     positional: Vec<String>,
 }
 
@@ -299,6 +307,14 @@ impl Flags {
                     )
                 }
                 "--status" => f.status = true,
+                "--buyer" => f.buyer = Some(it.next().ok_or("--buyer needs an address")?),
+                "--blocks" => {
+                    f.blocks = Some(
+                        it.next()
+                            .and_then(|v| v.parse().ok())
+                            .ok_or("--blocks needs a number")?,
+                    )
+                }
                 "--immutable" => f.immutable = true,
                 "--upgrade-authority" => {
                     f.authority = Some(it.next().ok_or("--upgrade-authority needs an address")?)
@@ -326,4 +342,67 @@ impl Flags {
             None => Ok(s),
         }
     }
+}
+
+/// `btb name <sub> ...`: names on chain (`alice.btb`). Amounts are in BTB (up to 9 decimals).
+fn name_cmd(f: Flags) -> Result<(), String> {
+    use btb_chain::names::{strip_suffix, NameOp};
+    use btb_chain::TxKind;
+    let p = &f.positional;
+    let (Some(sub), Some(raw)) = (p.first(), p.get(1)) else {
+        return Err(
+            "usage: btb name <show|register|release|pay|list|unlist|buy|give> <name> ...".into(),
+        );
+    };
+    let name = strip_suffix(raw).to_string();
+    let third = || {
+        p.get(2)
+            .ok_or_else(|| format!("btb name {sub} needs a third argument"))
+    };
+    if sub == "show" {
+        let rpc = f.rpc.as_deref().ok_or("--rpc is required")?;
+        let v = chain::Rpc::new(rpc).call("btb_getName", serde_json::json!([name]))?;
+        if v.is_null() {
+            println!("{name}.btb is not registered");
+        } else {
+            println!("{}", serde_json::to_string_pretty(&v).expect("json"));
+        }
+        return Ok(());
+    }
+    let s = f.session()?;
+    let op = match sub.as_str() {
+        "register" => NameOp::Register { name },
+        "release" => NameOp::Release { name },
+        "unlist" => NameOp::Unlist { name },
+        "pay" => NameOp::Pay {
+            name,
+            amount: chain::parse_btb(third()?)?,
+        },
+        "buy" => NameOp::Buy {
+            name,
+            max_price: chain::parse_btb(third()?)?,
+        },
+        "give" => NameOp::Give {
+            name,
+            to: chain::parse_address(third()?)?,
+        },
+        "list" => {
+            let st = s.rpc_call("btb_status", serde_json::json!([]))?;
+            let height = st["height"].as_u64().ok_or("status has no height")?;
+            NameOp::List {
+                name,
+                price: chain::parse_btb(third()?)?,
+                buyer: f.buyer.as_deref().map(chain::parse_address).transpose()?,
+                expires_height: height + f.blocks.unwrap_or(100_000),
+            }
+        }
+        other => return Err(format!("unknown name command {other}")),
+    };
+    let (_, rc) = s.send(TxKind::Name(op))?;
+    let out = rc["output"].as_str().unwrap_or("");
+    println!("ok: height {}, fee {}", rc["height"], rc["fee"]);
+    if sub == "pay" && !out.is_empty() {
+        println!("paid {out}");
+    }
+    Ok(())
 }

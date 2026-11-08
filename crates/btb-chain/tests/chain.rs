@@ -632,11 +632,15 @@ fn tx_and_block_wire_roundtrip_and_rejects_garbage() {
         assert!(Transaction::decode(&wire[..wire.len() - 1]).is_err());
     }
     let mut bad_tag = txs[2].encode();
-    bad_tag[16] = 63;
+    // 31: no flag bits (0x80 relayer, 0x40 session, 0x20 account) and no such kind.
+    bad_tag[16] = 31;
     assert!(matches!(
         Transaction::decode(&bad_tag),
-        Err(TxError::BadTag(63))
+        Err(TxError::BadTag(31))
     ));
+    // 63 sets the account bit: the missing account fields make it fail too.
+    bad_tag[16] = 63;
+    assert!(Transaction::decode(&bad_tag).is_err());
     let blk = Block::new(3, [1; 32], 5, [2; 32], txs);
     assert_eq!(Block::decode(&blk.encode()).unwrap(), blk);
     assert_ne!(

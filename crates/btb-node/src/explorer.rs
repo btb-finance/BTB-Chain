@@ -34,6 +34,8 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Cross(_) => "cross",
         TxKind::Host(_) => "host",
         TxKind::Session(_) => "session",
+        TxKind::Account(_) => "account",
+        TxKind::Name(_) => "name",
         TxKind::Upgrade { .. } => "upgrade",
     }
 }
@@ -57,7 +59,24 @@ pub fn tx_json(tx: &Transaction) -> Value {
         // `from` is the account; `public_key` is the session key that signed.
         o.insert("via_session".into(), json!(true));
     }
+    if let Some(a) = &tx.body.account {
+        // `from` is the account; `public_key` is the slot key that signed (now retired if rotating).
+        o.insert("via_slot".into(), json!(a.slot));
+    }
     match &tx.body.kind {
+        TxKind::Name(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+            o.insert("name".into(), json!(format!("{}.btb", op.name())));
+        }
+        TxKind::Account(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
+        }
         TxKind::Session(op) => {
             o.insert(
                 "op".into(),
@@ -203,6 +222,7 @@ mod tests {
             TxBody {
                 relayer: None,
                 session: None,
+                account: None,
                 chain_id: 7,
                 nonce: 2,
                 kind: TxKind::Transfer {

@@ -404,6 +404,7 @@ impl Faucet {
                 TxBody {
                     relayer: None,
                     session: None,
+                    account: None,
                     chain_id,
                     nonce,
                     kind: TxKind::Transfer { to, amount },

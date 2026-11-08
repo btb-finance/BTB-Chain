@@ -73,6 +73,8 @@ pub enum Invalid {
     TooLarge,
     /// A transaction signed by a session key broke its grant (`crate::session`).
     Session(crate::session::SessionInvalid),
+    /// A transaction acting as an account broke its key slots (`crate::account`).
+    Account(crate::account::AccountInvalid),
 }
 
 /// Why a valid transaction failed while running (state reverted, fee charged).
@@ -110,6 +112,10 @@ pub enum Revert {
     Upgrade(crate::upgrade::UpgradeError),
     /// A session grant or revoke was refused (nothing changed).
     Session(crate::session::SessionError),
+    /// An account operation was refused (nothing changed).
+    Account(crate::account::AccountError),
+    /// A name operation was refused (nothing changed).
+    Name(crate::names::NameError),
     Vm(String),
 }
 
@@ -202,6 +208,8 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
         TxKind::Dex(op) => fee.checked_add(op.debit()),
         TxKind::Storage(op) => fee.checked_add(op.debit(&cfg.storage)),
         TxKind::Action(op) => fee.checked_add(op.debit()),
+        TxKind::Account(op) => fee.checked_add(op.debit()),
+        TxKind::Name(op) => fee.checked_add(op.debit()),
         TxKind::Upgrade { budget_gas, .. } => {
             fee.checked_add(budget_gas.checked_mul(cfg.gas_price)?)
         }
@@ -218,6 +226,7 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
         });
     }
     crate::session::check_kind(tx).map_err(Invalid::Session)?;
+    crate::account::check_static(tx).map_err(Invalid::Account)?;
     match &tx.body.kind {
         TxKind::Call {
             kind,
@@ -341,6 +350,22 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
         }
         TxKind::Session(op) => {
             if op.check_static().is_err() {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::Account(op) => {
+            if op.slots_len() > crate::account::MAX_SLOTS {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
+        TxKind::Name(op) => {
+            if op.name().len() > crate::names::MAX_NAME {
                 return Err(Invalid::TooLarge);
             }
             if !tx.verify_signature() {
@@ -1021,6 +1046,11 @@ impl<S: KvStore> Ctx<'_, S> {
             Err(crate::session::AuthError::Invalid(i)) => return Ok(invalid(Invalid::Session(i))),
             Err(crate::session::AuthError::State(e)) => return Err(e),
         };
+        let slot_auth = match crate::account::authorize(&self.overlay, tx) {
+            Ok(a) => a,
+            Err(crate::account::AuthError::Invalid(i)) => return Ok(invalid(Invalid::Account(i))),
+            Err(crate::account::AuthError::State(e)) => return Err(e),
+        };
         let expected = read_u64(&self.overlay, &nonce_key(&sender))?;
         let next = expected.checked_add(1);
         if tx.body.nonce != expected || next.is_none() {
@@ -1189,6 +1219,45 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::session::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Account(op) => {
+                let gas_used = tx.intrinsic_gas();
+                match crate::account::apply(&mut self.overlay, &sender, tx.body.nonce, op) {
+                    Ok(output) => {
+                        if let crate::account::AccountOp::Create { fund, .. } = op {
+                            let id: Address = output.clone().try_into().expect("32-byte id");
+                            self.debit(&sender, *fund)?;
+                            self.credit(&id, *fund)?;
+                        }
+                        Done {
+                            gas_used,
+                            output,
+                            result: Ok(()),
+                        }
+                    }
+                    Err(crate::account::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Account(e)),
+                    },
+                    Err(crate::account::Fail::State(e)) => return Err(e),
+                }
+            }
+            TxKind::Name(op) => {
+                let gas_used = tx.intrinsic_gas();
+                match crate::names::apply(&mut self.overlay, self.height, &sender, op) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::names::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Name(e)),
+                    },
+                    Err(crate::names::Fail::State(e)) => return Err(e),
+                }
+            }
             TxKind::Upgrade {
                 contract,
                 code,
@@ -1269,6 +1338,11 @@ impl<S: KvStore> Ctx<'_, S> {
         self.via_session = false;
         if let Some(key) = &session {
             crate::session::add_spent(&mut self.overlay, &sender, key, fee)?;
+        }
+        if let Some(a) = &slot_auth {
+            // The revealed key of a rotating slot never signs again, success or revert.
+            let revealed = crate::account::key_commitment(&tx.public_key);
+            crate::account::rotate(&mut self.overlay, a, &revealed)?;
         }
         Ok(Receipt {
             id,

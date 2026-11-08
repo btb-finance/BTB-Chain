@@ -642,6 +642,7 @@ mod tests {
                         TxBody {
                             relayer: None,
                             session: None,
+                            account: None,
                             chain_id: 7,
                             nonce: h * 10 + n,
                             kind: TxKind::Transfer {
