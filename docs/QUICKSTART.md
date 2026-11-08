@@ -25,9 +25,9 @@ This builds `btb-node` and `btb-faucet`, writes a genesis with 4 validator keys 
 
 | What | Where |
 | --- | --- |
-| Explorer (blocks, transactions, accounts, validators) | http://127.0.0.1:8545/explorer |
-| Faucet page | http://127.0.0.1:8080/ |
-| Node status (JSON) | http://127.0.0.1:8545/status |
+| Explorer (blocks, transactions, accounts, validators) | `http://127.0.0.1:8545/explorer` |
+| Faucet page | `http://127.0.0.1:8080/` |
+| Node status (JSON) | `http://127.0.0.1:8545/status` |
 
 Leave it running in its own terminal; Ctrl-C stops the chain. Useful options: `--validators N`, `--dir DIR` (where keys and logs go; default under `/tmp`), `--epoch-len N`, `--no-build`. Without `--release` it builds in debug mode, which is slower to run but faster to compile.
 
@@ -149,7 +149,7 @@ Measured on a local network: Bob's balance went 0, 1,000, 2,000, 3,000, 4,000 at
 
 - **Hot reload without a chain:** `btb dev` in a contract directory runs a single-node dev server with live queries ([DEV_SERVER.md](DEV_SERVER.md)); `btb init my-app` scaffolds a project ([CLI.md](CLI.md)).
 - **A web front end:** `examples/todo` and `@btb/client` ([TS_SDK.md](TS_SDK.md)).
-- **The built-in DEX page:** http://127.0.0.1:8545/dex.
+- **The built-in DEX page:** `http://127.0.0.1:8545/dex`.
 - **Serving reads to the public:** run `btb-host` nodes instead of exposing a validator's RPC ([HOSTING.md](HOSTING.md)). The validator RPC binds to loopback only and has no authentication.
 
 ## Throughput on one machine
