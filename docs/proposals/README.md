@@ -17,3 +17,4 @@ Design changes go through a Design Proposal before code (see [AGENTS.md](../../A
 | --- | --- | --- |
 | [0001](0001-consensus-fast-path.md) | Consensus-level fast path for owner-only transactions | Draft |
 | [0002](0002-accounts.md) | Named accounts with hidden, rotating keys (names, passkeys, recovery, post-quantum path) | Draft; phases A and B built |
+| [0003](0003-storage-growth.md) | Keep node storage small: compression, pruning, tiers, snapshots, smaller transactions | Draft; phase A built |

@@ -51,3 +51,5 @@ default = ["https"]
 https = ["dep:ureq", "dep:bitcoin"]
 # Keep chain state in RocksDB (--data <dir>) instead of memory. Needs clang/libclang to build.
 rocksdb = ["btb-runtime/rocksdb"]
+# Experimental (proposal 0003): also build the redb store; `BTB_STORAGE=redb` selects it at run time.
+redb = ["rocksdb", "btb-runtime/redb"]

@@ -271,6 +271,12 @@ fn proof_key(epoch: u64) -> Vec<u8> {
     k
 }
 
+/// Experimental storage engine choice (proposal 0003): `BTB_STORAGE=redb` uses redb instead of
+/// RocksDB for the block store and the chain state, in a build with the `redb` feature.
+pub fn redb_selected() -> bool {
+    cfg!(feature = "redb") && std::env::var("BTB_STORAGE").is_ok_and(|v| v == "redb")
+}
+
 pub struct BlockStore {
     kv: Box<dyn KvStore + Send>,
     /// Heights kept (memory backend); `None` keeps everything (disk).
@@ -286,9 +292,15 @@ impl BlockStore {
         Self::over(Box::new(MemKv::new()), Some(keep.max(1))).expect("empty store")
     }
 
-    /// RocksDB at `path`: everything is kept.
+    /// RocksDB at `path` (or redb, see [`redb_selected`]): everything is kept.
     #[cfg(feature = "rocksdb")]
     pub fn disk(path: &std::path::Path) -> Result<Self, String> {
+        #[cfg(feature = "redb")]
+        if redb_selected() {
+            let kv = btb_runtime::redb_kv::RedbKv::open(path.join("blocks.redb"))
+                .map_err(|e| format!("open block store {}: {e}", path.display()))?;
+            return Self::over(Box::new(kv), None);
+        }
         let kv = btb_runtime::rocks::RocksKv::open(path)
             .map_err(|e| format!("open block store {}: {e}", path.display()))?;
         Self::over(Box::new(kv), None)

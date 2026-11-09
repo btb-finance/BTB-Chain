@@ -416,11 +416,14 @@ fn four_validators_generate_taproot_and_ed25519_keys_and_sign_a_withdrawal_for_e
     assert_eq!(c.supply(3, Scheme::Ed25519), (50_000, 20_000, 30_000));
     // BTB itself never moved because of any of it (the chain checks the invariant every block);
     // the signing was done with fresh nonces: each signer spent one per signature
-    let st = c.node(0).call("btb_status", json!([])).unwrap();
-    assert!(
-        st["cross"]["signatures_made"].as_u64().unwrap() >= 1,
-        "{st}"
-    );
+    // Only a threshold of the validators has to sign, so look at all of them, not one.
+    let made: u64 = (0..4)
+        .map(|i| {
+            let st = c.node(i).call("btb_status", json!([])).unwrap();
+            st["cross"]["signatures_made"].as_u64().unwrap()
+        })
+        .sum();
+    assert!(made >= 1, "no validator made a signature");
 
     // 3. epoch change: the keys are reshared, the addresses are not
     c.wait_until("epoch 1", 120, || {

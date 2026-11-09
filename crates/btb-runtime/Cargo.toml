@@ -9,8 +9,15 @@ license.workspace = true
 btb-vm = { path = "../btb-vm" }
 sha2 = "0.11.1"
 # Apache-2.0 wrapper; librocksdb-sys is MIT/Apache-2.0/BSD-3-Clause. Needs clang/libclang to build.
-rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime"], optional = true }
+# `zstd` (BSD-3-Clause / GPL-2.0 dual, used under BSD) compresses tables and the write-ahead log.
+rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime", "zstd"], optional = true }
+
+# Pure-Rust embedded store (MIT/Apache-2.0), an alternative to RocksDB under evaluation (proposal 0003).
+redb = { version = "=4.5.0", optional = true }
+# Value compression for the redb store (zstd, BSD).
+zstd = { version = "0.13", optional = true }
 
 [features]
 default = []
 rocksdb = ["dep:rocksdb"]
+redb = ["dep:redb", "dep:zstd"]

@@ -12,6 +12,8 @@ pub mod merkle;
 pub mod occ;
 pub mod query;
 pub mod readset;
+#[cfg(feature = "redb")]
+pub mod redb_kv;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
 pub mod schema;
