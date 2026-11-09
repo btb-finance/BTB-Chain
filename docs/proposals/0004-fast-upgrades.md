@@ -6,7 +6,7 @@ Status: **Draft**. Issue: to be opened by a maintainer as a Design Proposal. Tou
 
 Make upgrading a contract (and the chain itself) something a team can do **every day**, including with AI-written changes, because every upgrade is checked against the contract's real interface and real recent traffic before it goes live, rolls back by itself if it starts failing, and leaves **no old version behind** once it has proven itself. Do the same for the protocol: nodes start from validator-signed snapshots, so old rules can be deleted from the code instead of being carried forever.
 
-**Recommendation:** build the interface check (A) and the dry run (B) first, they catch most breakage and change little; then automatic rollback (C) and atomic app upgrades (D); then protocol rule retirement (E) together with snapshots (proposal 0003, phase D).
+**Recommendation:** build the interface check (A) and the dry run (B) first, they catch most breakage and change little; then automatic rollback (C) and atomic app upgrades (D); then protocol rule retirement (E) together with snapshots (proposal 0003, phase D). Chain-driven upgrades (F) start now as a rule (host call numbers are permanent, behaviour changes get new numbers) and get their tooling (`btb migrate`, importer counts) with A; native token improvements (G) are their own small proposals, one per feature.
 
 ## Why
 
@@ -73,6 +73,36 @@ One `Upgrade` may carry the contract code, its site files and the generated type
 
 Network upgrades are activated at an agreed height, and the protocol version is part of the state. After each upgrade, once a snapshot past the activation height is certified by the validators (proposal 0003, phase D), new nodes start from that snapshot instead of replaying older blocks. The code for the old rules can then be **deleted from the node** in the next release. Archive nodes that want to re-execute old history keep using the release that still has those rules; the current release never carries them.
 
+### F. Chain-driven upgrades of every contract (consensus)
+
+Contracts reach the chain through **numbered host calls** ([LANGUAGE.md](../LANGUAGE.md#host-calls)): the SDK's `block_height()` is only a name for a number in the ELF. That gives the chain team a way to improve all contracts at once without breaking any:
+
+| Change | Rule | Effect on deployed contracts |
+| --- | --- | --- |
+| Rename (`get_block` → `get_hash` in the SDK) | Number unchanged | None: they keep working, new code uses the new name |
+| Faster or cheaper implementation, same behaviour | Number unchanged | Every contract gets it automatically |
+| Different behaviour | **New number**; the old number becomes a thin wrapper over the new call that keeps the old behaviour | Unchanged until their owners upgrade |
+| Retire the old behaviour | The chain counts which live contracts import each host call (it reads every ELF at deploy and upgrade); a wrapper with **zero importers** is deleted in the next release, and a host call with importers gets a sunset height announced long in advance | No dead wrappers kept forever |
+
+`btb migrate` rewrites a contract's source to the current SDK (renames, new call forms; mechanical, and AI-assisted for the rest), and the owner ships it with the normal upgrade flow (A to D), so moving to new behaviour is one command plus a dry run.
+
+The chain never changes what a deployed contract **does** on its own: owners and users rely on that, and contracts deployed `--immutable` were promised it. Automatic means renames and same-behaviour improvements; behaviour changes are opt-in and made cheap.
+
+### G. Upgrading the native token module for every token (consensus)
+
+BTB tokens are not separate contracts with frozen code (as ERC-20 tokens are): they are records in one native module (`token_create`, `token_transfer_of`, `token_balance_of`, `token_info`, `token_holders`, `token_mint`, `token_burn`; host calls 16 to 22, [TOKENOMICS.md](../TOKENOMICS.md)). Improving the module improves **every token at once**, which ERC-20 never could: tokens deployed before `permit` or receive hooks existed still lack them today.
+
+First improvements to make for all tokens:
+
+| ERC-20 problem | Native module improvement |
+| --- | --- |
+| Tokens sent to a contract that cannot handle them are lost | **Receive callback**: a contract recipient is called and may refuse; the transfer then fails as a whole |
+| `approve` then `transferFrom` takes two transactions and has a known allowance race | **Allowances with expected-value updates**, and **permit** (approval by signature in the same transaction) |
+| Every token reimplements the same logic with its own bugs | One audited implementation for all tokens |
+| New features never reach old tokens | Module upgrades reach every token |
+
+Features that change behaviour for existing holders (for example hooks that run custom code on every transfer, or freezing) are **opt-in per token by its creator** (a flag in the token record), never switched on for existing tokens by an upgrade. Every module change goes through a proposal, failure-case tests and audit, since it touches every token on the chain.
+
 ### Who can upgrade
 
 Unchanged: the contract's upgrade authority (deployer, a named account such as a multisig or a governance contract, or nobody). With key-slot accounts (proposal 0002) the authority's admin slot signs upgrades and a spending slot cannot. Options for users to have a say (opt-out windows, voting) are open question 3.
@@ -84,6 +114,8 @@ Unchanged: the contract's upgrade authority (deployer, a named account such as a
 - **Rollback (C)** must be deterministic: the error-rate measure counts receipts in blocks, not wall-clock time; the window and threshold are bounded by protocol constants so a contract cannot keep unlimited old code; a rollback is itself recorded as an event. An owner cannot use rollback to undo *other* state (balances moved by users stay moved); only code is reverted, plus migrations through the existing undo log.
 - **Atomic upgrades (D)** keep the existing size limits per transaction.
 - **Retiring rules (E)** only after the snapshot that follows the activation height is certified by a quorum; a node that must replay older blocks refuses with a clear message naming the release to use.
+- **F:** a host call number never changes meaning; a wrapper is deleted only when the chain's own importer count is zero; tests compare a contract's results before and after a rename (identical) and after a wrapper is added (identical).
+- **G:** module changes affect every token: test failure cases for each new feature (a refusing receiver, a stale allowance update, a bad or replayed permit signature), check that opt-in features stay off for existing tokens, and keep token operations out of the BTB supply (as today).
 - Gas: the interface diff and the call counters have fixed costs per function and per call, defined before the phase ships.
 
 ## Tests
@@ -100,3 +132,5 @@ Unchanged: the contract's upgrade authority (deployer, a named account such as a
 2. Should a breaking upgrade also require a minimum notice period when other contracts depend on the removed function?
 3. Should users have a say: for example a short window in which they can withdraw from a contract before a breaking upgrade applies, or a governance vote for contracts that hold others' funds?
 4. Where the dry run gets its traffic: the node's own history, a hosting node, or an indexer of the contract's calls.
+5. Sunset period for a host call that still has importers, and whether the chain should notify their owners (an event per affected contract).
+6. Which token features go first (receive callback, permit, allowances), and the gas for a callback (paid by the sender, with a fixed cap).
