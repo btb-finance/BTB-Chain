@@ -157,7 +157,7 @@ Every validator also works for the oracle features that need the outside world (
 | `btb_getNameOf` | `[address]` | `"alice.btb"` or `null` |
 | `btb_getAccountSlots` | `[account]` | `[{commitment, admin, rotate}]` or `null`; public keys are never stored |
 | `btb_query` | `[contract, function, args_hex?, caller?]` | `{output, gas_used}`, read-only via `Executor::query` on the head state |
-| `btb_getEpoch` | `[epoch?]` | validator set in consensus order (operator, key, stake at epoch start, `jailed` now), start height, anchor |
+| `btb_getEpoch` | `[epoch?]` | validator set in consensus order (operator, key, `stake` = consensus weight at epoch start, capped at 5% of the set's total, `jailed` now), start height, anchor |
 | `btb_getBlocks` | `[before?, limit?]` | newest-first block summaries (height, hash, time, tx count, proposer, gas, fees); `limit` at most 100 |
 | `btb_getTransaction` | `[tx_id]` | the transaction (kind, from, to, amount, function, nonce, gas limit) with block, index and receipt, or `null` |
 | `btb_getAccount` | `[address]` | balance, nonce, bonded and unbonding stake, validator info (jailed), whether it is a contract |

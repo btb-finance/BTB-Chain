@@ -199,7 +199,9 @@ pub struct ActiveValidator {
     pub operator: Address,
     /// Ed25519 consensus key.
     pub consensus_key: [u8; 32],
-    /// Bonded stake when the set was fixed; it is the consensus weight for the whole epoch.
+    /// Consensus weight for the whole epoch: the bonded stake when the set was fixed, capped by
+    /// [`cap_voting_power`] (so at most `MAX_VOTING_POWER_BPS` of the set's total). Rewards,
+    /// oracle weights and the vault's security bound use it too; slashing uses the real bond.
     pub stake: u64,
 }
 
@@ -729,8 +731,56 @@ fn pay_rewards(kv: &mut impl KvStore, rec: &EpochRecord) -> Result<(), StateErro
     Ok(())
 }
 
+/// Most voting power one validator may have, in basis points of the set's total weight
+/// (proposal 0005). A protocol constant on purpose: no transaction, vote or genesis parameter
+/// can raise it; changing it needs a software upgrade. With this cap at least 14 validators are
+/// needed for a 2/3 quorum.
+pub const MAX_VOTING_POWER_BPS: u64 = 500;
+
+/// Cap every validator's weight at [`MAX_VOTING_POWER_BPS`] of the set's total weight ("water
+/// filling"): the smallest `k` such that, with the `k` largest capped at
+/// `T = bps * rest / (10000 - k * bps)` (`rest` = the others' stake), the next largest is not
+/// above `T`. Stake above the cap counts for nothing, in consensus and in rewards, so growing a
+/// validator past it (by own stake or by pooling others') gains no power and no income.
+/// A set too small for the cap (`n * bps <= 10000`, 20 validators or fewer at 5%) cannot
+/// satisfy it at all and is left uncapped (local testnets, tests); a public network must
+/// launch with more validators than that for the cap to apply. `vs` is sorted by stake
+/// descending. Deterministic, integer only.
+pub fn cap_voting_power(vs: &mut [ActiveValidator]) {
+    let n = vs.len() as u64;
+    if n == 0 {
+        return;
+    }
+    let bps = u128::from(MAX_VOTING_POWER_BPS);
+    if u128::from(n) * bps <= 10_000 {
+        return;
+    }
+    let total: u128 = vs.iter().map(|v| u128::from(v.stake)).sum();
+    let mut capped_sum: u128 = 0; // stake of the k largest
+    for k in 0..vs.len() {
+        let Some(room) = 10_000u128.checked_sub(k as u128 * bps).filter(|r| *r > 0) else {
+            break;
+        };
+        let t = bps * (total - capped_sum) / room;
+        if u128::from(vs[k].stake) <= t {
+            for v in vs.iter_mut().take(k) {
+                // Never raises a weight: capped validators had more than `t`.
+                v.stake = v.stake.min(u64::try_from(t).unwrap_or(u64::MAX));
+            }
+            return;
+        }
+        capped_sum += u128::from(vs[k].stake);
+    }
+    // Not reachable when n * bps > 10000; equal weights are the safe fallback.
+    let m = vs.iter().map(|v| v.stake).min().unwrap_or(0);
+    for v in vs.iter_mut() {
+        v.stake = m;
+    }
+}
+
 /// The top `max_validators` registered, non-jailed operators with at least `min_stake` bonded,
-/// by stake descending, ties broken by operator address ascending.
+/// by stake descending, ties broken by operator address ascending, with their weights capped
+/// by [`cap_voting_power`].
 pub(crate) fn select_set(
     kv: &impl KvStore,
     cfg: &StakingConfig,
@@ -767,6 +817,7 @@ pub(crate) fn select_set(
     }
     all.sort_by(|a, b| b.stake.cmp(&a.stake).then(a.operator.cmp(&b.operator)));
     all.truncate(cfg.max_validators as usize);
+    cap_voting_power(&mut all);
     Ok(all)
 }
 
@@ -835,6 +886,7 @@ pub(crate) fn genesis_ops(
     }
     if !active.is_empty() {
         active.sort_by(|a, b| b.stake.cmp(&a.stake).then(a.operator.cmp(&b.operator)));
+        cap_voting_power(&mut active);
         let rec = EpochRecord {
             epoch: 0,
             start_height: 0,
@@ -930,5 +982,122 @@ impl<S: KvStore> ChainState<S> {
     /// Whether `operator` was already slashed for `epoch`.
     pub fn slashed_in_epoch(&self, epoch: u64, operator: &Address) -> Result<bool, KvError> {
         Ok(self.kv.get(&slashed_key(epoch, operator))?.is_some())
+    }
+}
+
+#[cfg(test)]
+mod voting_power_tests {
+    use super::*;
+
+    fn set(stakes: &[u64]) -> Vec<ActiveValidator> {
+        let mut v: Vec<ActiveValidator> = stakes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ActiveValidator {
+                operator: [i as u8; 32],
+                consensus_key: [i as u8; 32],
+                stake: *s,
+            })
+            .collect();
+        v.sort_by(|a, b| b.stake.cmp(&a.stake).then(a.operator.cmp(&b.operator)));
+        v
+    }
+
+    fn max_share_bps(v: &[ActiveValidator]) -> u128 {
+        let total: u128 = v.iter().map(|x| u128::from(x.stake)).sum();
+        v.iter()
+            .map(|x| u128::from(x.stake) * 10_000 / total)
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn whale_is_capped_and_small_ones_keep_their_stake() {
+        // one validator with 60% of the stake among 40
+        let mut stakes = vec![1_000u64; 39];
+        stakes.push(58_500);
+        let mut v = set(&stakes);
+        cap_voting_power(&mut v);
+        assert!(max_share_bps(&v) <= MAX_VOTING_POWER_BPS as u128);
+        assert!(v[1..].iter().all(|x| x.stake == 1_000));
+        assert!(v[0].stake < 58_500);
+    }
+
+    #[test]
+    fn no_cap_when_nobody_is_too_big_and_never_raises_a_weight() {
+        let stakes: Vec<u64> = (1..=50).map(|i| 1_000 + i).collect();
+        let mut v = set(&stakes);
+        let before = v.clone();
+        cap_voting_power(&mut v);
+        assert_eq!(v, before);
+        // several whales
+        let mut stakes = vec![10u64; 30];
+        stakes.extend([5_000, 4_000, 3_000]);
+        let mut v = set(&stakes);
+        let orig = v.clone();
+        cap_voting_power(&mut v);
+        assert!(max_share_bps(&v) <= MAX_VOTING_POWER_BPS as u128);
+        assert!(v.iter().zip(&orig).all(|(a, b)| a.stake <= b.stake));
+    }
+
+    #[test]
+    fn a_quorum_needs_many_validators() {
+        let mut stakes = vec![1u64 << 40; 5]; // five giants
+        stakes.extend(vec![1_000_000u64; 95]);
+        let mut v = set(&stakes);
+        cap_voting_power(&mut v);
+        let total: u128 = v.iter().map(|x| u128::from(x.stake)).sum();
+        let mut acc = 0u128;
+        let mut needed = 0;
+        for x in &v {
+            acc += u128::from(x.stake);
+            needed += 1;
+            if acc * 3 > total * 2 {
+                break;
+            }
+        }
+        assert!(needed >= 14, "quorum reached with {needed}");
+    }
+
+    #[test]
+    fn sets_too_small_for_the_cap_are_left_as_they_are() {
+        let mut v = set(&[100, 200, 300, 400]);
+        let before = v.clone();
+        cap_voting_power(&mut v);
+        assert_eq!(v, before);
+        let mut e: Vec<ActiveValidator> = Vec::new();
+        cap_voting_power(&mut e);
+    }
+
+    #[test]
+    fn genesis_set_is_stored_capped() {
+        use btb_runtime::{KvStore, MemKv, WriteBatch};
+        let cfg = StakingConfig::default();
+        let key = |i: u8| {
+            ed25519_dalek::SigningKey::from_bytes(&[i + 1; 32])
+                .verifying_key()
+                .to_bytes()
+        };
+        let mut vals: Vec<GenesisValidator> = (0..25u8)
+            .map(|i| GenesisValidator {
+                operator: [i; 32],
+                consensus_key: key(i),
+                network_addr: Vec::new(),
+                stake: cfg.min_stake,
+            })
+            .collect();
+        vals[7].stake = cfg.min_stake * 100; // a whale with ~80% of all stake
+        let mut batch = WriteBatch::new();
+        genesis_ops(&cfg, &vals, [9; 32], &mut batch).unwrap();
+        let mut kv = MemKv::new();
+        kv.commit(batch).unwrap();
+        let rec = epoch_record(&kv, 0).unwrap().unwrap();
+        assert!(max_share_bps(&rec.validators) <= MAX_VOTING_POWER_BPS as u128);
+        // the whale keeps its full bond (slashing and unbonding use it), only its weight is capped
+        assert_eq!(bonded(&kv, &[7; 32]).unwrap(), cfg.min_stake * 100);
+        assert!(rec
+            .validators
+            .iter()
+            .any(|v| v.operator == [7; 32] && v.stake < cfg.min_stake * 100));
     }
 }

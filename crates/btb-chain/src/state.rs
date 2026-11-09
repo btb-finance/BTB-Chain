@@ -97,6 +97,12 @@ pub struct ChainConfig {
     pub host_unbonding_blocks: u64,
 }
 
+/// Highest gas price any chain may use (proposal 0005): a plain transfer then costs at most
+/// 0.02 BTB. The gas price is fixed in the genesis and no transaction, vote or validator can
+/// change it on a running chain; this ceiling is a protocol constant, so even a new genesis
+/// cannot set a punitive fee, and raising it needs a software upgrade.
+pub const MAX_GAS_PRICE: u64 = 10_000;
+
 impl ChainConfig {
     pub fn new(chain_id: u64) -> Self {
         ChainConfig {
@@ -122,6 +128,11 @@ impl ChainConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.gas_price == 0 {
             return Err("gas_price must be at least 1".into());
+        }
+        if self.gas_price > MAX_GAS_PRICE {
+            return Err(format!(
+                "gas_price above the protocol maximum {MAX_GAS_PRICE}"
+            ));
         }
         if self.max_tx_gas == 0 || self.cron_gas_limit == 0 {
             return Err("gas limits must be non-zero".into());

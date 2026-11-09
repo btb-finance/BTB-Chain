@@ -18,3 +18,5 @@ Design changes go through a Design Proposal before code (see [AGENTS.md](../../A
 | [0001](0001-consensus-fast-path.md) | Consensus-level fast path for owner-only transactions | Draft |
 | [0002](0002-accounts.md) | Named accounts with hidden, rotating keys (names, passkeys, recovery, post-quantum path) | Draft; phases A and B built |
 | [0003](0003-storage-growth.md) | Keep node storage small: compression, pruning, tiers, snapshots, smaller transactions | Draft; phase A built |
+| [0004](0004-fast-upgrades.md) | Ship upgrades every day without breaking anyone, and without keeping old code alive | Draft |
+| [0005](0005-economics-and-anti-capture.md) | Economics that pay node operators; rules that stop validators from capturing the chain | Draft; voting-power cap and gas-price ceiling built |

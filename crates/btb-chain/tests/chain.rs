@@ -47,6 +47,16 @@ fn genesis_rejects_wrong_supply_and_duplicates() {
         ChainState::from_genesis(MemKv::new(), &g),
         Err(GenesisError::Config(_))
     ));
+    // A punitive gas price is refused by the protocol constant, whatever the genesis says.
+    let mut g = genesis(&[&a], RICH);
+    g.config.gas_price = btb_chain::state::MAX_GAS_PRICE + 1;
+    assert!(matches!(
+        ChainState::from_genesis(MemKv::new(), &g),
+        Err(GenesisError::Config(_))
+    ));
+    let mut g = genesis(&[&a], RICH);
+    g.config.gas_price = btb_chain::state::MAX_GAS_PRICE;
+    assert!(ChainState::from_genesis(MemKv::new(), &g).is_ok());
     // Cannot create a second chain in a used store.
     let n = net(&[&a], RICH);
     let kv = n.state.into_store();
