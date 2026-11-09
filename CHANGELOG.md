@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Voting-power cap:** each validator's consensus weight is capped at 5% of its epoch set's total (`MAX_VOTING_POWER_BPS`, protocol constant; stake above it counts for nothing in votes or rewards; sets of 20 or fewer unchanged). A 2/3 quorum then needs at least 14 validators. ([proposal 0005](docs/proposals/0005-economics-and-anti-capture.md))
+- **Gas-price ceiling:** `MAX_GAS_PRICE = 10,000` (a transfer costs at most 0.02 BTB); a genesis above it is refused.
+
 ### Added
 - **Accounts with hidden, rotating keys** (proposal 0002 phase A, `account.rs`): `Account` transactions (tag 24: `Create` with funding, `SetSlots`) and `TxBody::account` (tag bit `0x20`). An account id no longer depends on a key; up to 8 slots store only `SHA256("btb.key.v1" || scheme || public_key)`; a rotating slot names the next key's commitment and its revealed key is retired by the same transaction (also on revert); admin vs spending slots. New `Invalid::Account`, `Revert::Account`; state tag `0x73`; RPC `btb_getAccountSlots`
 - **Names** (proposal 0002 phase B, `names.rs`): `Name` transactions (tag 25: `Register`, `Release`, `List`, `Unlist`, `Buy`, `Give`, `Pay`). `alice.btb` with a refundable deposit by length counted by the supply invariant (`0x75`), one name per account, atomic sale (price plus deposit to the seller, name to the buyer), pay by name. `btb name` CLI, RPC `btb_getName`, `btb_getNameOf`
