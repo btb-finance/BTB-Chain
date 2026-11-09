@@ -90,6 +90,18 @@ Blocks carry witnesses for the state they touch, so validators need almost no st
 - **BLAKE3.** 5x faster than SHA-256 on large inputs on one core and 13x on all cores (measured above), parallel and with a built-in tree mode for verifying parts of a file. Equal for small items such as Merkle nodes. Plan: BLAKE3 for large content first (storage-node pieces and file ids, snapshots, archived history), which is local to those subsystems. Switching consensus hashes (transaction ids, block hashes, state tree, addresses) changes every id and address: decide once, before mainnet, together with any other hash change, since it is a hard fork afterwards. SHA-256 has hardware instructions on most CPUs; BLAKE3 has none but does not need them.
 - **redb instead of RocksDB.** redb is a pure-Rust embedded key-value store (B-tree, ACID, MVCC, MIT/Apache-2.0). Gains: no C++ build (RocksDB needs clang and compiles for minutes; this session also ran out of disk building it), smaller attack surface, simpler crash model. Costs: mainline redb has **no built-in compression**, so the phase A gains would have to come from compressing values ourselves (or a fork such as `shodh-redb` or `redb-turbo`, both young); a B-tree rewrites pages in place, while RocksDB's LSM is built for heavy write streams like block history. `KvStore` is already an interface (`MemKv`, `RocksKv`), so a `RedbKv` can be added next to RocksDB and measured with the same tests (10,000-transfer flood, idle growth, restart of all validators) before choosing. Benchmarks published by the projects themselves disagree by version and hardware.
 
+  **Measured** (`RedbKv` in `btb-runtime`, feature `redb`; `btb-node --features redb` with `BTB_STORAGE=redb`; values zstd-compressed per value when 64 bytes or more; `Durability::Immediate`). Same binary, fresh 4-validator chain each, node 0's data directory:
+
+  | | RocksDB (zstd, phase A) | redb (+ per-value zstd) |
+  | --- | --- | --- |
+  | Idle growth | 1,726 B/block | 2,038 B/block |
+  | 10,000 transfers | 239 B/tx, 2,627 tx/s | 941 B/tx, 2,827 tx/s |
+  | 36,000 more transfers | 298 B/tx, 2,677 tx/s | 886 B/tx, 2,697 tx/s |
+  | Data directory after the run | 13 MB | 43 MB |
+  | Same randomized equivalence tests as `MemKv` | pass | pass |
+
+  Speed is the same (the load generator is the limit). redb uses **about 3x more disk**: it compresses value by value (most values are small: tree nodes, receipts, index entries) and its B-tree pages are allocated in place, while RocksDB compresses 32 KiB blocks of sorted data. **Decision for now: keep RocksDB as the default; keep `RedbKv` as an experimental option** (it builds without C++). Revisit if redb gains page compression or BTB values get larger.
+
 ## Safety
 
 - **A** changes only how each node stores bytes; nothing it stores is used in consensus differently. Tested by the full RocksDB suite (restart of all four nodes from disk included).
@@ -109,4 +121,4 @@ Blocks carry witnesses for the state they touch, so validators need almost no st
 1. Idle blocks: lower `idle_block_ms`, or skip empty blocks unless a cron is due?
 2. Pruning window `K` for validators and for hosting nodes.
 3. Who pays storage nodes for archived history: the protocol (fee share), or archive users?
-4. **Observed once, not reproduced:** after restarting all four validators of a local chain that had first been restarted with `idle_block_ms = 1000`, the chain stopped making blocks (all nodes at the same height and round, leader not proposing). Fresh restarts with the default and with 1,000 ms, and after a 10,000-transaction flood, all resumed; the RocksDB restart test passes. Needs investigation before a public testnet.
+4. **All-validator restart stall (diagnosed, not fixed).** After restarting all four validators more than a couple of hundred blocks into an epoch, the chain stops: every node's high QC names the newest certified block, which the restarted replica does not hold; it asks peers (who have it and answer with 64 ancestors), but the replica only links blocks back to the block it knows, the **epoch's start block**, and for every unlinked block in an answer it requests that block's parent again, so the requests multiply and the walk back never reaches the start. Reproduced with RocksDB and with redb (heights 456, 480, 572 stall; 115, 187 resume); raising `max_pending_blocks` does not help. Fix (consensus code, its own PR with a cluster test that restarts all validators deep into an epoch): seed a restarted replica with the last committed block so linking stops there, and request only the parent of the oldest unlinked block. Must be fixed before a public testnet.

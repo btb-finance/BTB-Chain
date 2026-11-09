@@ -179,6 +179,14 @@ fn start(p: NodeParams) -> Result<(), String> {
     match p.data_dir.clone() {
         Some(d) => {
             std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            #[cfg(feature = "redb")]
+            if btb_node::blockstore::redb_selected() {
+                let kv = btb_runtime::redb_kv::RedbKv::open(d.join("chain.redb"))
+                    .map_err(|e| e.to_string())?;
+                println!("btb-node: storage engine redb (experimental)");
+                let state = open_chain(kv, &p.genesis)?;
+                return serve(p, state);
+            }
             let kv =
                 btb_runtime::rocks::RocksKv::open(d.join("chain")).map_err(|e| e.to_string())?;
             let state = open_chain(kv, &p.genesis)?;
