@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `btb-node operator-key`, `assemble-genesis`, `node-config` for networks of independent operators
 
 ### Changed
+- RocksDB storage is zstd-compressed (tables, write-ahead log; 32 KiB blocks; stronger bottom level with a trained dictionary): about 2.8x less disk per transfer in a 10,000-transfer test (657 → 238 bytes), no consensus change ([proposal 0003](docs/proposals/0003-storage-growth.md))
 - Block payload limit 256 KiB → 25 MiB (frame, sync, rate-limit and timeout limits adjusted)
 - Transaction kind tags must stay below `0x20` (bit `0x20` now flags key-slot accounts)
 

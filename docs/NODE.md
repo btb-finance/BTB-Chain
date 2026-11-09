@@ -30,7 +30,7 @@ Without `--features rocksdb` the node keeps chain state in memory and **refuses 
 | `rpc` | bind address, loopback only |
 | `reporter_key_file` | optional `{"secret": hex}` of the account that signs and pays for `SubmitEvidence` (default: the validator key's own account) |
 | `data_dir` | see above |
-| `tick_ms` (20), `round_timeout_ms` (2000), `idle_block_ms` (250) | timing |
+| `tick_ms` (20), `round_timeout_ms` (2000), `idle_block_ms` (250) | timing; `idle_block_ms` sets how often an idle chain makes an empty block, and so how fast an idle node's disk grows (1000 cuts it about 4x, see [proposal 0003](proposals/0003-storage-growth.md); crons count blocks, so they run less often in wall-clock time while idle) |
 | `serve_followers` | optional: serve block sync to non-validators, see [Serving followers](#serving-followers) |
 | `sync_poll_ms` | optional: how long a stalled node waits before asking for blocks (default 1000) |
 | `oracle_share_file` | optional, **`--insecure-dealer` testnets only**: `{"share": hex}`, this validator's share of the dealt epoch-0 key; chains that generate their key on chain need no such file |
@@ -119,7 +119,7 @@ Every executed block is stored with its receipts, the consensus block it came fr
 
 | Node | Where | Kept |
 | --- | --- | --- |
-| built with `--features rocksdb`, `data_dir` set | RocksDB at `<data_dir>/blocks` | **everything**, never pruned; survives restarts |
+| built with `--features rocksdb`, `data_dir` set | RocksDB at `<data_dir>/blocks` | **everything**, never pruned; survives restarts; zstd-compressed on disk ([proposal 0003](proposals/0003-storage-growth.md)) |
 | in memory | a bounded `MemKv` | the newest **4096** heights; older blocks and their receipt index entries are deleted as new ones arrive, so `btb_getBlock` for them is an error and block sync cannot serve them |
 
 The history is separate from the chain state and not part of consensus. The record is written before the executed height is marked done, so a crash can leave a missing record only between the state commit and the write (reads return `null`, sync skips it, and the execution attestation window falls back to the chain state's roots for that height). The store also remembers the last 512 proposals of round leaders (and indexes executed blocks by consensus id) so that a node can answer consensus `SyncRequest`s for blocks its replica forgot in a restart; without that, every validator restarting at the same moment would lose the certified-but-uncommitted tip for good.
