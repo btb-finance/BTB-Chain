@@ -46,3 +46,6 @@ examples/nft/nft.elf
 examples/oracle/oracle.elf
 examples/caller/caller.elf
 examples/files/files.elf
+examples/market-data/market-data.elf
+examples/market-data/web/index.html
+examples/market-data-web/target/
