@@ -94,6 +94,29 @@ So a provider sells **freshness, coverage, clean schema and verified answers**, 
 - **B.** `DataOp` transaction: register a dataset (schema hash, read price, stake), and a host call `data_read(dataset)` that charges the provider's fee in mutations and is free in queries. Vouchers carry a per-dataset read count; the provider's share is paid on claim.
 - **C.** Several providers per dataset, median per field, a fraud proof (two signed batches for the same session that differ, or a published fact contradicting a signed report from an exchange) slashes stake.
 
+## Global coverage (every country)
+
+The schema does not change per country. Adding one is data, not code:
+
+1. **Exchange row** (`exchanges` table): MIC, country, currency and its decimals, timezone, trading calendar and holidays, session times, local markers (PSX `XD`/`XB`, NSE `ex-date`, Tadawul codes), price-limit rules, settlement cycle. Local mechanics are columns in the same shape, never a new schema.
+2. **Dataset per exchange** (`psx.eod`, `nse.eod`, `tadawul.eod`, ...): each has its own provider(s), read price and licence statement. One provider may hold many datasets; a country can have competing providers (phase C takes their median).
+3. **Same crons**: ratios, technicals and sector medians run per exchange (sector medians never mix currencies). Cross-market views (a global screener) convert at the built-in FX price feeds and say so.
+
+Rollout by region, each a gate: South Asia (PSX, NSE, BSE, DSE, CSE), MENA (Tadawul, ADX, DFM, QSE, EGX), then major markets, then frontier markets (NGX, NSE Kenya, ...) where a scraper-based provider is the only source.
+
+**Scale for ~60,000 companies in ~100 countries:**
+
+| | Estimate | Where it lives |
+| --- | --- | --- |
+| Live quotes | 60,000 × ~200 B ≈ 12 MB | Validator state |
+| Recent bars (50 sessions) | 60,000 × 50 × ~48 B ≈ 150 MB | Validator state |
+| Full history, statements, filings | tens of GB | Storage nodes (erasure coded), roots on chain |
+| EOD publishes | ~120 transactions of 500 quotes per day | Spread over the day as exchanges close |
+| Recompute | ~60,000 symbols per day | Crons under `cron_gas_block_cap`, per exchange after its close |
+| Reads | unbounded | Queries on hosting and edge nodes; validators do not serve them |
+
+Validators carry only the live data; the bulk scales with storage and hosting nodes, which earn for it ([SCALING.md](../SCALING.md)). The real limit is **licensing per exchange**, recorded in each dataset's licence statement.
+
 ## Sizes and limits (to measure in A)
 
 - 55,000 quotes × ~200 B ≈ 11 MB of live state; 400 bars × 55,000 × ~48 B ≈ 1 GB, which is why older bars go to storage nodes.
