@@ -106,6 +106,10 @@ Publishing gas always goes to the validator pool. Attested data pays validators 
 
 **Safety.** Nothing is minted: every unit comes from a payer's channel deposit (supply invariant unchanged). A node cannot charge more than the payer signed. A client cannot get unpaid queries beyond the quota (vouchers strictly increase; replays refused). Charging by `gas_used` is deterministic, so two honest nodes charge the same for the same query. Failure-case tests: a stale, replayed, lower, wrong-chain or wrong-payee voucher is refused with `402`; a query over the quota without a voucher gets `402` and does not run; a query that traps is charged its gas used; redeem pays exactly the best voucher; the free quota resets per window.
 
+## Licence statement per dataset
+
+Each operator decides what data it provides and carries its own legal responsibility; the chain stays neutral (as for oracle feeds, [0005](0005-open-data-feeds.md)). To make that decision informed, a dataset carries a **licence statement** set by its provider at registration and shown by `btb_feed`/dataset views: `source` (exchange, vendor or "own computation"), `licence` (`public`, `redistribution`, `own`, `other` plus a link), and `delay` (real time, delayed N minutes, end of day). Validators and hosting nodes read it to decide whether to serve the dataset; readers see what they are buying. The chain does not verify it.
+
 ## Options compared
 
 | | A: one contract, one provider | B: provider registry | C: many providers, median, slashing |
