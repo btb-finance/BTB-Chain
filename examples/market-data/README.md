@@ -8,4 +8,4 @@ Example contract for [proposal 0004](../../docs/proposals/0004-market-data.md), 
 
 Units: prices in 1e-4 of the local currency (`312.55` = `3125500`), money totals in whole units, percentages in basis points, ratios in 1e-4. Symbols are `EXCHANGE:TICKER` (`PSX:OGDC`).
 
-Build: `./build.sh` (writes `market-data.elf`). Tests: `cargo test -p btb-tests --test market_data` loads real PSX figures for OGDC and checks P/E 5.12, yield 4.00 %, market cap PKR 1,344,255,171,420 and the -17.8 % discount to the sector median against the off-chain API.
+Build: `./build.sh` (writes `market-data.elf`). Frontend (all Rust, Dioxus/WASM): [`../market-data-web`](../market-data-web). Tests: `cargo test -p btb-tests --test market_data` loads real PSX figures for OGDC and checks P/E 5.12, yield 4.00 %, market cap PKR 1,344,255,171,420 and the -17.8 % discount to the sector median against the off-chain API.

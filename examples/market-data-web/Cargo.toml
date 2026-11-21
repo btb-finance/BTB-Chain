@@ -1,0 +1,24 @@
+[package]
+name = "market-data-web"
+description = "All-Rust web frontend (Dioxus, WASM) for the market-data example contract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone workspace: builds for wasm32-unknown-unknown (see build.sh).
+[workspace]
+
+[dependencies]
+btb-codec = { path = "../../crates/btb-codec" }
+dioxus = { version = "0.7", default-features = false, features = ["web", "macro", "html", "hooks", "signals", "launch"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Request", "RequestInit", "Response", "Headers", "Location"] }
+js-sys = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
