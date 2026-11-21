@@ -92,6 +92,17 @@ pub fn oracle_price_key(pair: u32) -> Vec<u8> {
     k
 }
 
+/// `50 60 id:u32be`: a registered open data feed (`btb_chain::feeds::FeedRecord`, canonical
+/// encoding: name, decimals, owner, read_fee, ...). Registered ids start at `1 << 16`.
+pub fn oracle_feed_key(id: u32) -> Vec<u8> {
+    let mut k = vec![TAG_ORACLE, 0x60];
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// First id of a registered open data feed; genesis pairs are below.
+pub const FIRST_FEED_ID: u32 = 1 << 16;
+
 /// `50 11 pair:u32be`: the circuit-breaker record of a feed; its first byte is 1 while the feed
 /// is paused (the rest is the chain's business, see `btb_chain::oracle`).
 pub fn oracle_breaker_key(pair: u32) -> Vec<u8> {

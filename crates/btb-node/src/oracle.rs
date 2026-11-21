@@ -478,7 +478,15 @@ impl Prices {
     /// An observation from the network. Kept if it verifies, comes from a validator in
     /// `validators`, names a configured pair and is newer than what we hold.
     pub fn on_observation(&mut self, o: SignedObservation, validators: &[[u8; 32]]) -> bool {
-        if !self.pairs.contains(&o.obs.pair)
+        // Genesis pairs we know; registered open feeds (proposal 0005) are relayed whoever
+        // reports them, so a leader that does not report a feed still carries its observations
+        // (the executor checks that the reporter joined the feed). Bounded per validator.
+        let open = o.obs.pair >= btb_runtime::layout::FIRST_FEED_ID;
+        if (!open && !self.pairs.contains(&o.obs.pair))
+            || (open
+                && !self.pending.contains_key(&(o.obs.pair, o.key))
+                && self.pending.keys().filter(|(_, k)| *k == o.key).count()
+                    >= btb_chain::feeds::MAX_FEEDS_PER_VALIDATOR as usize + self.pairs.len())
             || !validators.contains(&o.key)
             || self
                 .pending
@@ -518,6 +526,11 @@ impl Prices {
 
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// The pairs and feeds this validator observes.
+    pub fn pairs(&self) -> &[u32] {
+        &self.pairs
     }
 }
 
@@ -564,12 +577,38 @@ impl OracleNode {
                 );
             }
         }
-        let pairs: Vec<u32> = og.pairs.iter().map(|p| p.id).collect();
+        // Genesis pairs plus the open feeds registered so far (proposal 0005): `price_sources`
+        // may name either. A feed registered later is picked up at the next start.
+        let mut known = og.pairs.clone();
+        for (id, f) in btb_chain::feeds::list(state.store(), btb_chain::feeds::FIRST_ID, 100_000)
+            .map_err(|e| e.to_string())?
+        {
+            known.push(btb_chain::PairConfig {
+                id,
+                name: f.name,
+                decimals: f.decimals,
+            });
+        }
+        let mut pairs: Vec<u32> = og.pairs.iter().map(|p| p.id).collect();
         let source = match (&p.price_source, p.price_sources.is_empty()) {
-            (Some(s), _) => Some(s.clone()),
+            (Some(s), _) => {
+                // a price function (tests): it may answer for any known pair or feed
+                for k in &known {
+                    if !pairs.contains(&k.id) {
+                        pairs.push(k.id);
+                    }
+                }
+                Some(s.clone())
+            }
             (None, true) => None,
             (None, false) => {
-                let pairs = crate::price_sources::resolve(&p.price_sources, &og.pairs)?;
+                let pairs_cfg = crate::price_sources::resolve(&p.price_sources, &known)?;
+                for r in &pairs_cfg {
+                    if !pairs.contains(&r.id) {
+                        pairs.push(r.id);
+                    }
+                }
+                let pairs = pairs_cfg;
                 Some(
                     crate::price_sources::PriceFetcher::spawn(
                         pairs,

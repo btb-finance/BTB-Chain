@@ -12,7 +12,7 @@ Every request pays the node that served or executed it:
 | Website / file serving | App via voucher | Hosting node | Batched on-chain |
 | Mutation | Sender (or app-sponsored) | Validators 80%, relay host 20% (the relay host is the registered hosting or edge node the sender signed into the transaction; without one, validators get 100%) | In the block |
 | Cron job | Contract's prepaid balance | Block executor | In the block |
-| Oracle price read in a mutation or cron | The user or bot reading it (a per-read fee of 10,000 gas on top of the read) | Validators that reported the price (validator pool) | In the block |
+| Oracle price read in a mutation or cron | The user or bot reading it (a per-read fee: 10,000 gas for built-in pairs, the feed's own `read_fee` for open feeds, on top of the read) | Only the validators whose observations made the value read, pro rata by stake (moved from the validator pool after the block, [ORACLES.md](ORACLES.md#2b-open-data-feeds)) | In the block |
 | Oracle price read in a query | Nobody (queries are not billed) | Served by hosting nodes | None |
 | Randomness | Mutation's gas (`300 + 2/byte`; the full gas limit is charged) | Validators | In the block |
 | Large-file storage (blob layer) | Uploader prepays per GB per period | Storage nodes that pass storage challenges | Per period |

@@ -38,6 +38,8 @@ Short definitions of terms used across the BTB Chain docs, in alphabetical order
 
 **Mutation.** A function kind that reads and writes state in a transaction. It goes through consensus and pays gas. See [Languages](LANGUAGE.md#four-function-kinds).
 
+**Open data feed.** A feed anyone registers on chain (1,000 BTB deposit); each validator decides whether to join and report it, the value is the stake-weighted median of the joined reporters when the feed's quorum is met, and reads in mutations pay the validators that made the value. See [ORACLES.md](ORACLES.md#2b-open-data-feeds).
+
 **Payment channel.** BTB locked on-chain once, then drawn down by signed vouchers so per-request fees need no consensus. See [Tokenomics](TOKENOMICS.md#payment-channels-for-per-request-fees).
 
 **Query.** A read-only function kind answered by hosting nodes without consensus. Queries cannot write state or use randomness, and frontends can subscribe to them. See [Languages](LANGUAGE.md#four-function-kinds).

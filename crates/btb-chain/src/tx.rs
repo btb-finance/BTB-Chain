@@ -325,6 +325,9 @@ pub enum TxKind {
     Account(crate::account::AccountOp),
     /// Register, sell, give or pay a name (`crate::names`).
     Name(crate::names::NameOp),
+    /// Register, update or close an open data feed, or join or leave one as a validator
+    /// (`crate::feeds`).
+    Feed(crate::feeds::FeedOp),
 }
 
 fn encode_evidence(e: &Evidence, out: &mut Vec<u8>) {
@@ -521,6 +524,10 @@ impl Encode for TxBody {
                 25u8.encode_to(out);
                 op.encode_to(out);
             }
+            TxKind::Feed(op) => {
+                26u8.encode_to(out);
+                op.encode_to(out);
+            }
         }
         // v2: a relayer sets the tag's high bit and follows it as 32 bytes; v3: a session
         // account sets bit 0x40 and follows the relayer.
@@ -641,6 +648,10 @@ impl TxBody {
             },
             25 => match crate::names::NameOp::decode_from(r)? {
                 Ok(op) => TxKind::Name(op),
+                Err(t) => return Err(TxError::BadTag(t)),
+            },
+            26 => match crate::feeds::FeedOp::decode_from(r)? {
+                Ok(op) => TxKind::Feed(op),
                 Err(t) => return Err(TxError::BadTag(t)),
             },
             t => return Err(TxError::BadTag(t)),
@@ -768,6 +779,7 @@ impl Transaction {
             TxKind::Session(op) => op.gas(),
             TxKind::Account(op) => op.gas(),
             TxKind::Name(op) => op.gas(),
+            TxKind::Feed(op) => op.gas(),
             TxKind::Upgrade { code, .. } => crate::upgrade::UPGRADE_BASE_GAS
                 .saturating_add(DEPLOY_BYTE_GAS.saturating_mul(code.len() as u64)),
             TxKind::Deploy { code, .. } => {

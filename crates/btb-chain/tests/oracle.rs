@@ -1181,3 +1181,354 @@ fn twap_off_when_the_window_is_zero() {
         <(u8, u128)>::decode(&e.net.query(&c, "twap", &(0u32, 1u64), &w.addr())).unwrap();
     assert_eq!(status, 1);
 }
+
+// ------------------------------------------------------------------ open data feeds (0005)
+
+use btb_chain::feeds::{self, FeedError, FeedOp};
+
+fn register(name: &str, read_fee: u64, min_reporters: u32, min_stake_bps: u32) -> TxKind {
+    TxKind::Feed(FeedOp::Register {
+        name: name.into(),
+        decimals: 4,
+        read_fee,
+        min_reporters,
+        min_stake_bps,
+        max_age_blocks: 20,
+    })
+}
+
+fn feed_err(r: &Receipt) -> FeedError {
+    match &r.status {
+        Status::Reverted(Revert::Feed(e)) => e.clone(),
+        other => panic!("expected a feed error, got {other:?}"),
+    }
+}
+
+/// Validators sign feed operations with their consensus key; fund those accounts for fees.
+fn validator_wallets(e: &mut Env) -> Vec<Wallet> {
+    let ws: Vec<Wallet> = (0..4).map(|i| Wallet::new(100 + i as u8)).collect();
+    for (i, w) in ws.iter().enumerate() {
+        assert_eq!(w.key.verifying_key().to_bytes(), ckey_bytes(i));
+        let fund = e.users[2].transfer(w.addr(), 1_000_000_000);
+        ok(&e.run_one(fund));
+    }
+    ws
+}
+
+/// A feed owner with enough for the 1,000 BTB deposit (test accounts start with exactly 1,000).
+fn feed_owner(e: &mut Env) -> Wallet {
+    let w = Wallet::new(60);
+    for i in 0..2 {
+        let t = e.users[i].transfer(w.addr(), 600 * UNITS_PER_BTB);
+        ok(&e.run_one(t));
+    }
+    // and from operators 0 to 2 (genesis accounts that sign nothing else in these tests)
+    for i in 0..3 {
+        let t = Wallet::new(10 + i as u8).transfer(w.addr(), 900 * UNITS_PER_BTB);
+        ok(&e.run_one(t));
+    }
+    w
+}
+
+fn operator(i: usize) -> Address {
+    Wallet::new(10 + i as u8).addr()
+}
+
+#[test]
+fn feeds_register_validate_and_lock_a_deposit() {
+    let mut e = env();
+    let gp = e.net.state.config().gas_price;
+    let mut owner = feed_owner(&mut e);
+    let before = e.net.bal(&owner.addr());
+    let r = e.run_one(owner.sign(register("PSX:OGDC", 50_000, 3, 5_000)));
+    ok(&r);
+    let id = u32::decode(&r.output).unwrap();
+    assert_eq!(id, feeds::FIRST_ID);
+    assert_eq!(
+        e.net.bal(&owner.addr()),
+        before - feeds::FEED_DEPOSIT - r.fee,
+        "deposit locked"
+    );
+    assert_eq!(r.fee, feeds::FEED_GAS * gp);
+    let store = e.net.state.store();
+    assert_eq!(feeds::deposit(store, id).unwrap(), feeds::FEED_DEPOSIT);
+    assert_eq!(feeds::id_of(store, "PSX:OGDC").unwrap(), Some(id));
+    assert_eq!(feeds::get(store, id).unwrap().unwrap().owner, owner.addr());
+    // refusals change nothing but the fee
+    for (kind, err) in [
+        (register("PSX:OGDC", 50_000, 3, 5_000), FeedError::Taken),
+        (register("BTC/USD", 50_000, 3, 5_000), FeedError::Taken),
+        (register("has space", 50_000, 3, 5_000), FeedError::BadName),
+        (register("", 50_000, 3, 5_000), FeedError::BadName),
+        (register("X:1", 50_000, 2, 5_000), FeedError::BadParams),
+        (register("X:2", 50_000, 3, 999), FeedError::BadParams),
+        (register("X:3", 9_999, 3, 5_000), FeedError::BadParams),
+        (register("X:4", 50_000, 3, 10_001), FeedError::BadParams),
+    ] {
+        let b = e.net.bal(&owner.addr());
+        let r = e.run_one(owner.sign(kind));
+        assert_eq!(feed_err(&r), err);
+        assert_eq!(e.net.bal(&owner.addr()), b - r.fee);
+    }
+    let mut poor = Wallet::new(77);
+    let fund = e.users[0].transfer(poor.addr(), 1_000_000);
+    ok(&e.run_one(fund));
+    // Without the deposit the transaction is invalid before it runs: nothing is charged.
+    let r = e.run_one(poor.sign(register("X:5", 50_000, 3, 5_000)));
+    assert!(matches!(r.status, Status::Invalid(_)), "{r:?}");
+    assert_eq!(e.net.bal(&poor.addr()), 1_000_000);
+    // update and close are the owner's
+    let mut other = e.users.remove(2);
+    let upd = FeedOp::Update {
+        feed: id,
+        read_fee: 60_000,
+        min_reporters: 3,
+        min_stake_bps: 5_000,
+        max_age_blocks: 20,
+    };
+    assert_eq!(
+        feed_err(&e.run_one(other.sign(TxKind::Feed(upd.clone())))),
+        FeedError::NotOwner
+    );
+    assert_eq!(
+        feed_err(&e.run_one(other.sign(TxKind::Feed(FeedOp::Close { feed: id })))),
+        FeedError::NotOwner
+    );
+    ok(&e.run_one(owner.sign(TxKind::Feed(upd))));
+    assert_eq!(
+        feeds::get(e.net.state.store(), id)
+            .unwrap()
+            .unwrap()
+            .read_fee,
+        60_000
+    );
+    let b = e.net.bal(&owner.addr());
+    let r = e.run_one(owner.sign(TxKind::Feed(FeedOp::Close { feed: id })));
+    ok(&r);
+    assert_eq!(
+        e.net.bal(&owner.addr()),
+        b - r.fee + feeds::FEED_DEPOSIT,
+        "deposit back"
+    );
+    assert!(feeds::get(e.net.state.store(), id).unwrap().is_none());
+    assert_eq!(feeds::id_of(e.net.state.store(), "PSX:OGDC").unwrap(), None);
+    // ids are never reused
+    let r = e.run_one(owner.sign(register("PSX:OGDC", 50_000, 3, 5_000)));
+    assert_eq!(u32::decode(&r.output).unwrap(), id + 1);
+}
+
+#[test]
+fn only_joined_validators_report_and_the_feed_quorum_decides() {
+    let mut e = env();
+    let mut vals = validator_wallets(&mut e);
+    let mut owner = feed_owner(&mut e);
+    let r = e.run_one(owner.sign(register("PSX:OGDC", 50_000, 3, 9_000)));
+    let id = u32::decode(&r.output).unwrap();
+    // joining: validators only, once each
+    let join = TxKind::Feed(FeedOp::Join { feed: id });
+    assert_eq!(
+        feed_err(&e.run_one(owner.sign(join.clone()))),
+        FeedError::NotValidator
+    );
+    assert_eq!(
+        feed_err(&e.run_one(vals[0].sign(TxKind::Feed(FeedOp::Join { feed: 999_999 })))),
+        FeedError::NoSuchFeed
+    );
+    for v in vals.iter_mut().take(3) {
+        ok(&e.run_one(v.sign(join.clone())));
+    }
+    assert_eq!(
+        feed_err(&e.run_one(vals[0].sign(join.clone()))),
+        FeedError::AlreadyJoined
+    );
+    assert_eq!(feeds::reporters(e.net.state.store(), id).unwrap().len(), 3);
+    assert_eq!(
+        feeds::joined_count(e.net.state.store(), &ckey_bytes(0)).unwrap(),
+        1
+    );
+
+    // Validator 3 did not join: ignored. Two reporters: below min_reporters (3).
+    let h = e.height() + 1;
+    e.run_obs(vec![
+        obs(3, id, 1, h),
+        obs(0, id, 3_125_500, h),
+        obs(1, id, 3_126_000, h),
+    ]);
+    assert_eq!(e.price(id), None, "two of three required reporters");
+    // The third joins in: 90,000 of 90,000 joined stake reports, median by stake.
+    let h = e.height() + 1;
+    e.run_obs(vec![obs(2, id, 9_999_999, h)]);
+    assert_eq!(e.price(id), Some((3_126_000, h, 4, 3)));
+    let mut who = feeds::contributors(e.net.state.store(), id).unwrap();
+    who.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    assert_eq!(
+        who,
+        vec![
+            (operator(0), STAKES[0]),
+            (operator(1), STAKES[1]),
+            (operator(2), STAKES[2])
+        ]
+    );
+    // min_stake_bps: once validator 0 (40,000 of 90,000) leaves, the other two can never reach
+    // 3 reporters, and a feed below quorum keeps its old value.
+    ok(&e.run_one(vals[0].sign(TxKind::Feed(FeedOp::Leave { feed: id }))));
+    assert_eq!(
+        feed_err(&e.run_one(vals[0].sign(TxKind::Feed(FeedOp::Leave { feed: id })))),
+        FeedError::NotJoined
+    );
+    let h = e.height() + 1;
+    e.run_obs(vec![obs(0, id, 5, h), obs(1, id, 6, h), obs(2, id, 7, h)]);
+    assert_eq!(e.price(id).unwrap().0, 3_126_000, "below quorum: unchanged");
+    // A non-validator's observation for a feed is ignored, a forged one too.
+    let outsider = SignedObservation::sign(
+        CHAIN_ID,
+        &SigningKey::from_bytes(&[9; 32]),
+        Observation {
+            pair: id,
+            price: 1,
+            height: e.height() + 1,
+        },
+    );
+    e.run_obs(vec![outsider]);
+    assert_eq!(e.price(id).unwrap().0, 3_126_000);
+}
+
+#[test]
+fn reads_in_mutations_pay_the_reporters_of_the_value_read() {
+    let mut e = env();
+    let gp = e.net.state.config().gas_price;
+    let c = e.deploy_oracle_contract(vec![]);
+    let mut vals = validator_wallets(&mut e);
+    let mut owner = feed_owner(&mut e);
+    let r = e.run_one(owner.sign(register("PSX:OGDC", 50_000, 3, 5_000)));
+    let id = u32::decode(&r.output).unwrap();
+    for v in vals.iter_mut().take(3) {
+        ok(&e.run_one(v.sign(TxKind::Feed(FeedOp::Join { feed: id }))));
+    }
+    let h = e.height() + 1;
+    e.run_obs((0..3).map(|v| obs(v, id, 3_125_500, h)).collect());
+    assert!(e.price(id).is_some());
+    let mut reader = e.users.remove(0);
+    let ops: Vec<u64> = (0..4).map(|i| e.net.bal(&operator(i))).collect();
+    let pool = e.net.bal(&validator_pool());
+    // A query read is free and pays nobody.
+    e.net.query(&c, "quote", &id, &reader.addr());
+    // A mutation read costs the feed's own fee in gas.
+    let r = e.run_one(reader.call(c, "use_price", &(id, 5u64)));
+    ok(&r);
+    assert!(
+        r.gas_used >= 200 + 50_000,
+        "feed fee charged: {}",
+        r.gas_used
+    );
+    let paid = 50_000 * gp;
+    assert_eq!(r.feed_fees, vec![(id, paid)]);
+    // Contributors 0, 1, 2 split it by stake (40:30:20); validator 3 did not report.
+    let total = STAKES[0] + STAKES[1] + STAKES[2];
+    let mut shares: Vec<u64> = (0..3).map(|i| paid * STAKES[i] / total).collect();
+    let rem = (paid - shares.iter().sum::<u64>()) as usize;
+    for s in shares.iter_mut().take(rem) {
+        *s += 1;
+    }
+    for i in 0..3 {
+        assert_eq!(e.net.bal(&operator(i)), ops[i] + shares[i], "operator {i}");
+    }
+    assert_eq!(e.net.bal(&operator(3)), ops[3]);
+    assert_eq!(
+        e.net.bal(&validator_pool()),
+        pool + r.fee - paid,
+        "the rest of the fee stays in the pool"
+    );
+    // A relayed read: the relay host's share comes out of the reporters' part too, and the
+    // reporters never get more than reached the pool. (No registered relayer here: full fee.)
+    // A genesis pair read pays its (all four) reporters the standard fee.
+    let h = e.height() + 1;
+    e.run_obs((0..4).map(|v| obs(v, 0, 6_500_000_000_000, h)).collect());
+    let ops: Vec<u64> = (0..4).map(|i| e.net.bal(&operator(i))).collect();
+    let r = e.run_one(reader.call(c, "use_price", &(0u32, 5u64)));
+    ok(&r);
+    assert_eq!(r.feed_fees, vec![(0, btb_vm::gas::PRICE_READ_FEE * gp)]);
+    for (i, before) in ops.iter().enumerate() {
+        assert!(
+            e.net.bal(&operator(i)) > *before,
+            "genesis reporter {i} paid"
+        );
+    }
+    // A read that finds no value (closed feed) pays nobody; the fee stays in the pool.
+    ok(&e.run_one(owner.sign(TxKind::Feed(FeedOp::Close { feed: id }))));
+    let ops: Vec<u64> = (0..4).map(|i| e.net.bal(&operator(i))).collect();
+    let r = e.run_one(reader.call(c, "use_price", &(id, 5u64)));
+    assert!(matches!(r.status, Status::Reverted(Revert::Abort(ref m)) if m == "no price"));
+    for (i, before) in ops.iter().enumerate() {
+        assert_eq!(e.net.bal(&operator(i)), *before);
+    }
+    // The supply invariant was checked after every block (`try_run`).
+}
+
+#[test]
+fn open_feeds_agree_between_sequential_and_parallel_execution() {
+    let mk = |parallel: bool| {
+        let mut e = env_with(&STAKES, 3, 12);
+        e.net.ex = if parallel {
+            let mut x = Executor::parallel(4);
+            x.parallel_min_txs = 2;
+            x
+        } else {
+            Executor::sequential()
+        };
+        let c = e.deploy_oracle_contract(vec![]);
+        let mut vals = validator_wallets(&mut e);
+        let mut owner = feed_owner(&mut e);
+        let r = e.run_one(owner.sign(register("F:1", 30_000, 3, 5_000)));
+        let id = u32::decode(&r.output).unwrap();
+        for v in vals.iter_mut() {
+            ok(&e.run_one(v.sign(TxKind::Feed(FeedOp::Join { feed: id }))));
+        }
+        let mut users = std::mem::take(&mut e.users);
+        let mut roots = Vec::new();
+        for round in 0..3u64 {
+            let h = e.height() + 1;
+            let observations = (0..4)
+                .map(|v| obs(v, id, 1_000 + u128::from(round) + v as u128, h))
+                .collect();
+            let txs: Vec<Transaction> = users
+                .iter_mut()
+                .map(|u| u.call(c, "use_price", &(id, 50u64)))
+                .collect();
+            e.try_run(txs, observations).unwrap();
+            roots.push(e.net.state.root().unwrap());
+        }
+        roots
+    };
+    assert_eq!(mk(false), mk(true));
+}
+
+#[test]
+fn feed_operations_round_trip_on_the_wire() {
+    let mut w = Wallet::new(5);
+    for op in [
+        FeedOp::Register {
+            name: "BTC/USD:x".into(),
+            decimals: 8,
+            read_fee: 12_345,
+            min_reporters: 4,
+            min_stake_bps: 2_500,
+            max_age_blocks: 9,
+        },
+        FeedOp::Update {
+            feed: 70_000,
+            read_fee: 10_000,
+            min_reporters: 3,
+            min_stake_bps: 1_000,
+            max_age_blocks: 1,
+        },
+        FeedOp::Close { feed: 70_001 },
+        FeedOp::Join { feed: 70_002 },
+        FeedOp::Leave { feed: u32::MAX },
+    ] {
+        let tx = w.sign(TxKind::Feed(op));
+        let back = Transaction::decode(&tx.encode()).unwrap();
+        assert_eq!(back, tx);
+        assert!(back.verify_signature());
+    }
+}

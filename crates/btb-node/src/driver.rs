@@ -226,6 +226,8 @@ struct Driver<S: KvStore + 'static> {
     ckey_nonce: glue::CkeyNonce,
     /// Paid `btb_query` (`crate::query_pay`); `None`: queries are free.
     query_pay: Option<crate::query_pay::QueryPay>,
+    /// Open feeds this validator asked to join, and when (proposal 0005; retried after 30 s).
+    feed_joins: HashMap<u32, Instant>,
 }
 
 /// `(sender, nonce)` of every transaction in the given block payloads.
@@ -373,6 +375,7 @@ impl<S: KvStore + 'static> Driver<S> {
             reports: ReportNode::new(p.genesis.chain_id),
             cross: None,
             ckey_nonce: Default::default(),
+            feed_joins: HashMap::new(),
             query_pay: p.query_pay.clone().map(|c| {
                 crate::query_pay::QueryPay::new(
                     c,
@@ -1050,6 +1053,7 @@ impl<S: KvStore + 'static> Driver<S> {
         self.oracle_after_block();
         if !self.applying_sync {
             self.redeem_query_vouchers();
+            self.join_feeds();
         }
         Ok(())
     }
@@ -1135,6 +1139,61 @@ impl<S: KvStore + 'static> Driver<S> {
             self.submit_dkg(ops);
         }
         self.cross_after_block();
+    }
+
+    /// Join the open feeds this validator has price sources for (proposal 0005): a `FeedOp::Join`
+    /// signed with the consensus key, once per feed (again after 30 s if it did not land).
+    fn join_feeds(&mut self) {
+        let Some(o) = self.oracle.as_ref() else {
+            return;
+        };
+        let me = self.signing.verifying_key().to_bytes();
+        if !self.keys.contains(&me) {
+            return; // only validators of the current epoch can join
+        }
+        let wanted: Vec<u32> = o
+            .prices
+            .pairs()
+            .iter()
+            .copied()
+            .filter(|id| *id >= btb_chain::feeds::FIRST_ID)
+            .collect();
+        for feed in wanted {
+            match btb_chain::feeds::joined(self.state.store(), feed, &me) {
+                Ok(false) => {}
+                _ => continue,
+            }
+            if self
+                .feed_joins
+                .get(&feed)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+            {
+                continue;
+            }
+            let addr = account_address(&me);
+            let nonce = self.next_ckey_nonce(&addr);
+            let tx = Transaction::sign(
+                TxBody {
+                    relayer: None,
+                    session: None,
+                    account: None,
+                    chain_id: self.chain_id,
+                    nonce,
+                    kind: TxKind::Feed(btb_chain::feeds::FeedOp::Join { feed }),
+                },
+                &self.signing,
+            );
+            match self.add_tx(&tx.encode(), None) {
+                Ok(_) => {
+                    self.ckey_nonce.used(nonce);
+                    self.feed_joins.insert(feed, Instant::now());
+                }
+                Err(e) => eprintln!(
+                    "btb-node[{}]: could not join open feed {feed}: {e}",
+                    self.index()
+                ),
+            }
+        }
     }
 
     /// Settle query-payment channels that earned enough: `ChannelOp::Close` with the best

@@ -35,6 +35,41 @@ fn beacon_json(b: &Beacon) -> Value {
     })
 }
 
+fn feed_json<S: KvStore>(
+    st: &ChainState<S>,
+    id: u32,
+    f: &btb_chain::feeds::FeedRecord,
+) -> RpcResult {
+    let kv = st.store();
+    let price = oracle::price(kv, id).map_err(app)?;
+    Ok(json!({
+        "id": id,
+        "name": f.name,
+        "decimals": f.decimals,
+        "owner": hex::encode(&f.owner),
+        "read_fee": f.read_fee,
+        "min_reporters": f.min_reporters,
+        "min_stake_bps": f.min_stake_bps,
+        "max_age_blocks": f.max_age_blocks,
+        "deposit": btb_chain::feeds::deposit(kv, id).map_err(app)?.to_string(),
+        "reporters": btb_chain::feeds::reporters(kv, id)
+            .map_err(app)?
+            .iter()
+            .map(|k| hex::encode(k))
+            .collect::<Vec<_>>(),
+        "price": price.map(|p| json!({
+            "price": p.price.to_string(),
+            "height": p.height,
+            "reporters": p.reporters,
+        })),
+        "contributors": btb_chain::feeds::contributors(kv, id)
+            .map_err(app)?
+            .iter()
+            .map(|(op, stake)| json!({"operator": hex::encode(op), "stake": stake}))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 pub fn handle<S: KvStore>(
     st: &ChainState<S>,
     store: &BlockStore,
@@ -141,14 +176,18 @@ pub fn handle<S: KvStore>(
                 .and_then(Value::as_u64)
                 .and_then(|x| u32::try_from(x).ok())
                 .ok_or_else(|| RpcError::invalid_params("pair id must be a number"))?;
-            let Some(cfg) = og.pairs.iter().find(|p| p.id == pair) else {
-                return Ok(Value::Null);
+            let name = match og.pairs.iter().find(|p| p.id == pair) {
+                Some(cfg) => cfg.name.clone(),
+                None => match btb_chain::feeds::get(st.store(), pair).map_err(app)? {
+                    Some(f) => f.name,
+                    None => return Ok(Value::Null),
+                },
             };
             Ok(match oracle::price(st.store(), pair).map_err(app)? {
                 None => Value::Null,
                 Some(p) => json!({
                     "pair": pair,
-                    "name": cfg.name,
+                    "name": name,
                     "price": p.price.to_string(),
                     "decimals": p.decimals,
                     "height": p.height,
@@ -156,6 +195,38 @@ pub fn handle<S: KvStore>(
                     "paused": oracle::paused(st.store(), pair).map_err(app)?,
                 }),
             })
+        }
+        "btb_oracleFeeds" => {
+            // [from_id?, limit?]: registered open feeds (proposal 0005), by id.
+            let from = params
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|x| u32::try_from(x).ok())
+                .unwrap_or(btb_chain::feeds::FIRST_ID);
+            let limit = params
+                .get(1)
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(500) as usize;
+            let list = btb_chain::feeds::list(st.store(), from, limit).map_err(app)?;
+            let mut out = Vec::new();
+            for (id, f) in list {
+                out.push(feed_json(st, id, &f)?);
+            }
+            Ok(json!(out))
+        }
+        "btb_oracleFeed" => {
+            // [id or name]
+            let id = match params.first() {
+                Some(Value::Number(n)) => n.as_u64().and_then(|x| u32::try_from(x).ok()),
+                Some(Value::String(s)) => btb_chain::feeds::id_of(st.store(), s).map_err(app)?,
+                _ => None,
+            }
+            .ok_or_else(|| RpcError::invalid_params("expected a feed id or name"))?;
+            match btb_chain::feeds::get(st.store(), id).map_err(app)? {
+                None => Ok(Value::Null),
+                Some(f) => feed_json(st, id, &f),
+            }
         }
         "btb_oracleTwap" => {
             let pair = params

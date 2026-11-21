@@ -553,6 +553,11 @@ pub trait Host {
     fn price(&mut self, _pair: u32) -> Option<PriceRecord> {
         None
     }
+    /// Per-read fee, in gas, of `pair` in a mutation or cron (a registered open feed sets its
+    /// own, proposal 0005). Charged on top of `gas::HOST_PRICE_QUERY` before the read.
+    fn price_read_fee(&mut self, _pair: u32) -> u64 {
+        gas::PRICE_READ_FEE
+    }
     /// Time-weighted average price of `pair` over the last `window` blocks.
     fn price_twap(&mut self, _pair: u32, _window: u64) -> TwapOutcome {
         TwapOutcome::NotFound
@@ -923,7 +928,9 @@ pub fn run_with_host(vm: &mut Vm, host: &mut impl Host) -> Result<Exit, Trap> {
                 vm.charge_gas(if host.read_only() {
                     gas::HOST_PRICE_QUERY
                 } else {
-                    gas::HOST_PRICE_MUTATION
+                    let fee = u32::try_from(a0)
+                        .map_or(gas::PRICE_READ_FEE, |pair| host.price_read_fee(pair));
+                    gas::HOST_PRICE_QUERY.saturating_add(fee)
                 })?;
                 // Validate the output window before doing anything.
                 buf(vm, a1, 32)?;

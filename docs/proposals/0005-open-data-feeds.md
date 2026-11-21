@@ -1,6 +1,6 @@
 # 0005: Open data feeds: any validator adds any feed, readers pay the reporters
 
-Status: **Draft**. Issue: to be opened by a maintainer as a Design Proposal. Touches oracles (consensus-adjacent execution) and tokenomics: the Safety section must be reviewed before code.
+Status: **Accepted; phases A and B built** ([ORACLES.md](../ORACLES.md#2b-open-data-feeds)). Issue: to be opened by a maintainer as a Design Proposal. Touches oracles (consensus-adjacent execution) and tokenomics: the Safety section must be reviewed before code.
 
 ## Summary
 
@@ -73,7 +73,7 @@ Failure-case tests: registration without deposit, duplicate name, quorum below t
 
 ## Phases
 
-- **A + B:** `btb_chain::oracle` (feed registry under the oracle tag, opt-in set, per-feed quorum, contributor set stored with each value, fee credit), `FeedOp` transaction, `btb_vm` host-call gas for `read_fee`, SDK `price(feed)` unchanged, RPC `btb_feeds`, `btb_feed [id]`, node `Join` from config. Genesis pairs migrate as chain-owned feeds.
+- **A + B (built):** `btb_chain::feeds` and `btb_chain::oracle` (feed registry under the oracle tag, opt-in set, per-feed quorum, contributor set stored with each value, fee credit), `FeedOp` transaction, `btb_vm` host-call gas for `read_fee`, SDK `price(feed)` unchanged, RPC `btb_oracleFeeds`, `btb_oracleFeed [id or name]`, node `Join` from config. As built, genesis pairs keep their own rule (all validators, two thirds of the total stake) instead of becoming chain-owned feeds, but their reads also pay the contributors of the value; the owner share is not built.
 - **C:** `price_checked_with`, `kind = Value`, licence statement.
 
 ## Affected files

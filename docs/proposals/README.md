@@ -19,4 +19,4 @@ Design changes go through a Design Proposal before code (see [AGENTS.md](../../A
 | [0002](0002-accounts.md) | Named accounts with hidden, rotating keys (names, passkeys, recovery, post-quantum path) | Draft; phases A and B built |
 | [0003](0003-storage-growth.md) | Keep node storage small: compression, pruning, tiers, snapshots, smaller transactions | Draft; phase A built |
 | [0004](0004-market-data.md) | Market data: data providers, stock tables, one-call payloads | Accepted; phases A and B0 built |
-| [0005](0005-open-data-feeds.md) | Open data feeds: any validator adds any feed, readers pay the reporters | Draft |
+| [0005](0005-open-data-feeds.md) | Open data feeds: any validator adds any feed, readers pay the reporters | Accepted; phases A and B built |

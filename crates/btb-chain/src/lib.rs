@@ -15,6 +15,7 @@ pub mod dex;
 pub mod dkg;
 pub mod dkg_agent;
 pub mod exec;
+pub mod feeds;
 pub mod host;
 pub mod mempool;
 pub mod names;
