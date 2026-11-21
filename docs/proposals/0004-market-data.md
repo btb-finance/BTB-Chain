@@ -1,6 +1,6 @@
 # 0004: Market data on BTB: data providers, stock tables and one-call payloads
 
-Status: **Draft**. Issue: to be opened by a maintainer as a Design Proposal. Phase B touches tokenomics (fees paid to non-validators) and needs the Safety section reviewed before code.
+Status: **Draft; phase A built** (`examples/market-data`, tests `crates/btb-tests/tests/market_data.rs`). Issue: to be opened by a maintainer as a Design Proposal. Phase B touches tokenomics (fees paid to non-validators) and needs the Safety section reviewed before code.
 
 ## Summary
 
@@ -116,6 +116,10 @@ Rollout by region, each a gate: South Asia (PSX, NSE, BSE, DSE, CSE), MENA (Tada
 | Reads | unbounded | Queries on hosting and edge nodes; validators do not serve them |
 
 Validators carry only the live data; the bulk scales with storage and hosting nodes, which earn for it ([SCALING.md](../SCALING.md)). The real limit is **licensing per exchange**, recorded in each dataset's licence statement.
+
+## Phase A as built
+
+`examples/market-data`: tables `Exchange`, `Company`, `Quote`, `Bar` (key `SYMBOL|YYYYMMDD`, so a primary range scan gives a symbol's bars in date order), `Fundamentals`; provider-only `publish_*` mutations; queries `stock`, `quotes`, `symbols`, `sector`. One difference from the text above: the C blocks (ratios, analytics, sector median) are computed **at read time inside the query** rather than by crons. That is free for the reader, always consistent with the facts, and needs no stored copy; crons that store them become worthwhile when a sector has hundreds of companies (the sector median reads every company of the sector). Covered so far: ratios, change, market cap, free float, 20-day high and drawdown, SMA 20/50, average volume, distance from the 52-week high, sector median P/E and premium. Technicals (RSI, volatility), dividend history and percentiles are next.
 
 ## Sizes and limits (to measure in A)
 
