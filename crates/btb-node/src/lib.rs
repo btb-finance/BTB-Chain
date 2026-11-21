@@ -18,6 +18,7 @@ pub mod operators;
 pub mod oracle;
 pub mod oracle_rpc;
 pub mod price_sources;
+pub mod query_pay;
 pub mod reports;
 pub mod rpc;
 pub mod storage;

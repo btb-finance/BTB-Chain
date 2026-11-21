@@ -30,7 +30,7 @@
 //! DEV/TESTNET API: no authentication and no TLS, so it only binds to loopback. Put a proxy
 //! in front of it to expose it.
 
-use crate::driver::{Input, RpcError, RpcResult};
+use crate::driver::{Input, RpcError, RpcMeta, RpcResult};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::mpsc::Sender;
@@ -46,10 +46,21 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Send one call to the driver and wait for the answer.
 pub async fn call(tx: &Sender<Input>, method: &str, params: Value) -> RpcResult {
+    call_with(tx, method, params, None).await
+}
+
+/// Like [`call`], with the HTTP facts paid methods need (`crate::query_pay`).
+pub async fn call_with(
+    tx: &Sender<Input>,
+    method: &str,
+    params: Value,
+    meta: Option<RpcMeta>,
+) -> RpcResult {
     let (reply, rx) = oneshot::channel();
     tx.send(Input::Rpc {
         method: method.to_string(),
         params,
+        meta,
         reply,
     })
     .map_err(|_| RpcError::app("node is shutting down"))?;
@@ -73,7 +84,7 @@ pub async fn serve(addr: SocketAddr, tx: Sender<Input>) -> Result<SocketAddr, St
     let limit = Arc::new(Semaphore::new(64));
     tokio::spawn(async move {
         loop {
-            let Ok((conn, _)) = listener.accept().await else {
+            let Ok((conn, peer)) = listener.accept().await else {
                 continue;
             };
             let Ok(permit) = limit.clone().try_acquire_owned() else {
@@ -81,7 +92,7 @@ pub async fn serve(addr: SocketAddr, tx: Sender<Input>) -> Result<SocketAddr, St
             };
             let tx = tx.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(IO_TIMEOUT * 3, handle(conn, tx)).await;
+                let _ = tokio::time::timeout(IO_TIMEOUT * 3, handle(conn, peer, tx)).await;
                 drop(permit);
             });
         }
@@ -89,8 +100,8 @@ pub async fn serve(addr: SocketAddr, tx: Sender<Input>) -> Result<SocketAddr, St
     Ok(local)
 }
 
-async fn handle(mut conn: TcpStream, tx: Sender<Input>) {
-    let Some((method, path, body)) = read_request(&mut conn).await else {
+async fn handle(mut conn: TcpStream, peer: SocketAddr, tx: Sender<Input>) {
+    let Some((method, path, headers, body)) = read_request(&mut conn).await else {
         let _ = respond(
             &mut conn,
             "400 Bad Request",
@@ -114,13 +125,25 @@ async fn handle(mut conn: TcpStream, tx: Sender<Input>) {
             let _ = respond_html(&mut conn, crate::explorer::DEX_PAGE).await;
             return;
         }
-        ("POST", "/") => ("200 OK", rpc_response(&tx, &body).await),
+        ("POST", "/") => {
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.clone())
+            };
+            let meta = RpcMeta {
+                client: header("x-real-ip").unwrap_or_else(|| peer.ip().to_string()),
+                voucher: header("x-btb-voucher"),
+            };
+            ("200 OK", rpc_response(&tx, &body, meta).await)
+        }
         _ => ("404 Not Found", json!({"error": "not found"})),
     };
     let _ = respond(&mut conn, status, &out).await;
 }
 
-async fn rpc_response(tx: &Sender<Input>, body: &[u8]) -> Value {
+async fn rpc_response(tx: &Sender<Input>, body: &[u8], meta: RpcMeta) -> Value {
     let req: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return err_obj(Value::Null, -32700, &format!("parse error: {e}")),
@@ -133,7 +156,7 @@ async fn rpc_response(tx: &Sender<Input>, body: &[u8]) -> Value {
     if !params.is_array() {
         return err_obj(id, -32602, "params must be an array");
     }
-    match call(tx, method, params).await {
+    match call_with(tx, method, params, Some(meta)).await {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(e) => err_obj(id, e.code, &e.message),
     }
@@ -168,7 +191,9 @@ async fn respond_html(conn: &mut TcpStream, page: &str) -> std::io::Result<()> {
 }
 
 /// (method, path, body). `None` on anything malformed or too large.
-async fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+type Headers = Vec<(String, String)>;
+
+async fn read_request(conn: &mut TcpStream) -> Option<(String, String, Headers, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -192,11 +217,13 @@ async fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)>
     let mut first = lines.next()?.split(' ');
     let (method, path) = (first.next()?.to_string(), first.next()?.to_string());
     let mut len = 0usize;
+    let mut headers = Vec::new();
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 len = v.trim().parse().ok()?;
             }
+            headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
     if len > MAX_BODY {
@@ -214,5 +241,5 @@ async fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)>
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(len);
-    Some((method, path, body))
+    Some((method, path, headers, body))
 }

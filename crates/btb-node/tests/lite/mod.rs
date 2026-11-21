@@ -135,6 +135,18 @@ impl Lite {
         followers: Option<FollowerPolicy>,
         storage: btb_chain::StorageConfig,
     ) -> Lite {
+        Self::with_params(n, running, epoch_len, followers, storage, |_, _| {})
+    }
+
+    /// Like `with_storage`, letting the test adjust each node's parameters (`tweak(i, params)`).
+    pub fn with_params(
+        n: usize,
+        running: usize,
+        epoch_len: u64,
+        followers: Option<FollowerPolicy>,
+        storage: btb_chain::StorageConfig,
+        tweak: impl Fn(usize, &mut NodeParams),
+    ) -> Lite {
         let keys: Vec<SigningKey> = (0..n).map(|i| key(10 + i as u8)).collect();
         let faucet = Wallet::new(99);
         let per = 1_000 * UNITS_PER_BTB;
@@ -173,6 +185,7 @@ impl Lite {
             p.timing = fast();
             p.rpc = Some("127.0.0.1:0".parse().unwrap());
             p.serve_followers = followers;
+            tweak(i, &mut p);
             let state = open_chain(MemKv::new(), &c.genesis).unwrap();
             c.nodes[i] = Some(Node::start(p, state).unwrap());
         }

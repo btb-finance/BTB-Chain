@@ -109,11 +109,22 @@ pub type StateJob = Box<dyn FnOnce(&mut dyn std::any::Any) + Send>;
 /// subscriptions and indexes here.
 pub type BlockHook = Box<dyn FnMut(&mut dyn std::any::Any, &StoredBlock) + Send>;
 
+/// HTTP facts about an RPC call that paid methods need (`crate::query_pay`).
+#[derive(Debug, Clone, Default)]
+pub struct RpcMeta {
+    /// Client identity for the free quota: `X-Real-IP` if a proxy set it, else the peer address.
+    pub client: String,
+    /// `X-BTB-Voucher` header, hex.
+    pub voucher: Option<String>,
+}
+
 pub enum Input {
     Net([u8; 32], Inbound),
     Rpc {
         method: String,
         params: Value,
+        /// Who asked and how they pay, for calls that came in over HTTP (`None`: internal).
+        meta: Option<RpcMeta>,
         reply: tokio::sync::oneshot::Sender<RpcResult>,
     },
     /// Run a closure on the driver thread against the chain state.
@@ -213,6 +224,8 @@ struct Driver<S: KvStore + 'static> {
     cross: Option<CrossNode>,
     /// Next nonce for transactions signed by the consensus key (DKG and cross-chain messages).
     ckey_nonce: glue::CkeyNonce,
+    /// Paid `btb_query` (`crate::query_pay`); `None`: queries are free.
+    query_pay: Option<crate::query_pay::QueryPay>,
 }
 
 /// `(sender, nonce)` of every transaction in the given block payloads.
@@ -360,6 +373,13 @@ impl<S: KvStore + 'static> Driver<S> {
             reports: ReportNode::new(p.genesis.chain_id),
             cross: None,
             ckey_nonce: Default::default(),
+            query_pay: p.query_pay.clone().map(|c| {
+                crate::query_pay::QueryPay::new(
+                    c,
+                    p.genesis.chain_id,
+                    account_address(&p.key.verifying_key().to_bytes()),
+                )
+            }),
         };
         if d.oracle.is_some() {
             d.cross = Some(CrossNode::new(
@@ -589,9 +609,14 @@ impl<S: KvStore + 'static> Driver<S> {
             Input::Rpc {
                 method,
                 params,
+                meta,
                 reply,
             } => {
-                let r = self.rpc(&method, &params, received);
+                let r = if method == "btb_query" {
+                    self.paid_query(&params, meta.as_ref())
+                } else {
+                    self.rpc(&method, &params, received)
+                };
                 let _ = reply.send(r);
             }
             Input::Job(job) => job(&mut self.state),
@@ -1023,6 +1048,9 @@ impl<S: KvStore + 'static> Driver<S> {
             self.resolve_proofs();
         }
         self.oracle_after_block();
+        if !self.applying_sync {
+            self.redeem_query_vouchers();
+        }
         Ok(())
     }
 
@@ -1107,6 +1135,78 @@ impl<S: KvStore + 'static> Driver<S> {
             self.submit_dkg(ops);
         }
         self.cross_after_block();
+    }
+
+    /// Settle query-payment channels that earned enough: `ChannelOp::Close` with the best
+    /// voucher, signed with the consensus key (the payee account of `crate::query_pay`).
+    fn redeem_query_vouchers(&mut self) {
+        let Some(qp) = self.query_pay.as_mut() else {
+            return;
+        };
+        let vouchers = qp.take_redeemable();
+        for voucher in vouchers {
+            let addr = account_address(&self.signing.verifying_key().to_bytes());
+            let nonce = self.next_ckey_nonce(&addr);
+            let tx = Transaction::sign(
+                TxBody {
+                    relayer: None,
+                    session: None,
+                    account: None,
+                    chain_id: self.chain_id,
+                    nonce,
+                    kind: TxKind::Channel(btb_chain::channel::ChannelOp::Close { voucher }),
+                },
+                &self.signing,
+            );
+            match self.add_tx(&tx.encode(), None) {
+                Ok(_) => self.ckey_nonce.used(nonce),
+                Err(e) => eprintln!(
+                    "btb-node[{}]: could not submit a query-payment settlement: {e}",
+                    self.index()
+                ),
+            }
+        }
+    }
+
+    /// `btb_query` with payment (`crate::query_pay`) when it is configured and the call came in
+    /// over HTTP; otherwise the plain query.
+    fn paid_query(&mut self, params: &Value, meta: Option<&RpcMeta>) -> RpcResult {
+        let (Some(qp), Some(m)) = (self.query_pay.as_mut(), meta) else {
+            return self.rpc("btb_query", params, Instant::now());
+        };
+        let st = &self.state;
+        let admit = qp
+            .admit(Instant::now(), &m.client, m.voucher.as_deref(), |id| {
+                st.channel(id)
+                    .ok()
+                    .flatten()
+                    .map(|c| crate::query_pay::ChannelView {
+                        payer_key: c.payer_key,
+                        payee: c.payee,
+                        deposit: c.deposit,
+                        closing: c.closing.is_some(),
+                    })
+            })
+            .map_err(|e| RpcError {
+                code: crate::query_pay::PAYMENT_REQUIRED,
+                message: format!(
+                    "payment required: {e} (payee {}, price_per_mgas {}, min_charge {}; see btb_queryPay)",
+                    hex::encode(&qp.payee()),
+                    qp.cfg.price_per_mgas,
+                    qp.cfg.min_charge
+                ),
+            })?;
+        let r = self.rpc("btb_query", params, Instant::now());
+        let gas = r
+            .as_ref()
+            .ok()
+            .and_then(|v| v["gas_used"].as_u64())
+            .unwrap_or(0);
+        let charged = self.query_pay.as_mut().map_or(0, |q| q.charge(admit, gas));
+        r.map(|mut v| {
+            v["charged"] = json!(charged.to_string());
+            v
+        })
     }
 
     /// Sign key generation operations with the consensus key and submit them.
@@ -1995,6 +2095,7 @@ impl<S: KvStore + 'static> Driver<S> {
                 Ok(json!({"txs": out}))
             }
             "btb_status" => self.status(),
+            "btb_queryPay" => Ok(self.query_pay.as_ref().map_or(Value::Null, |q| q.status())),
             "btb_getEpoch" => {
                 let e = match arr.first() {
                     Some(v) => v
