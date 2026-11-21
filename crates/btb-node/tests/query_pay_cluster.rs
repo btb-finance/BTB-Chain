@@ -4,7 +4,6 @@
 //! voucher, and node 0 settles the channel on chain by itself once it earned enough.
 
 #[path = "../../btb-tests/tests/common/mod.rs"]
-#[allow(dead_code)]
 mod common;
 mod lite;
 

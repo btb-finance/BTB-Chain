@@ -118,6 +118,9 @@ pub struct RuntimeHost<'a, S: KvStore> {
     /// Net metered bytes of each contract already settled into its deposit (see
     /// `settle_contract`).
     settled: BTreeMap<Address, i128>,
+    /// Gas paid as per-read fees for `price` in mutation frames, per feed or pair (proposal
+    /// 0005): the executor pays that part of the fee to the value's reporters.
+    price_reads: BTreeMap<u32, u64>,
 }
 
 impl<'a, S: KvStore> RuntimeHost<'a, S> {
@@ -146,6 +149,7 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
             ancestors: Vec::new(),
             extra_tables: None,
             settled: BTreeMap::new(),
+            price_reads: BTreeMap::new(),
         }
     }
 
@@ -179,6 +183,11 @@ impl<'a, S: KvStore> RuntimeHost<'a, S> {
     }
 
     /// The writes of the call, to be committed with `KvStore::commit`; or the first fault.
+    /// Gas paid as per-read price fees so far, per feed (mutation frames only).
+    pub fn price_reads(&self) -> &BTreeMap<u32, u64> {
+        &self.price_reads
+    }
+
     pub fn finish(self) -> Result<WriteBatch, Fault> {
         self.finish_tracked().map(|(b, _)| b)
     }
@@ -439,6 +448,28 @@ impl<S: KvStore> Host for RuntimeHost<'_, S> {
         self.kv(r);
         self.reports += 1;
         Some(id)
+    }
+
+    fn price_read_fee(&mut self, pair: u32) -> u64 {
+        let mut fee = btb_vm::gas::PRICE_READ_FEE;
+        if pair >= layout::FIRST_FEED_ID {
+            let r = self.kv.get(&layout::oracle_feed_key(pair));
+            if let Some(b) = self.kv(r) {
+                // Canonical encoding: name (u32 LE length + bytes), decimals (1), owner (32),
+                // read_fee (u64 LE), ...: only the prefix up to the fee is read.
+                let parsed = (|| {
+                    let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
+                    let at = 4usize.checked_add(n)?.checked_add(1 + 32)?;
+                    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+                })();
+                if let Some(f) = parsed {
+                    fee = f;
+                }
+            }
+        }
+        let slot = self.price_reads.entry(pair).or_insert(0);
+        *slot = slot.saturating_add(fee);
+        fee
     }
 
     fn price(&mut self, pair: u32) -> Option<btb_vm::host::PriceRecord> {

@@ -38,6 +38,7 @@ use crate::block::Block;
 use crate::dkg;
 use crate::staking;
 use crate::state::StateError;
+use crate::tx::Address;
 use btb_codec::{Decode, DecodeError, Encode, Reader};
 use btb_oracle::price::weighted_median;
 use btb_oracle::{Beacon, GroupKey, SignedObservation};
@@ -254,7 +255,11 @@ impl OracleGenesis {
             std::collections::BTreeSet::new(),
         );
         for p in &self.pairs {
-            if p.name.is_empty() || p.name.len() > MAX_PAIR_NAME || p.decimals > 36 {
+            if p.name.is_empty()
+                || p.name.len() > MAX_PAIR_NAME
+                || p.decimals > 36
+                || p.id >= crate::feeds::FIRST_ID
+            {
                 return Err(format!("bad price pair {:?}", p.name));
             }
             if !ids.insert(p.id) || !names.insert(p.name.clone()) {
@@ -499,19 +504,42 @@ pub(crate) fn end_block(
         .map(|v| (v.consensus_key, v.stake))
         .collect();
     let total: u128 = stakes.values().map(|s| u128::from(*s)).sum();
+    let operators: BTreeMap<[u8; 32], Address> = rec
+        .validators
+        .iter()
+        .map(|v| (v.consensus_key, v.operator))
+        .collect();
+    // Registered feeds seen in this block (read once each).
+    let mut feeds: BTreeMap<u32, Option<crate::feeds::FeedRecord>> = BTreeMap::new();
     let mut dirty = std::collections::BTreeSet::new();
     for o in obs.iter().take(MAX_OBS_PER_BLOCK) {
         let ob = &o.obs;
-        let Some(pair) = og.pairs.iter().find(|p| p.id == ob.pair) else {
-            continue;
+        let max_age = match og.pairs.iter().find(|p| p.id == ob.pair) {
+            Some(_) => og.max_age_blocks,
+            None => {
+                if let std::collections::btree_map::Entry::Vacant(slot) = feeds.entry(ob.pair) {
+                    slot.insert(crate::feeds::get(&*kv, ob.pair)?);
+                }
+                match &feeds[&ob.pair] {
+                    // Only validators that joined the feed report it.
+                    Some(f) if crate::feeds::joined(&*kv, ob.pair, &o.key)? => f.max_age_blocks,
+                    _ => continue,
+                }
+            }
         };
         if !stakes.contains_key(&o.key)
             || ob.height > height
-            || height - ob.height > og.max_age_blocks
+            || height - ob.height > max_age
             || !o.verify(chain_id)
         {
             continue;
         }
+        let pair = PairConfig {
+            id: ob.pair,
+            name: String::new(),
+            decimals: 0,
+        };
+        let pair = &pair;
         let k = obs_key(pair.id, &o.key);
         if let Some(prev) = kv.get(&k)? {
             let prev_h = prev
@@ -528,11 +556,28 @@ pub(crate) fn end_block(
         dirty.insert(pair.id);
     }
     for id in dirty {
-        let Some(pair) = og.pairs.iter().find(|p| p.id == id) else {
-            continue;
+        // A genesis pair, or a registered feed with its own quorum and age.
+        let (pair, feed) = match og.pairs.iter().find(|p| p.id == id) {
+            Some(p) => (p.clone(), None),
+            None => match feeds.get(&id).cloned().flatten() {
+                Some(f) => (
+                    PairConfig {
+                        id,
+                        name: f.name.clone(),
+                        decimals: f.decimals,
+                    },
+                    Some(f),
+                ),
+                None => continue,
+            },
         };
+        let pair = &pair;
+        let max_age = feed
+            .as_ref()
+            .map_or(og.max_age_blocks, |f| f.max_age_blocks);
         let (start, end) = obs_prefix(id);
         let mut items: Vec<(u128, u64)> = Vec::new();
+        let mut who: Vec<(Address, u64)> = Vec::new();
         let mut reporting: u128 = 0;
         for (k, v) in kv.scan(&start, Some(&end), false, 4096)? {
             let key: Option<[u8; 32]> = k.get(6..38).and_then(|b| b.try_into().ok());
@@ -540,26 +585,42 @@ pub(crate) fn end_block(
                 continue;
             };
             let h = u64::from_le_bytes(v[16..24].try_into().expect("8 bytes"));
+            let still_joined = feed.is_none() || crate::feeds::joined(&*kv, id, &key)?;
             match stakes.get(&key) {
-                Some(stake) if height.saturating_sub(h) <= og.max_age_blocks => {
+                Some(stake) if still_joined && height.saturating_sub(h) <= max_age => {
                     items.push((
                         u128::from_le_bytes(v[..16].try_into().expect("16 bytes")),
                         *stake,
                     ));
+                    who.push((operators[&key], *stake));
                     reporting += u128::from(*stake);
                 }
-                // stale or no longer a validator: it can never count again
+                // stale, left the feed or no longer a validator: it can never count again
                 _ => kv.delete(&k)?,
             }
         }
-        // At least two thirds of the stake must have reported fresh observations. Then the
-        // honest reporters hold more than half of the reporting weight whenever less than a
-        // third of the stake is faulty, so the median is an honest value or between two.
-        if total == 0 || reporting * 3 < total * 2 {
+        let quorum = match &feed {
+            // Genesis pairs: at least two thirds of the total stake must have reported fresh
+            // observations. Then the honest reporters hold more than half of the reporting
+            // weight whenever less than a third of the stake is faulty, so the median is an
+            // honest value or between two.
+            None => total > 0 && reporting * 3 >= total * 2,
+            // Registered feeds: the feed's own quorum over the validators that joined it.
+            Some(f) => {
+                let mut joined_stake: u128 = 0;
+                for key in crate::feeds::reporters(&*kv, id)? {
+                    joined_stake += stakes.get(&key).map_or(0, |s| u128::from(*s));
+                }
+                items.len() as u64 >= u64::from(f.min_reporters)
+                    && joined_stake > 0
+                    && reporting * 10_000 >= joined_stake * u128::from(f.min_stake_bps)
+            }
+        };
+        if !quorum {
             continue;
         }
         if let Some(candidate) = weighted_median(&items) {
-            apply_candidate(kv, &og.rules, pair, height, candidate, items.len() as u32)?;
+            apply_candidate(kv, &og.rules, pair, height, candidate, &who)?;
         }
     }
     Ok(())
@@ -641,15 +702,17 @@ fn publish(
     pair: &PairConfig,
     height: u64,
     price: u128,
-    reporters: u32,
+    who: &[(Address, u64)],
 ) -> Result<(), StateError> {
     let e = PriceEntry {
         price,
         height,
         decimals: pair.decimals,
-        reporters,
+        reporters: who.len() as u32,
     };
     kv.put(&oracle_price_key(pair.id), &e.encode())?;
+    // Who made this value: their operators are paid for its reads (`feeds::pay_reporters`).
+    crate::feeds::set_contributors(kv, pair.id, who)?;
     if rules.twap_max_window > 0 {
         btb_runtime::twap::record(kv, pair.id, height, price, rules.twap_max_window)?;
     }
@@ -663,7 +726,7 @@ fn apply_candidate(
     pair: &PairConfig,
     height: u64,
     candidate: u128,
-    reporters: u32,
+    who: &[(Address, u64)],
 ) -> Result<(), StateError> {
     let cur = price(&*kv, pair.id)?;
     let mut publish_now = false;
@@ -721,7 +784,33 @@ fn apply_candidate(
         }
     };
     if due {
-        publish(kv, rules, pair, height, candidate, reporters)?;
+        publish(kv, rules, pair, height, candidate, who)?;
+    }
+    Ok(())
+}
+
+/// Delete everything stored for a closed feed: its value, breaker, observations and TWAP
+/// checkpoints. Ids are never reused, so nothing can refer to them again.
+pub(crate) fn forget_feed(kv: &mut impl KvStore, id: u32) -> Result<(), StateError> {
+    kv.delete(&oracle_price_key(id))?;
+    kv.delete(&oracle_breaker_key(id))?;
+    for p in [TAG_OBS, btb_runtime::twap::KEY_CHECKPOINT] {
+        let mut start = vec![TAG_ORACLE, p];
+        start.extend_from_slice(&id.to_be_bytes());
+        let mut end = vec![TAG_ORACLE, p];
+        match id.checked_add(1) {
+            Some(n) => end.extend_from_slice(&n.to_be_bytes()),
+            None => end = vec![TAG_ORACLE, p + 1],
+        }
+        loop {
+            let page = kv.scan(&start, Some(&end), false, 1024)?;
+            if page.is_empty() {
+                break;
+            }
+            for (k, _) in page {
+                kv.delete(&k)?;
+            }
+        }
     }
     Ok(())
 }

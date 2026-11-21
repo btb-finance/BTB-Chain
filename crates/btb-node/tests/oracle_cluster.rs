@@ -958,3 +958,60 @@ fn a_restarted_validator_keeps_its_share_and_the_next_resharing_still_works() {
         .unwrap();
     assert!(last["deals"].as_array().unwrap().len() >= 3, "{last}");
 }
+
+/// Open data feeds (proposal 0005) on real nodes: a feed registered on chain is picked up by
+/// the validators at their next start; each one that has a source for it joins it by itself
+/// (a `Join` signed with its consensus key), the ones that report make the value, and the
+/// value records who made it.
+#[test]
+fn validators_join_open_feeds_they_report_and_publish_their_median() {
+    let _g = serial();
+    const FEED: u32 = btb_chain::feeds::FIRST_ID;
+    // validators 0..2 have a source for the feed, validator 3 has none
+    let prices: PriceFn = Arc::new(|i, pair| match (i, pair) {
+        (3, FEED) => None,
+        (_, FEED) => Some(3_125_500 + i as u128),
+        (_, 0) => Some(BTC + i as u128),
+        _ => Some(BTC / 20 + i as u128),
+    });
+    let mut c = Cluster::new(4, 4, prices);
+    c.wait_connected();
+    let reg = c
+        .wallet
+        .sign(TxKind::Feed(btb_chain::feeds::FeedOp::Register {
+            name: "PSX:OGDC".into(),
+            decimals: 4,
+            read_fee: 50_000,
+            min_reporters: 3,
+            min_stake_bps: 5_000,
+            max_age_blocks: 200,
+        }));
+    let out = c.run(0, &reg);
+    assert_eq!(u32::decode(&out).unwrap(), FEED);
+    // Nodes learn registered feeds when they start: restart them one at a time on their data
+    // (in-memory block stores cannot restart all validators at once).
+    for i in 0..4 {
+        let h = c.height((i + 1) % 4);
+        c.kill(i);
+        c.start(i);
+        c.wait_connected();
+        c.wait_until("the restarted node to catch up", 60, || c.height(i) > h);
+    }
+    c.wait_until("validators to join the feed", 60, || {
+        let f = c
+            .node(0)
+            .call("btb_oracleFeed", json!(["PSX:OGDC"]))
+            .unwrap();
+        f["reporters"].as_array().is_some_and(|r| r.len() == 4)
+    });
+    c.wait_until("the feed's value", 60, || c.price(0, FEED).is_some());
+    let p = c.price(1, FEED).unwrap();
+    assert_eq!(p["name"], "PSX:OGDC");
+    let v: u128 = p["price"].as_str().unwrap().parse().unwrap();
+    assert!((3_125_500..=3_125_502).contains(&v), "median of 0..2: {v}");
+    assert_eq!(p["reporters"], 3, "validator 3 joined but has no source");
+    let f = c.node(2).call("btb_oracleFeed", json!([FEED])).unwrap();
+    assert_eq!(f["contributors"].as_array().unwrap().len(), 3);
+    let list = c.node(3).call("btb_oracleFeeds", json!([])).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+}

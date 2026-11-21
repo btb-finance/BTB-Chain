@@ -36,6 +36,7 @@ pub fn kind_name(k: &TxKind) -> &'static str {
         TxKind::Session(_) => "session",
         TxKind::Account(_) => "account",
         TxKind::Name(_) => "name",
+        TxKind::Feed(_) => "feed",
         TxKind::Upgrade { .. } => "upgrade",
     }
 }
@@ -70,6 +71,12 @@ pub fn tx_json(tx: &Transaction) -> Value {
                 json!(format!("{op:?}").split([' ', '(', '{']).next()),
             );
             o.insert("name".into(), json!(format!("{}.btb", op.name())));
+        }
+        TxKind::Feed(op) => {
+            o.insert(
+                "op".into(),
+                json!(format!("{op:?}").split([' ', '(', '{']).next()),
+            );
         }
         TxKind::Account(op) => {
             o.insert(

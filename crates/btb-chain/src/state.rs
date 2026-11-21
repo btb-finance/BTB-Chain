@@ -412,7 +412,8 @@ pub(crate) fn money(kv: &impl KvStore) -> Result<u128, KvError> {
         + sum_tag(kv, crate::storage::TAG_ESCROW)?
         + sum_tag(kv, crate::host::TAG_HOST_BOND)?
         + sum_tag(kv, crate::host::TAG_HOST_UNBOND)?
-        + sum_tag(kv, crate::names::TAG_NAME_DEPOSIT)?)
+        + sum_tag(kv, crate::names::TAG_NAME_DEPOSIT)?
+        + sum_tag(kv, crate::feeds::TAG_FEED_DEPOSIT)?)
 }
 
 /// Register the indexes of a contract into `tables`: the ones its code declares with

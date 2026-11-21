@@ -116,6 +116,8 @@ pub enum Revert {
     Account(crate::account::AccountError),
     /// A name operation was refused (nothing changed).
     Name(crate::names::NameError),
+    /// A feed operation was refused (nothing changed).
+    Feed(crate::feeds::FeedError),
     Vm(String),
 }
 
@@ -159,6 +161,10 @@ pub struct Receipt {
     /// not a registered host, or the sender itself; the validator pool got the whole fee).
     pub relayer: Option<Address>,
     pub output: Vec<u8>,
+    /// Base units of `fee` that paid per-read price fees, per feed (proposal 0005): after the
+    /// block's transactions they move from the validator pool to the reporters of the value
+    /// read (`feeds::pay_reporters`). Not part of any hash.
+    pub feed_fees: Vec<(u32, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +216,7 @@ pub fn max_cost(tx: &Transaction, cfg: &ChainConfig) -> Option<u64> {
         TxKind::Action(op) => fee.checked_add(op.debit()),
         TxKind::Account(op) => fee.checked_add(op.debit()),
         TxKind::Name(op) => fee.checked_add(op.debit()),
+        TxKind::Feed(op) => fee.checked_add(op.debit()),
         TxKind::Upgrade { budget_gas, .. } => {
             fee.checked_add(budget_gas.checked_mul(cfg.gas_price)?)
         }
@@ -372,6 +379,14 @@ pub fn check_static(tx: &Transaction, cfg: &ChainConfig) -> Result<(), Invalid> 
                 return Err(Invalid::BadSignature);
             }
         }
+        TxKind::Feed(op) => {
+            if op.name_len() > crate::feeds::MAX_NAME {
+                return Err(Invalid::TooLarge);
+            }
+            if !tx.verify_signature() {
+                return Err(Invalid::BadSignature);
+            }
+        }
         TxKind::Site(op) => {
             // Too big or malformed files never enter a block.
             if op.check_static().is_err() {
@@ -456,6 +471,8 @@ pub(crate) struct Ctx<'a, S: KvStore> {
     /// receipts and applied once after the transactions (they commute, so the result is the
     /// same, and no two transactions conflict on the pool balances).
     pub(crate) defer_fees: bool,
+    /// Per-read price fees (gas) of the current transaction or cron, per feed (proposal 0005).
+    pub(crate) price_reads: BTreeMap<u32, u64>,
     /// Parallel mode: register a called contract's tables from its manifest before the call
     /// (the shared registry cannot be mutated by concurrent deploys).
     pub(crate) lazy_tables: bool,
@@ -530,6 +547,24 @@ impl<S: KvStore> Ctx<'_, S> {
         Ok(paid)
     }
 
+    /// The reporters' part of a fee just charged: per feed, the base units of the per-read
+    /// price fees of this transaction or cron, less the relay share when a relayer took one,
+    /// never more in total than what reached the validator pool. Clears the read record.
+    pub(crate) fn take_feed_fees(&mut self, fee: u64, relayed: bool) -> Vec<(u32, u64)> {
+        let reads = std::mem::take(&mut self.price_reads);
+        let mut left = fee - relay_share(fee, relayed);
+        let mut out = Vec::new();
+        for (feed, g) in reads {
+            let units = g.saturating_mul(self.cfg.gas_price);
+            let units = (units - relay_share(units, relayed)).min(left);
+            if units > 0 {
+                left -= units;
+                out.push((feed, units));
+            }
+        }
+        out
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_contract(
         &mut self,
@@ -579,6 +614,10 @@ impl<S: KvStore> Ctx<'_, S> {
             vm_gas,
             self.cfg.vm_memory as usize,
         );
+        for (feed, g) in host.price_reads() {
+            let slot = self.price_reads.entry(*feed).or_insert(0);
+            *slot = slot.saturating_add(*g);
+        }
         let full = |used: u64| if uses_randomness { vm_gas } else { used };
         Ok(match r {
             Ok(o) => {
@@ -980,6 +1019,7 @@ impl<S: KvStore> Ctx<'_, S> {
             fee: 0,
             relayer: None,
             output: Vec::new(),
+            feed_fees: Vec::new(),
         };
         let price = self.cfg.gas_price;
         let mut used = 0;
@@ -1021,6 +1061,8 @@ impl<S: KvStore> Ctx<'_, S> {
             left -= per * voters.len() as u64;
         }
         self.credit(&p.requester, left)?;
+        // Price reads of an action callback leave their fees in the validator pool.
+        self.price_reads.clear();
         receipts.push(receipt);
         Ok(used)
     }
@@ -1037,6 +1079,8 @@ impl<S: KvStore> Ctx<'_, S> {
             fee: 0,
             relayer: None,
             output: Vec::new(),
+
+            feed_fees: Vec::new(),
         };
         if let Err(i) = check_static(tx, &self.cfg) {
             return Ok(invalid(i));
@@ -1258,6 +1302,29 @@ impl<S: KvStore> Ctx<'_, S> {
                     Err(crate::names::Fail::State(e)) => return Err(e),
                 }
             }
+            TxKind::Feed(op) => {
+                let gas_used = tx.intrinsic_gas();
+                match crate::feeds::apply(
+                    &mut self.overlay,
+                    self.cfg.staking.epoch_len,
+                    self.height,
+                    &sender,
+                    &tx.public_key,
+                    op,
+                ) {
+                    Ok(output) => Done {
+                        gas_used,
+                        output,
+                        result: Ok(()),
+                    },
+                    Err(crate::feeds::Fail::Tx(e)) => Done {
+                        gas_used,
+                        output: Vec::new(),
+                        result: Err(Revert::Feed(e)),
+                    },
+                    Err(crate::feeds::Fail::State(e)) => return Err(e),
+                }
+            }
             TxKind::Upgrade {
                 contract,
                 code,
@@ -1335,6 +1402,7 @@ impl<S: KvStore> Ctx<'_, S> {
             .ok_or_else(|| StateError("fee overflow".into()))?;
         self.set_u64(&nonce_key(&sender), next.expect("checked above"))?;
         let relayer = self.charge(&sender, fee, tx.body.relayer)?;
+        let feed_fees = self.take_feed_fees(fee, relayer.is_some());
         self.via_session = false;
         if let Some(key) = &session {
             crate::session::add_spent(&mut self.overlay, &sender, key, fee)?;
@@ -1355,6 +1423,7 @@ impl<S: KvStore> Ctx<'_, S> {
             fee,
             relayer,
             output: done.output,
+            feed_fees,
         })
     }
 
@@ -1422,6 +1491,8 @@ impl<S: KvStore> Ctx<'_, S> {
                 fee: 0,
                 relayer: None,
                 output: Vec::new(),
+
+                feed_fees: Vec::new(),
             };
             let balance = self.balance(&contract)?;
             if balance < reserve {
@@ -1474,6 +1545,7 @@ impl<S: KvStore> Ctx<'_, S> {
                 Err(r) => receipt.status = Status::Reverted(r),
             }
             self.charge(&contract, fee, None)?;
+            receipt.feed_fees = self.take_feed_fees(fee, false);
             gas_total += used;
             receipts.push(receipt);
         }
@@ -1612,6 +1684,7 @@ impl Executor {
             cfg,
             height: h.height,
             defer_fees: false,
+            price_reads: BTreeMap::new(),
             lazy_tables: false,
             registered: Default::default(),
             via_session: false,
@@ -1687,6 +1760,16 @@ impl Executor {
         ctx.run_upgrades()?;
         crate::dex::end_block(&mut ctx.overlay, &cfg, h.height)?;
         crate::reports::end_block(&mut ctx.overlay, h.height)?;
+        // Read fees go to the reporters of the values that were read, before this block's
+        // observations can publish new values (proposal 0005).
+        let mut feed_fees: BTreeMap<u32, u64> = BTreeMap::new();
+        for r in &receipts {
+            for (feed, units) in &r.feed_fees {
+                let slot = feed_fees.entry(*feed).or_insert(0);
+                *slot = slot.saturating_add(*units);
+            }
+        }
+        crate::feeds::pay_reporters(&mut ctx.overlay, &feed_fees)?;
         crate::oracle::end_block(
             &mut ctx.overlay,
             cfg.chain_id,
