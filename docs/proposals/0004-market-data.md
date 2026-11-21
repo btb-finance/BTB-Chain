@@ -1,6 +1,6 @@
 # 0004: Market data on BTB: data providers, stock tables and one-call payloads
 
-Status: **Draft; phase A built** (`examples/market-data`, tests `crates/btb-tests/tests/market_data.rs`). Issue: to be opened by a maintainer as a Design Proposal. Phase B touches tokenomics (fees paid to non-validators) and needs the Safety section reviewed before code.
+Status: **Accepted; phases A and B0 built** (`examples/market-data`, tests `crates/btb-tests/tests/market_data.rs`). Issue: to be opened by a maintainer as a Design Proposal. Phase B touches tokenomics (fees paid to non-validators) and needs the Safety section reviewed before code.
 
 ## Summary
 
@@ -86,8 +86,8 @@ So a provider sells **freshness, coverage, clean schema and verified answers**, 
 **Rule.** A validator (or any full node) that serves `btb_query` charges a small fee per query, in BTB, through the payment channels and vouchers that edge nodes already use ([EDGE.md](../EDGE.md#payments), `btb-voucher`). No consensus per query, no new token, no minting.
 
 1. **Free quota.** Each client address (and IP) gets `free_queries` per `window` (default 100 per hour) so developers can try things. `btb_status`, `btb_getBalance`, `btb_getReceipt`, `btb_sendTransaction` and the other non-query methods stay free.
-2. **Price by work, not flat.** Beyond the quota a query costs `ceil(gas_used * query_price_per_gas)` (node config; suggested default 1/10 of the chain's gas price), with a minimum per call. A cheap `quotes` lookup costs little, a full `stock` payload with a sector median costs more. The node runs the query, then answers with `X-BTB-Charged: <units>`.
-3. **Pay with a voucher.** The request carries `X-BTB-Voucher` (channel payee = the validator's account). The node checks it as the edge does (`Ledger::accept`: this chain, open channel, payer signature, strictly growing amount and nonce) and serves the query if the cumulative amount covers everything charged so far plus a pre-charge of `max_gas * query_price_per_gas` (refunded against the next voucher). Without one: `402` with `X-BTB-Price-Per-Gas` and the payee address.
+2. **Price by work, not flat.** Beyond the quota a query costs `ceil(gas_used * query_price_per_gas)` (node config; default 1/10 of the chain's gas price), with a minimum per call. A cheap `quotes` lookup costs little, a full `stock` payload with a sector median costs more. The node runs the query, then answers with `charged` in the result.
+3. **Pay with a voucher.** The request carries `X-BTB-Voucher` (channel payee = the validator's account). The node checks it as the edge does (`Ledger::accept`: this chain, open channel, payer signature, strictly growing amount and nonce) and serves the query if the cumulative amount covers everything charged so far plus `min_charge`; a charge above that is a debt the next voucher pays first. Without one: JSON-RPC error `-32402` with the price and the payee address. As built: [NODE.md](../NODE.md#paid-queries).
 4. **Settle in one transaction.** The node closes or tops up channels with its best voucher in batches (`redeem_every`, `redeem_min`), like the edge. The BTB goes to the validator's own account, not the pool: whoever served the query gets paid.
 5. **Rate limits stay.** Paid queries still have a per-client concurrency cap and a gas cap per call, because `btb_query` runs on the driver thread between consensus events. A validator may refuse public queries entirely and serve only consensus; then reads go to hosting and edge nodes, which charge the same way.
 
@@ -118,7 +118,7 @@ Publishing gas always goes to the validator pool. Attested data pays validators 
 ## Recommendation and phases
 
 - **A.** `examples/market-data`: tables, `publish`, recompute crons, `stock()` query, with PSX EOD for ~500 companies from an off-chain Rust ingester. Measure gas per publish and payload size.
-- **B0. Paid validator queries** ([above](#paid-queries-on-validator-rpc)): vouchers on `btb_query`, free quota, price per gas used. Node-side only, reusing `btb-voucher`; no consensus change. First to build.
+- **B0. Paid validator queries** ([above](#paid-queries-on-validator-rpc)): vouchers on `btb_query`, free quota, price per gas used. Node-side only, reusing `btb-voucher`; no consensus change. **Built** (`btb-node` `query_pay`, [NODE.md](../NODE.md#paid-queries)).
 - **B.** `DataOp` transaction: register a dataset (schema hash, read price, stake), and a host call `data_read(dataset)` that charges the provider's fee in mutations and is free in queries. Vouchers carry a per-dataset read count; the provider's share is paid on claim.
 - **C.** Several providers per dataset, median per field, a fraud proof (two signed batches for the same session that differ, or a published fact contradicting a signed report from an exchange) slashes stake.
 

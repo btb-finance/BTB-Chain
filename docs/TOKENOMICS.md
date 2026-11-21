@@ -8,7 +8,7 @@ Every request pays the node that served or executed it:
 
 | Request | Who pays | Who earns | Settles |
 | --- | --- | --- | --- |
-| Query / subscription | App (or user) via voucher | Hosting node that served it | Batched on-chain |
+| Query / subscription | App (or user) via voucher (a free quota first) | The hosting, edge **or validator** node that served it ([NODE.md](NODE.md#paid-queries), price per gas used) | Batched on-chain |
 | Website / file serving | App via voucher | Hosting node | Batched on-chain |
 | Mutation | Sender (or app-sponsored) | Validators 80%, relay host 20% (the relay host is the registered hosting or edge node the sender signed into the transaction; without one, validators get 100%) | In the block |
 | Cron job | Contract's prepaid balance | Block executor | In the block |

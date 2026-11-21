@@ -428,6 +428,8 @@ pub struct NodeParams {
     pub observer: Option<std::sync::Arc<dyn btb_chain::vault::Observer>>,
     /// Cross-chain signing knobs (`crate::cross`).
     pub cross: crate::cross::CrossParams,
+    /// Paid `btb_query` (`crate::query_pay`, node.json section `query_pay`). `None`: free.
+    pub query_pay: Option<crate::query_pay::QueryPayConfig>,
 }
 
 impl NodeParams {
@@ -457,6 +459,7 @@ impl NodeParams {
             fetch_policy: crate::actions::FetchPolicy::default(),
             observer: None,
             cross: crate::cross::CrossParams::default(),
+            query_pay: None,
         }
     }
 
@@ -547,6 +550,12 @@ impl NodeParams {
             .get("price_interval_ms")
             .and_then(Value::as_u64)
             .unwrap_or(p.price_interval_ms);
+        if let Some(q) = v.get("query_pay") {
+            p.query_pay = Some(crate::query_pay::QueryPayConfig::from_json(
+                q,
+                p.genesis.gas_price,
+            )?);
+        }
         let num = |k: &str, d: u64| v.get(k).and_then(Value::as_u64).unwrap_or(d);
         p.timing = Timing {
             tick_ms: num("tick_ms", p.timing.tick_ms),

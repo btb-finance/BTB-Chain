@@ -17,6 +17,7 @@ btb-runtime = { path = "../btb-runtime" }
 btb-codec = { path = "../btb-codec" }
 btb-oracle = { path = "../btb-oracle" }
 btb-vm = { path = "../btb-vm" }
+btb-voucher = { path = "../btb-voucher" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 sha2 = "0.11.1"
 # MIT. QUIC only (TLS 1.3 inside QUIC authenticates the peer id, so no noise/yamux), request-response for

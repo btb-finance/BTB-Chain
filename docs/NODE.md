@@ -38,6 +38,7 @@ Without `--features rocksdb` the node keeps chain state in memory and **refuses 
 | `price_interval_ms` | optional: how often a validator observes and signs prices (default 1000) |
 | `watch` | optional: the vault's chain watchers for Bitcoin and Solana (`bitcoin`: `esplora` URL or `rpc {url,user,password}`, `network`, `confirmations` (default 6), `fee_rate`, `fee_estimate_blocks`, `scan_blocks`, `poll_ms`, `allow_http`; `solana`: `rpc`, `blockhash_window`, `signature_limit`, `poll_ms`). Each validator should use its own, independent endpoints; without the section it attests nothing. Needs the `https` feature. See [CROSS_CHAIN.md](CROSS_CHAIN.md#chain-watchers) |
 | `price_sources` | optional: exchange sources per pair, `[{pair, min_sources, max_age_ms, outlier_bps, sources: [{preset, symbol} or {name, url, pointer, mul, div, max_bytes, timeout_ms}]}]`; fetched in a background thread under `fetch_policy` (https only, public addresses) with the last good value of each source kept; the validator signs the median of its fresh, agreeing sources and reports nothing when too few remain. `pair` is the genesis pair's name or id. Presets (`binance-example`, `coinbase-example`, `bitstamp-example`, `okx-example`) are **examples**, verify before use. Without it (and without the test-only `NodeParams::price_source`) a node reports nothing. See [ORACLES.md](ORACLES.md#sources-on-the-validator-built) |
+| `query_pay` | optional: charge for `btb_query` over HTTP, see [Paid queries](#paid-queries). `{free_queries, window_ms, price_per_mgas, min_charge, redeem_min}`, every field optional; defaults from the genesis gas price `g`: 100 free queries per hour, `g * 100,000` per million gas (a tenth of a transaction), `min_charge = g * 1,000`, `redeem_min = g * 10,000,000`. Without it queries are free |
 | `price_fetch_interval_ms` | optional: how often every price source is refetched (default 2000, at least 100) |
 
 ## Networking
@@ -134,6 +135,19 @@ When a replica verifies double signing (`Evidence::DoubleVote` or `DoubleProposa
 - `btb_status` has `evidence_submitted` (tx ids this node filed).
 
 The slashed validator is jailed, so the next epoch's set (chosen at the epoch's last block) leaves it out; consensus continues with the remaining validators. The cluster test shows this with a byzantine double voter.
+
+## Paid queries
+
+A query costs a node real work, so a node with `query_pay` in `node.json` charges for `btb_query` calls that come in over HTTP (`crates/btb-node/src/query_pay.rs`, [proposal 0004](proposals/0004-market-data.md#paid-queries-on-validator-rpc)). Internal calls and every other method stay free.
+
+- **Free quota.** `free_queries` per client and `window_ms`. The client is `X-Real-IP` when a proxy sets it (the RPC binds to loopback, so a public node always has a proxy in front; it must overwrite that header), else the peer address.
+- **Then pay with a voucher.** Header `X-BTB-Voucher`: hex of a 120-byte payment-channel voucher (`btb-voucher`, the format edge nodes take, [EDGE.md](EDGE.md#payments)) for a channel whose payee is **this node's account**, the account of its consensus key (`btb_queryPay` returns it). The voucher must be for this chain, signed by the channel's payer, for an open channel that is not closing, and strictly raise amount and nonce. The query runs when the channel's cumulative amount covers everything charged so far plus `min_charge`.
+- **Charge by work.** A query that ran is charged `max(min_charge, ceil(gas_used * price_per_mgas / 1,000,000))`; a query that failed is charged `min_charge`. The answer carries `charged` (decimal string; `"0"` inside the free quota). A charge above what the voucher covered is a debt the next voucher pays first (bounded by the query gas cap).
+- **Refusals** are JSON-RPC errors with code `-32402` (`payment required: ...`, with the payee, price and minimum): quota used up, a bad, replayed, lower, wrong-chain, wrong-payee or forged voucher (refused even inside the quota), an unknown or closing channel, or a voucher too small for what is owed.
+- **Settlement.** After each executed block the node closes every channel that earned at least `redeem_min` with a `ChannelOp::Close` carrying its best voucher, signed with the consensus key (nonce shared with its other system transactions; the account pays the Close's gas). The BTB goes to the node that served. The channel is then gone and further vouchers for it are refused.
+- **State** is in memory: a restart forgets unsettled vouchers (they are still valid; the client's next voucher, which is cumulative, carries them). `btb_queryPay` (`[]`) returns the config, the payee and counters (`free_served`, `paid_served`, `refused`, `charged_total`, `unsettled`, `redeemed_total`, `open_channels`), or `null` when queries are free.
+
+Tests: unit tests in `query_pay.rs` (quota and window reset, per-client quota, charge by gas with the minimum and debt, replayed, garbage, wrong-chain, wrong-payee, closing, unknown and forged vouchers refused without touching the quota, a deposit top-up re-reads the channel, redeem takes only channels above the minimum), and `crates/btb-node/tests/query_pay_cluster.rs` (four validators, the `counter` example, real HTTP: quota then `-32402`, a node without `query_pay` stays free, a channel opened to node 0, a paid query charged its gas, replayed and forged vouchers refused, the node closes the channel on chain by itself and its balance grows by what the client signed for).
 
 ## HTTPS actions and reports
 
