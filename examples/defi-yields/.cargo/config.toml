@@ -1,0 +1,20 @@
+# The VM implements only rv64im. The stable target riscv64imac-unknown-none-elf enables the C
+# (compressed) and A (atomics) extensions by default, so switch them off, and disable linker
+# relaxation (it would use the gp register, which the VM does not initialise).
+[build]
+target = "riscv64imac-unknown-none-elf"
+
+[target.riscv64imac-unknown-none-elf]
+rustflags = [
+  "-C", "target-feature=-c,-zca,-a,-zaamo,-zalrsc",
+  "-C", "relocation-model=static",   # non-PIC code, ET_EXEC
+  "-C", "link-arg=--no-relax",
+  "-C", "link-arg=-Tlink.ld",
+  "-C", "link-arg=--gc-sections",
+  "-C", "link-arg=--export-dynamic-symbol=btb_*",
+]
+
+# The prebuilt core/alloc for this target use compressed and atomic instructions, so rebuild them
+# with the flags above. build-std is unstable: callers must set RUSTC_BOOTSTRAP=1 (build.sh does).
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
