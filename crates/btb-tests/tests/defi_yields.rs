@@ -925,14 +925,14 @@ fn bad_input_is_refused_and_leaves_no_trace() {
         "publish_pools",
         PROVIDER,
         &(Vec::<PoolIn>::new(),),
-        "batch must hold 1..=16 rows",
+        "batch must hold 1..=64 rows",
     );
-    let many: Vec<PoolIn> = (0..17).map(|_| real_pools()[0].clone()).collect();
+    let many: Vec<PoolIn> = (0..65).map(|_| real_pools()[0].clone()).collect();
     ch.fails(
         "publish_pools",
         PROVIDER,
         &(many,),
-        "batch must hold 1..=16 rows",
+        "batch must hold 1..=64 rows",
     );
 
     // The key's chain must match the row's chain; one bad row refuses the whole batch.
@@ -1063,12 +1063,12 @@ fn non_evm_ids_keep_their_case() {
 
 #[test]
 fn a_full_batch_of_worst_case_rows_fits_in_the_heap() {
-    // 16 rows (MAX_BATCH) with the longest keys allowed in practice (V4 pool ids are 66
+    // 64 rows (MAX_BATCH) with the longest keys allowed in practice (V4 pool ids are 66
     // characters) and long labels: the batch limit must hold for them, not only for short rows.
     let mut ch = Chain::new();
     ch.mutate::<()>("init", PROVIDER, &());
     let key = |i: u64| format!("8453:0x{i:064x}");
-    let pools: Vec<PoolIn> = (0..16)
+    let pools: Vec<PoolIn> = (0..64)
         .map(|i| {
             pool(
                 &key(i),
@@ -1083,13 +1083,13 @@ fn a_full_batch_of_worst_case_rows_fits_in_the_heap() {
             )
         })
         .collect();
-    assert_eq!(ch.mutate::<u32>("publish_pools", PROVIDER, &(pools,)), 16);
-    let grades: Vec<GradeIn> = (0..16)
+    assert_eq!(ch.mutate::<u32>("publish_pools", PROVIDER, &(pools,)), 64);
+    let grades: Vec<GradeIn> = (0..64)
         .map(|i| grade_in(&format!("8453:0x{:040x}", i * 2 + 1), 80, 0))
         .collect();
-    assert_eq!(ch.mutate::<u32>("publish_grades", PROVIDER, &(grades,)), 16);
+    assert_eq!(ch.mutate::<u32>("publish_grades", PROVIDER, &(grades,)), 64);
     let stats = |at: u64| -> Vec<StatIn> {
-        (0..16)
+        (0..64)
             .map(|i| {
                 let mut s = stat(
                     &key(i),
@@ -1108,14 +1108,14 @@ fn a_full_batch_of_worst_case_rows_fits_in_the_heap() {
     // Twice: the second batch updates every row (the heavier path: old row, chain totals).
     assert_eq!(
         ch.mutate::<u32>("publish_stats", PROVIDER, &(stats(AS_OF),)),
-        16
+        64
     );
     assert_eq!(
         ch.mutate::<u32>("publish_stats", PROVIDER, &(stats(AS_OF + 3_600),)),
-        16
+        64
     );
     let v: IndexView = ch.query("index", &(8453u64, false));
-    assert_eq!(v.pools, 16);
+    assert_eq!(v.pools, 64);
 }
 
 #[test]
@@ -1125,7 +1125,7 @@ fn rankings_and_indices_stay_within_the_query_limits() {
     // 2,000 synthetic Base pools: far more than one query may decode.
     const N: u64 = 2_000;
     let ids: Vec<u64> = (0..N).collect();
-    for chunk in ids.chunks(16) {
+    for chunk in ids.chunks(64) {
         let pools: Vec<PoolIn> = chunk
             .iter()
             .map(|i| {
@@ -1170,18 +1170,18 @@ fn rankings_and_indices_stay_within_the_query_limits() {
 
     // A filter nothing passes makes top_pools decode its full MAX_SCAN rows.
     let (rows, gas): (Vec<TopRow>, u64) =
-        ch.query_gas("top_pools", &(8453u64, 0u8, u64::MAX, false, 50u32));
+        ch.query_gas("top_pools", &(8453u64, 0u8, u64::MAX, false, 100u32));
     assert!(rows.is_empty(), "no pool has that much TVL");
     println!("top_pools, full scan: {gas} gas");
     let (rows, gas): (Vec<TopRow>, u64) =
-        ch.query_gas("top_pools", &(8453u64, 0u8, 0u64, false, 50u32));
-    assert_eq!(rows.len(), 50);
+        ch.query_gas("top_pools", &(8453u64, 0u8, 0u64, false, 100u32));
+    assert_eq!(rows.len(), 100);
     assert!(rows.windows(2).all(|w| w[0].3 >= w[1].3));
     assert_eq!(rows[0].3, (0..N).map(apr).max().unwrap());
-    println!("top_pools, 50 rows: {gas} gas");
+    println!("top_pools, 100 rows: {gas} gas");
     let (rows, _): (Vec<TopRow>, u64) =
-        ch.query_gas("top_pools", &(8453u64, 0u8, 0u64, true, 50u32));
-    assert_eq!(rows.len(), 50);
+        ch.query_gas("top_pools", &(8453u64, 0u8, 0u64, true, 100u32));
+    assert_eq!(rows.len(), 100);
     assert_eq!(
         rows[0].3,
         (0..N).filter(|i| i % 3 == 0).map(apr).max().unwrap()
@@ -1205,8 +1205,8 @@ fn rankings_and_indices_stay_within_the_query_limits() {
         println!("index (stable_only {stable_only}): {gas} gas");
     }
 
-    let (rows, gas): (Vec<YieldOut>, u64) = ch.query_gas("top_yields", &(0u32, 0u8, 50u32));
-    assert_eq!(rows.len(), 50);
+    let (rows, gas): (Vec<YieldOut>, u64) = ch.query_gas("top_yields", &(0u32, 0u8, 100u32));
+    assert_eq!(rows.len(), 100);
     println!("top_yields: {gas} gas");
 }
 
@@ -1258,4 +1258,36 @@ fn rankings_use_the_stored_risk_until_rescored() {
         p.unwrap().risk.unwrap().reasons,
         R_IMPERMANENT_LOSS | R_HIGH_APR | R_OUT_OF_RANGE
     );
+}
+
+#[test]
+fn history_is_capped_at_two_weeks_per_call() {
+    let mut ch = Chain::loaded();
+    // 720 more hours of WETH/cbBTC (more than one call may return), 64 rows per batch: rows of
+    // one pool in one batch apply in
+    // order, each newer than the last.
+    let hours: Vec<u64> = (1..=720).collect();
+    for chunk in hours.chunks(64) {
+        let rows: Vec<StatIn> = chunk
+            .iter()
+            .map(|h| {
+                let mut s = real_stats()[1].clone();
+                s.3 .0 = Some(4_000 + *h as i64);
+                s.5 = AS_OF + h * 3_600;
+                s
+            })
+            .collect();
+        let n = chunk.len() as u32;
+        assert_eq!(ch.mutate::<u32>("publish_stats", PROVIDER, &(rows,)), n);
+    }
+    let (p, gas): (Option<PoolPayload>, u64) =
+        ch.query_gas("pool", &(WETH_CBBTC.to_string(), 10_000u32));
+    let p = p.unwrap();
+    assert_eq!(p.history.len(), 336, "capped at MAX_HOURS");
+    assert_eq!(p.history[0].apr_bps, 4_720);
+    assert_eq!(p.history[335].hour, AS_OF / 3_600 + 385);
+    println!("pool with 720 hours: {gas} gas");
+    // The chain totals still count the pool once.
+    let v: IndexView = ch.query("index", &(8453u64, false));
+    assert_eq!(v.pools, 5);
 }
