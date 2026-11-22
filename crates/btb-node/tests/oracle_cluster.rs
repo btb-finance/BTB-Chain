@@ -1004,7 +1004,20 @@ fn validators_join_open_feeds_they_report_and_publish_their_median() {
             .unwrap();
         f["reporters"].as_array().is_some_and(|r| r.len() == 4)
     });
-    c.wait_until("the feed's value", 60, || c.price(0, FEED).is_some());
+    // Every node, not just one: the checks below read nodes 1, 2 and 3, and a node that is a
+    // block behind has the feed without its value or contributors yet.
+    c.wait_until(
+        "the feed's value and contributors on every node",
+        60,
+        || {
+            (0..4).all(|i| {
+                c.price(i, FEED).is_some()
+                    && c.node(i).call("btb_oracleFeed", json!([FEED])).unwrap()["contributors"]
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty())
+            })
+        },
+    );
     let p = c.price(1, FEED).unwrap();
     assert_eq!(p["name"], "PSX:OGDC");
     let v: u128 = p["price"].as_str().unwrap().parse().unwrap();
