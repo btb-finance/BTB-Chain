@@ -20,3 +20,4 @@ Design changes go through a Design Proposal before code (see [AGENTS.md](../../A
 | [0003](0003-storage-growth.md) | Keep node storage small: compression, pruning, tiers, snapshots, smaller transactions | Draft; phase A built |
 | [0004](0004-market-data.md) | Market data: data providers, stock tables, one-call payloads | Accepted; phases A and B0 built |
 | [0005](0005-open-data-feeds.md) | Open data feeds: any validator adds any feed, readers pay the reporters | Accepted; phases A and B built |
+| [0006](0006-defi-yield-data.md) | DeFi yield data: BTB Finance as the first data provider (pools, stats, token grades, yields, risk grades) | Draft; phase M0 built |
