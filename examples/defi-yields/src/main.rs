@@ -144,6 +144,20 @@ pub struct Stat {
     /// The same, for stable pairs only (`None` keeps other pools out of this index).
     #[index]
     pub stable_apr: Option<u128>,
+    /// `risk_grade << 64 | apr`: pools of one grade in APR order, all chains, so a grade filter
+    /// reads only pools that pass it.
+    #[index]
+    pub grade_apr: u128,
+    /// `chain_id << 67 | risk_grade << 64 | apr`: the same within a chain.
+    #[index]
+    pub chain_grade_apr: u128,
+    /// `tvl_tier << 64 | apr` (tiers: under $100k, $1M, $10M, and above), so a TVL floor reads
+    /// only the tiers that can pass it.
+    #[index]
+    pub tier_apr: u128,
+    /// `chain_id << 66 | tvl_tier << 64 | apr`: the same within a chain.
+    #[index]
+    pub chain_tier_apr: u128,
     pub chain_id: u64,
     pub stable: bool,
     /// `SYMBOL0/SYMBOL1`, copied from the pool.
@@ -440,6 +454,32 @@ fn composite(hi: u64, v: i64) -> u128 {
     ((hi as u128) << 64) | (v - APR_MIN) as u64 as u128
 }
 
+/// `hi << (64 + bits) | mid << 64 | (v - APR_MIN)`, ordered like `(hi, mid, v)`; `mid < 2^bits`.
+fn composite3(hi: u64, bits: u32, mid: u64, v: i64) -> u128 {
+    ((hi as u128) << (64 + bits)) | composite(mid, v)
+}
+
+/// TVL tier: 0 under $100k, 1 under $1M, 2 under $10M, 3 from $10M.
+fn tvl_tier(tvl: u64) -> u64 {
+    match tvl {
+        0..100_000 => 0,
+        100_000..1_000_000 => 1,
+        1_000_000..10_000_000 => 2,
+        _ => 3,
+    }
+}
+
+/// Write the ranking keys of a stats row from its chain, stability, grade, TVL and APR.
+fn set_rank_keys(s: &mut Stat) {
+    let tier = tvl_tier(s.tvl_usd);
+    s.chain_apr = composite(s.chain_id, s.apr_bps);
+    s.stable_apr = s.stable.then_some(s.chain_apr);
+    s.grade_apr = composite(s.risk_grade as u64, s.apr_bps);
+    s.chain_grade_apr = composite3(s.chain_id, 3, s.risk_grade as u64, s.apr_bps);
+    s.tier_apr = composite(tier, s.apr_bps);
+    s.chain_tier_apr = composite3(s.chain_id, 2, tier, s.apr_bps);
+}
+
 fn apr_ok(v: i64) -> bool {
     (APR_MIN..=APR_MAX).contains(&v)
 }
@@ -538,12 +578,15 @@ pub fn publish_stats(rows: Vec<StatIn>) -> btb_sdk::Result<u32> {
             }
         };
         let risk = pool_risk_with(stable, tvl, in_range, apr, token_points, token_reasons);
-        let key = composite(chain_id, apr);
-        let row = Stat {
+        let mut row = Stat {
             pool: pool.clone(),
             apr_bps: apr,
-            chain_apr: key,
-            stable_apr: stable.then_some(key),
+            chain_apr: 0,
+            stable_apr: None,
+            grade_apr: 0,
+            chain_grade_apr: 0,
+            tier_apr: 0,
+            chain_tier_apr: 0,
             chain_id,
             stable,
             pair,
@@ -565,6 +608,7 @@ pub fn publish_stats(rows: Vec<StatIn>) -> btb_sdk::Result<u32> {
             as_of,
             height: block_height(),
         };
+        set_rank_keys(&mut row);
         let hour = as_of / 3_600;
         // Stats only move forward, so an hour after the previous row's has no history row yet.
         let same_hour = matches!(&old, Some((_, o)) if o.as_of / 3_600 == hour);
@@ -765,6 +809,7 @@ pub fn rescore(pools: Vec<String>) -> btb_sdk::Result<u32> {
         s.risk_score = r.score;
         s.risk_grade = r.grade;
         s.risk_reasons = r.reasons;
+        set_rank_keys(&mut s);
         s.update(id);
         n += 1;
     }
@@ -1121,38 +1166,76 @@ fn ranked(
     limit: u32,
 ) -> Vec<TopRow> {
     let limit = limit.clamp(1, MAX_LIMIT) as usize;
-    // Highest APR first, read from the index that already holds only the pools asked for.
-    let rows = if chain_id == 0 {
-        Stat::by_apr_bps_range(..)
+    // A position may be at most 2 % of a pool: the same as a TVL floor of 50x the position.
+    let floor = min_tvl.max(
+        u64::try_from(amount as u128 * 10_000 / MAX_POOL_SHARE_BPS as u128).unwrap_or(u64::MAX),
+    );
+    // Read only index ranges whose pools can pass the filters, each in APR order, and merge
+    // them: one range per grade up to `max_grade`, else one per TVL tier from the floor's, else
+    // the chain's (stable) pools. Without this, thousands of high-APR pools that fail the
+    // filters filled the scan and good pools further down were never reached.
+    let mut sources: Vec<btb_sdk::table::Lookup<Stat>> = Vec::new();
+    if max_grade > 0 {
+        for g in GRADE_A..=max_grade.min(GRADE_E) {
+            sources.push(if chain_id == 0 {
+                Stat::by_grade_apr_range(composite_range(g as u64))
+            } else {
+                Stat::by_chain_grade_apr_range(composite3_range(chain_id, 3, g as u64))
+            });
+        }
+    } else if floor > 0 {
+        for tier in tvl_tier(floor)..=3 {
+            sources.push(if chain_id == 0 {
+                Stat::by_tier_apr_range(composite_range(tier))
+            } else {
+                Stat::by_chain_tier_apr_range(composite3_range(chain_id, 2, tier))
+            });
+        }
+    } else if chain_id == 0 {
+        sources.push(Stat::by_apr_bps_range(..));
     } else if stable_only {
-        Stat::by_stable_apr_range(composite_range(chain_id))
+        sources.push(Stat::by_stable_apr_range(composite_range(chain_id)));
     } else {
-        Stat::by_chain_apr_range(composite_range(chain_id))
-    };
-    let mut out = Vec::new();
-    for (_, s) in rows.order(Order::Desc).limit(MAX_SCAN) {
-        if out.len() >= limit {
-            break;
+        sources.push(Stat::by_chain_apr_range(composite_range(chain_id)));
+    }
+    let per_source = MAX_SCAN / sources.len();
+    let mut out: Vec<TopRow> = Vec::new();
+    for rows in sources {
+        let mut taken = 0;
+        for (_, s) in rows.order(Order::Desc).limit(per_source) {
+            if taken >= limit {
+                break;
+            }
+            if (chain_id != 0 && s.chain_id != chain_id)
+                || s.tvl_usd < floor
+                || (stable_only && !s.stable)
+                || !grade_ok(s.risk_grade, max_grade)
+            {
+                continue;
+            }
+            // Each range is in APR order, so its first `limit` matches are all it can add.
+            let row = (
+                s.pool,
+                s.pair,
+                s.chain_id,
+                s.apr_bps,
+                s.tvl_usd,
+                s.risk_grade,
+                s.risk_score,
+            );
+            let at = out.partition_point(|x| x.3 >= row.3);
+            out.insert(at, row);
+            out.truncate(limit);
+            taken += 1;
         }
-        if s.tvl_usd < min_tvl
-            || (stable_only && !s.stable)
-            || !grade_ok(s.risk_grade, max_grade)
-            || (amount > 0
-                && (s.tvl_usd as u128) * (MAX_POOL_SHARE_BPS as u128) < amount as u128 * 10_000)
-        {
-            continue;
-        }
-        out.push((
-            s.pool,
-            s.pair,
-            s.chain_id,
-            s.apr_bps,
-            s.tvl_usd,
-            s.risk_grade,
-            s.risk_score,
-        ));
     }
     out
+}
+
+/// All values of a `composite3(hi, bits, mid, _)` key for fixed `hi` and `mid`.
+fn composite3_range(hi: u64, bits: u32, mid: u64) -> core::ops::RangeInclusive<u128> {
+    let lo = composite3(hi, bits, mid, APR_MIN);
+    lo..=(lo | u64::MAX as u128)
 }
 
 /// Yields of every kind in `kind_mask` (`1 << KIND_*`, 0 = all), pools included as kind LP,
