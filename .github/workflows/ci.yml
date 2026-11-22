@@ -83,6 +83,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         with:
           key: rocksdb
+          # RocksDB's C++ build is most of this job's time. Keep the cache even when a test
+          # fails, or every run after a red one rebuilds it from scratch (~24 minutes).
+          cache-on-failure: true
 
       - name: Clippy (rocksdb feature)
         run: |

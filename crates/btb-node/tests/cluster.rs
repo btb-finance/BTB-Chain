@@ -449,11 +449,28 @@ fn four_nodes_agree_on_transfer_and_counter_and_finalize_fast() {
     // Finality latency: cold submits spread over all nodes.
     let lat = measure(&mut c, &[0, 1, 2, 3], 24);
     let (med, max) = summarize("localhost 4 validators", &lat);
+    // On a slow sample, say whether consensus lost rounds (timeouts), a node fell behind
+    // (sync), or neither (the transaction waited before reaching a block).
+    let why = || {
+        let per_node: Vec<String> = c
+            .live()
+            .iter()
+            .map(|i| {
+                let s = c.status(*i);
+                format!(
+                    "node {i}: timeouts_sent {} sync requests {} rejected {}",
+                    s["consensus"]["timeouts_sent"], s["sync"]["requests"], s["sync"]["rejected"]
+                )
+            })
+            .collect();
+        format!("samples (ms, in order) {lat:?}; {}", per_node.join("; "))
+    };
     assert!(
         med < 1_000,
-        "median finality {med}ms should be well under 1 s"
+        "median finality {med}ms should be well under 1 s ({})",
+        why()
     );
-    assert!(max < 3_000, "max finality {max}ms");
+    assert!(max < 3_000, "max finality {max}ms ({})", why());
     c.assert_same_state();
     assert_eq!(c.evidence_total(), 0, "honest nodes produce no evidence");
     for i in c.live() {
