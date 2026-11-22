@@ -2,14 +2,19 @@
 //! bump allocator and the `mem*` routines.
 //!
 //! The VM runs each call in a fresh memory image, so the allocator never frees. The heap is a
-//! fixed zero-initialised region in `.bss`. The `mem*` routines are hand-written rv64im assembly
+//! fixed zero-initialised region in `.bss`, so it is part of the loaded image. A call gets
+//! `vm_memory` (1 MiB by default), shared from the bottom up by the image (code from 0x10000,
+//! data, this heap) and from the top down by the input region and a stack of at least 64 KiB.
+//! With a 512 KiB heap the example contracts (images of 584 to 652 KiB) keep 300 KiB or more for
+//! input; 128 KiB, the earlier size, held only about 16 rows of a table-heavy batch mutation
+//! (proposal 0006). The `mem*` routines are hand-written rv64im assembly
 //! (byte loops) so no precompiled, possibly compressed or atomic, library code is needed and the
 //! compiler cannot turn them into calls to themselves.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 
-const HEAP_SIZE: usize = 128 * 1024;
+const HEAP_SIZE: usize = 512 * 1024;
 
 #[repr(align(16))]
 struct Heap(UnsafeCell<[u8; HEAP_SIZE]>);

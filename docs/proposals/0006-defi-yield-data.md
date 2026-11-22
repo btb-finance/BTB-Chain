@@ -28,7 +28,7 @@ It is also the first real-world app for BTB Chain: a dataset with existing daily
 
 ### A. Provider tables in the `defi-yields` contract
 
-Modelled on `examples/market-data`: integer units, `CHAIN_ID:ID` keys, provider-only `publish_*` mutations of at most 16 rows (see [Heap limit](#heap-limit-what-m0-measured)), whole batch refused on one bad row, an older row never replaces a newer one.
+Modelled on `examples/market-data`: integer units, `CHAIN_ID:ID` keys, provider-only `publish_*` mutations of at most 64 rows (see [Heap limit](#heap-limit-what-m0-measured)), whole batch refused on one bad row, an older row never replaces a newer one.
 
 | Table | Key | Columns (units) | Published |
 | --- | --- | --- | --- |
@@ -38,8 +38,8 @@ Modelled on `examples/market-data`: integer units, `CHAIN_ID:ID` keys, provider-
 | `yields` | `kind:asset:venue` | rate (bps), kind (lp, staking, lending, tbill, savings, dividend), currency, liquidity class (instant, days, locked), source, as of | Phase 1: on-chain kinds only (LP, staking, lending, tokenized T-bills); later public rates (T-bills, savings) |
 
 **Derived on chain (integer math, like `stock()` in market-data), as built:**
-- `pool(key, hours)`: one call with pool facts, latest stats, fee estimate, the grades of both tokens, the **risk grade A..E** (recomputed live) and up to 168 hours of history.
-- `top_pools(chain, max_grade, min_tvl, stable_only, limit)` and `best_for(amount, max_grade, chain, limit)` (only pools where the position is at most 2 % of the TVL): ranked by headline APR from an APR index (all chains) or a `chain << 64 | apr` index (one chain, or its stable pairs), decoding at most 150 rows.
+- `pool(key, hours)`: one call with pool facts, latest stats, fee estimate, the grades of both tokens, the **risk grade A..E** (recomputed live) and up to 336 hours (14 days) of history.
+- `top_pools(chain, max_grade, min_tvl, stable_only, limit)` and `best_for(amount, max_grade, chain, limit)` (only pools where the position is at most 2 % of the TVL): ranked by headline APR from an APR index (all chains) or a `chain << 64 | apr` index (one chain, or its stable pairs), decoding at most 600 rows.
 - `top_yields(kind_mask, max_grade, limit)`: pools and non-pool yields (staking, lending, T-bills, savings, ...) in one ranking.
 - `index(chain, stable_only)`: pool count, TVL, median APR and TVL-weighted APR, **exact for any number of pools**: running totals are kept on every stats write and the median is found by counting row ids in APR order (no rows decoded).
 - `rescore(pools)`: after `publish_grades`, refreshes the token part of the risk stored for rankings.
@@ -87,7 +87,7 @@ Convex crons (hourly discover refresh, daily range yield, token scans)
 | A consumer of provider tables | Per read | **The provider** | Not built: needs 0004 phase B (provider registry and per-read fees to providers) |
 | Provider | Gas for `publish_*`, storage deposits for rows | Validators | Built |
 
-Until 0004 phase B exists, BTB Finance publishes at its own cost (gas plus deposits) and earns nothing on chain; the value is the showcase, the verified history and the feeds' reporters' income. Measured publishing load (M0, local network): about 97,000 gas per pool and hour (pool facts once, stats every hour), 16 rows per transaction. All 4,360 pools hourly would be about 273 transactions an hour; publishing only pools whose numbers changed, or every 4 hours, divides that.
+Until 0004 phase B exists, BTB Finance publishes at its own cost (gas plus deposits) and earns nothing on chain; the value is the showcase, the verified history and the feeds' reporters' income. Measured publishing load (M0, local network): about 97,000 gas per pool and hour (pool facts once, stats every hour), 64 rows per transaction since the SDK heap went to 512 KiB (16 before). All 4,360 pools hourly is about 69 transactions an hour; publishing only pools whose numbers changed, or every 4 hours, divides that.
 
 ## Milestones
 
@@ -102,17 +102,18 @@ Until 0004 phase B exists, BTB Finance publishes at its own cost (gas plus depos
 
 ## Heap limit: what M0 measured
 
-Contracts run with the SDK's **128 KiB bump heap, never freed within a call** (`crates/btb-sdk/src/runtime.rs`). Every lookup (key clones, request and result buffers), row read (256-byte buffer, then the exact size), `format!` and growing `Vec` keeps its memory until the call ends; a 300-byte row costs about 1 KB to write. Measured with worst-case rows (66-character V4 pool ids):
+Contracts run with the SDK's bump heap, **never freed within a call** (`crates/btb-sdk/src/runtime.rs`). Every lookup (key clones, request and result buffers), row read (256-byte buffer, then the exact size), `format!` and growing `Vec` keeps its memory until the call ends; a 300-byte row costs about 1 KB to write. M0 first ran with the SDK's original 128 KiB heap; it was then raised to 512 KiB (the VM gives a call 1 MiB, and every example contract still keeps 300 KiB or more for input). Measured with worst-case rows (66-character V4 pool ids):
 
-| Call | Fits |
-| --- | --- |
-| `publish_stats` (new or update) | 16 rows; fails at 20 |
-| `publish_pools` | 48 rows; fails at 56 |
-| A ranking decoding 150 stats rows | yes (1.8 M gas, of the 50 M query gas) |
+| Call | 128 KiB heap | 512 KiB heap |
+| --- | --- | --- |
+| `publish_stats` (new or update) | 16 rows; fails at 20 | 80 rows; fails at 96 (8.5 M gas for 64 new rows) |
+| `publish_pools` | 48 rows; fails at 56 | 128 rows and more |
+| `pool` history | not measured | 480 hours; fails at 720 |
+| A ranking decoding its full scan | 150 rows, 1.8 M gas | 600 rows, 7.2 M gas (of the 50 M query gas) |
 
-The contract is shaped by it: rankings decode one row per pool (pair and risk stored on write), the index keeps running totals and counts row ids instead of decoding rows, updates reuse the previous row instead of reading the pool and grades again, and pruning deletes by row id. `examples/market-data` documents 500 rows per publish call; with rows of its size the same limit very likely applies there (its tests publish a few rows).
+The contract keeps a margin: 64 rows per batch, 600 rows per ranking, 336 hours per `pool`. It is also shaped by the heap: rankings decode one row per pool (pair and risk stored on write), the index keeps running totals and counts row ids instead of decoding rows, updates reuse the previous row instead of reading the pool and grades again, and pruning deletes by row id.
 
-Options for the SDK (not part of this proposal): a larger heap (the VM gives a call 1 MiB), resetting the heap between rows in batch mutations, or size-hinted encoding so `Vec` growth does not leave dead buffers.
+Further options for the SDK, not taken: resetting the heap between rows of a batch mutation, or size-hinted encoding so `Vec` growth does not leave dead buffers.
 
 ## Chain-side work
 
@@ -135,7 +136,7 @@ Needed for the full design, none of it consensus-breaking:
 ## Open questions
 
 1. Publish hourly or every 4 hours, or only changed pools (about 97,000 gas per pool and hour, measured)?
-2. How many hours of history to keep on chain before moving to monthly blobs (`pool` returns at most 168)?
+2. How many hours of history to keep on chain before moving to monthly blobs (`pool` returns at most 336)?
 3. Should `yields` include off-chain rates (T-bills, savings) from day one, or only after several independent providers exist?
 4. Feed `read_fee` levels for the first five feeds.
 5. Does BTB Finance run its own validator (and report its own feeds), or only provide data and leave reporting to others?

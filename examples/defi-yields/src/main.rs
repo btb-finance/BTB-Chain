@@ -36,19 +36,19 @@ use btb_sdk::host::{storage_get, storage_set, table_index_scan, Bound, Key};
 use btb_sdk::prelude::*;
 use btb_sdk::table::Order;
 
-// Contracts run with a 128 KiB bump heap that is never freed within a call (`btb-sdk`
+// Contracts run with the SDK's 512 KiB bump heap, never freed within a call (`btb-sdk`
 // runtime), so every decoded row costs memory until the call ends. These bounds keep each call
-// inside it; `crates/btb-tests/tests/defi_yields.rs` measures them.
+// inside it with a margin; `crates/btb-tests/tests/defi_yields.rs` checks them with worst-case rows.
 
-/// Most rows one publish call may carry.
-pub const MAX_BATCH: usize = 16;
-/// Most history hours `pool` returns (one week).
-pub const MAX_HOURS: u32 = 168;
+/// Most rows one publish call may carry (worst-case stats rows fit up to 80).
+pub const MAX_BATCH: usize = 64;
+/// Most history hours `pool` returns (14 days; 720 does not fit the heap, 480 does).
+pub const MAX_HOURS: u32 = 336;
 /// Most rows a ranking query returns.
-pub const MAX_LIMIT: u32 = 50;
+pub const MAX_LIMIT: u32 = 100;
 /// Most stats rows a ranking query decodes. Rankings read one stats row per pool (pair label
 /// and risk are stored in it), in index order, so the bound is on rows looked at, not on pools.
-pub const MAX_SCAN: usize = 150;
+pub const MAX_SCAN: usize = 600;
 /// Most history rows one `prune_hours` call deletes.
 pub const MAX_PRUNE: usize = 200;
 /// A position may be at most this share of a pool's TVL (bps) to count as usable by `best_for`.
@@ -405,7 +405,7 @@ pub fn get_provider() -> Option<Address> {
 
 fn check_batch(n: usize) -> btb_sdk::Result<()> {
     only_provider()?;
-    ensure!(n > 0 && n <= MAX_BATCH, "batch must hold 1..=16 rows");
+    ensure!(n > 0 && n <= MAX_BATCH, "batch must hold 1..=64 rows");
     Ok(())
 }
 
@@ -1039,7 +1039,7 @@ fn grade_ok(grade: u8, max_grade: u8) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// Everything about one pool in one call: facts, latest stats, fee estimate, token grades,
-/// risk (recomputed now, from the current grades) and up to `hours` (at most 168) of history,
+/// risk (recomputed now, from the current grades) and up to `hours` (at most 336) of history,
 /// newest first.
 #[btb::query]
 pub fn pool(key: String, hours: u32) -> Option<PoolPayload> {
@@ -1086,7 +1086,7 @@ pub fn pool(key: String, hours: u32) -> Option<PoolPayload> {
 }
 
 /// Pools ranked by headline APR, highest first. Filters: `chain_id` (0 = all), `max_grade`
-/// (`GRADE_A`..=`GRADE_E`, 0 = any), `min_tvl_usd`, `stable_only`. At most `limit` (50) rows,
+/// (`GRADE_A`..=`GRADE_E`, 0 = any), `min_tvl_usd`, `stable_only`. At most `limit` (100) rows,
 /// from the `MAX_SCAN` highest-APR pools of the chain (or of all chains).
 #[btb::query]
 pub fn top_pools(
