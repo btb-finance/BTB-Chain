@@ -110,6 +110,10 @@ record!(Stat {
     apr_bps: i64,
     chain_apr: u128,
     stable_apr: Option<u128>,
+    grade_apr: u128,
+    chain_grade_apr: u128,
+    tier_apr: u128,
+    chain_tier_apr: u128,
     chain_id: u64,
     stable: bool,
     pair: String,
@@ -1168,11 +1172,18 @@ fn rankings_and_indices_stay_within_the_query_limits() {
     let apr = |i: u64| (i * 37 % 9_000) as i64;
     let tvl = |i: u64| 50_000 + i * 1_000;
 
-    // A filter nothing passes makes top_pools decode its full MAX_SCAN rows.
+    // Stable pairs over all chains: no index narrows that, so the ranking reads in APR order and
+    // filters (a third of the synthetic pools are stable), the heaviest scan a query can make.
     let (rows, gas): (Vec<TopRow>, u64) =
-        ch.query_gas("top_pools", &(8453u64, 0u8, u64::MAX, false, 100u32));
-    assert!(rows.is_empty(), "no pool has that much TVL");
-    println!("top_pools, full scan: {gas} gas");
+        ch.query_gas("top_pools", &(0u64, 0u8, 0u64, true, 100u32));
+    assert_eq!(rows.len(), 100);
+    assert!(rows.windows(2).all(|w| w[0].3 >= w[1].3));
+    println!("top_pools, stable pairs on all chains: {gas} gas");
+    assert!(gas < QUERY_GAS);
+    // A TVL floor no pool reaches reads only the empty top tier.
+    let (rows, _): (Vec<TopRow>, u64) =
+        ch.query_gas("top_pools", &(8453u64, 0u8, u64::MAX, false, 50u32));
+    assert!(rows.is_empty());
     let (rows, gas): (Vec<TopRow>, u64) =
         ch.query_gas("top_pools", &(8453u64, 0u8, 0u64, false, 100u32));
     assert_eq!(rows.len(), 100);
@@ -1290,4 +1301,98 @@ fn history_is_capped_at_two_weeks_per_call() {
     // The chain totals still count the pool once.
     let v: IndexView = ch.query("index", &(8453u64, false));
     assert_eq!(v.pools, 5);
+}
+
+#[test]
+fn filtered_rankings_find_good_pools_behind_thousands_of_junk_ones() {
+    // What the live snapshot showed: the highest APRs are small, risky pools. 1,000 of them
+    // (2,000 % to 50,000 % APR, under $100k TVL) sit above 20 good ones ($50M, 5 % to 24.5 %).
+    // A ranking that reads in APR order and filters afterwards never reached the good ones.
+    let mut ch = Chain::new();
+    ch.mutate::<()>("init", PROVIDER, &());
+    let key = |i: u64| format!("{}:0x{i:040x}", if i.is_multiple_of(2) { 8453 } else { 1 });
+    let ids: Vec<u64> = (0..1_020).collect();
+    for chunk in ids.chunks(64) {
+        let pools: Vec<PoolIn> = chunk
+            .iter()
+            .map(|&i| {
+                let good = i >= 1_000;
+                pool(
+                    &key(i),
+                    if i.is_multiple_of(2) { 8453 } else { 1 },
+                    ("Uniswap", "V3", 500),
+                    (
+                        &format!("0x{:040x}", i * 2 + 1),
+                        &format!("0x{:040x}", i * 2 + 2),
+                    ),
+                    ("AAA", "BBB"),
+                    good,
+                )
+            })
+            .collect();
+        ch.mutate::<u32>("publish_pools", PROVIDER, &(pools,));
+        let stats: Vec<StatIn> = chunk
+            .iter()
+            .map(|&i| {
+                let good = i >= 1_000;
+                let (tvl, apr) = if good {
+                    (50_000_000, 500 + (i - 1_000) as i64 * 100)
+                } else {
+                    (20_000 + i * 70, 200_000 + (i * 4_801) as i64 % 4_800_000)
+                };
+                stat(
+                    &key(i),
+                    (
+                        (tvl, Some(1), Some(1)),
+                        (apr, 0),
+                        (None, 0, None, None),
+                        None,
+                    ),
+                )
+            })
+            .collect();
+        ch.mutate::<u32>("publish_stats", PROVIDER, &(stats,));
+    }
+    // The good pools, best first: stable, $50M, two ungraded tokens: 100 - 5 - 5 = 90, grade A.
+    let mut good: Vec<(String, i64)> = (1_000..1_020u64)
+        .map(|i| (key(i), 500 + (i - 1_000) as i64 * 100))
+        .collect();
+    good.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let got = |rows: &[TopRow]| rows.iter().map(|r| (r.0.clone(), r.3)).collect::<Vec<_>>();
+
+    // Unfiltered, the junk leads (by design: highest APR first).
+    let all: Vec<TopRow> = ch.query("top_pools", &(0u64, 0u8, 0u64, false, 10u32));
+    assert!(all.iter().all(|r| r.4 < 100_000));
+
+    // Grade B or better, TVL >= $1M: exactly the good pools, best first.
+    let (b, gas): (Vec<TopRow>, u64) =
+        ch.query_gas("top_pools", &(0u64, 2u8, 1_000_000u64, false, 10u32));
+    assert_eq!(got(&b), good[..10].to_vec());
+    assert!(b.iter().all(|r| r.5 == 1 && r.6 == 90));
+    println!("top_pools grade <= B, TVL >= $1M: {gas} gas");
+    // The same on one chain (Base holds the even ids).
+    let base: Vec<TopRow> = ch.query("top_pools", &(8453u64, 2u8, 1_000_000u64, false, 50u32));
+    let good_base: Vec<(String, i64)> = good
+        .iter()
+        .filter(|g| g.0.starts_with("8453:"))
+        .cloned()
+        .collect();
+    assert_eq!(got(&base), good_base);
+    // A TVL floor alone reads only the tiers above it.
+    let (t, gas): (Vec<TopRow>, u64) =
+        ch.query_gas("top_pools", &(0u64, 0u8, 10_000_000u64, false, 50u32));
+    assert_eq!(got(&t), good);
+    println!("top_pools TVL >= $10M: {gas} gas");
+    // $250,000 needs a $12.5M pool: only the good ones qualify.
+    let (bf, gas): (Vec<TopRow>, u64) = ch.query_gas("best_for", &(250_000u64, 0u8, 0u64, 5u32));
+    assert_eq!(got(&bf), good[..5].to_vec());
+    println!("best_for $250,000: {gas} gas");
+    // Stable pairs on a chain still read the stable index.
+    let st: Vec<TopRow> = ch.query("top_pools", &(1u64, 0u8, 0u64, true, 50u32));
+    let good_eth: Vec<(String, i64)> = good
+        .iter()
+        .filter(|g| g.0.starts_with("1:"))
+        .cloned()
+        .collect();
+    assert_eq!(got(&st), good_eth);
 }

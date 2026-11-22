@@ -10,7 +10,7 @@ Example contract for [proposal 0006](../../docs/proposals/0006-defi-yield-data.m
   - `rescore`: refresh the stored risk after grades change; `prune_hours`: keep only the newest hours; `set_provider`: rotate the provider key.
 - **Everyone reads, free:**
   - `pool(key, hours)`: facts, latest stats, fee estimate, both token grades, the risk grade (A..E, recomputed live) and up to 336 hours (14 days) of history in one call;
-  - `top_pools(chain, max_grade, min_tvl, stable_only, limit)`, `best_for(amount_usd, max_grade, chain, limit)`: ranked by headline APR (the measured range APR when there is one);
+  - `top_pools(chain, max_grade, min_tvl, stable_only, limit)`, `best_for(amount_usd, max_grade, chain, limit)`: ranked by headline APR (the measured range APR when there is one), reading only the risk-grade or TVL-tier index ranges that can pass the filters, so good pools are found behind any number of high-APR, high-risk ones;
   - `top_yields(kind_mask, max_grade, limit)`: pools and other yields in one ranking;
   - `index(chain, stable_only)`: pool count, TVL, median and TVL-weighted APR, exact for any number of pools;
   - `pools(chain, limit, cursor)`, `grade(token)`, `yield_rate(key)`, `get_provider()`.
